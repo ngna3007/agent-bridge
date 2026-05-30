@@ -13716,6 +13716,154 @@ class StateDirResolver {
   }
 }
 
+// src/audit-log.ts
+import { existsSync as existsSync2, statSync, renameSync, unlinkSync, openSync, closeSync, writeSync, fsyncSync, mkdirSync as mkdirSync2, readFileSync } from "fs";
+import { dirname, join as join2 } from "path";
+
+class AuditLog {
+  path;
+  maxBytes;
+  maxRotations;
+  writing = false;
+  queue = [];
+  constructor(path, opts = {}) {
+    this.path = path;
+    this.maxBytes = opts.maxBytes ?? 10 * 1024 * 1024;
+    this.maxRotations = opts.maxRotations ?? 3;
+    try {
+      mkdirSync2(dirname(path), { recursive: true });
+    } catch {}
+  }
+  get filePath() {
+    return this.path;
+  }
+  append(record3) {
+    this.queue.push(record3);
+    if (!this.writing) {
+      this.drain();
+    }
+  }
+  appendMessage(msg) {
+    const to = msg.source === "claude" ? "codex" : "claude";
+    this.append({
+      t: Date.now(),
+      k: "msg",
+      from: msg.source,
+      to,
+      id: msg.id,
+      content: msg.content
+    });
+  }
+  appendEvent(event, meta2) {
+    this.append({
+      t: Date.now(),
+      k: "evt",
+      event,
+      ...meta2 && Object.keys(meta2).length > 0 ? { meta: meta2 } : {}
+    });
+  }
+  queryRecent(opts = {}) {
+    if (!existsSync2(this.path))
+      return [];
+    const limit = opts.limit ?? 100;
+    const sinceMs = opts.sinceMs ?? 0;
+    const wantKind = opts.kind;
+    const records = [];
+    const raw = readFileSync(this.path, "utf-8");
+    for (const line of raw.split(`
+`)) {
+      if (!line)
+        continue;
+      let parsed;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (parsed.t < sinceMs)
+        continue;
+      if (wantKind && parsed.k !== wantKind)
+        continue;
+      records.push(parsed);
+    }
+    return records.slice(-limit);
+  }
+  rotateNow() {
+    this.rotateIfNeeded(this.maxBytes + 1);
+  }
+  async drain() {
+    this.writing = true;
+    try {
+      while (this.queue.length > 0) {
+        const batch = this.queue.splice(0, this.queue.length);
+        await this.writeBatch(batch);
+      }
+    } finally {
+      this.writing = false;
+    }
+  }
+  async writeBatch(batch) {
+    const payload = batch.map((r) => JSON.stringify(r)).join(`
+`) + `
+`;
+    const currentSize = this.currentFileSize();
+    if (currentSize + payload.length > this.maxBytes && currentSize > 0) {
+      this.rotateIfNeeded(currentSize + payload.length);
+    }
+    let fd = null;
+    try {
+      fd = openSync(this.path, "a", 420);
+      writeSync(fd, payload);
+      fsyncSync(fd);
+    } catch (err) {
+      process.stderr.write(`[audit-log] write failed: ${err instanceof Error ? err.message : String(err)}
+`);
+    } finally {
+      if (fd !== null) {
+        try {
+          closeSync(fd);
+        } catch {}
+      }
+    }
+  }
+  currentFileSize() {
+    if (!existsSync2(this.path))
+      return 0;
+    try {
+      return statSync(this.path).size;
+    } catch {
+      return 0;
+    }
+  }
+  rotateIfNeeded(currentSize) {
+    if (currentSize <= this.maxBytes)
+      return;
+    const oldest = `${this.path}.${this.maxRotations}`;
+    if (existsSync2(oldest)) {
+      try {
+        unlinkSync(oldest);
+      } catch {}
+    }
+    for (let i = this.maxRotations - 1;i >= 1; i--) {
+      const src = `${this.path}.${i}`;
+      const dst = `${this.path}.${i + 1}`;
+      if (existsSync2(src)) {
+        try {
+          renameSync(src, dst);
+        } catch {}
+      }
+    }
+    if (existsSync2(this.path)) {
+      try {
+        renameSync(this.path, `${this.path}.1`);
+      } catch {}
+    }
+  }
+}
+function defaultAuditLogPath(stateDir) {
+  return join2(stateDir, "audit.jsonl");
+}
+
 // src/claude-adapter.ts
 var CLAUDE_INSTRUCTIONS = [
   "Codex is an AI coding agent (OpenAI) running in a separate session on the same machine.",
@@ -13765,9 +13913,11 @@ class ClaudeAdapter extends EventEmitter {
   pendingMessages = [];
   maxBufferedMessages;
   droppedMessageCount = 0;
+  audit;
   constructor(logFile = new StateDirResolver().logFile) {
     super();
     this.logFile = logFile;
+    this.audit = new AuditLog(defaultAuditLogPath(new StateDirResolver().dir));
     this.instanceId = randomUUID().slice(0, 8);
     this.sessionId = `codex_${Date.now()}`;
     this.notificationIdPrefix = randomUUID().replace(/-/g, "").slice(0, 12);
@@ -13923,6 +14073,29 @@ ${formatted}`
             properties: {},
             required: []
           }
+        },
+        {
+          name: "transcript",
+          description: "Replay the durable audit log of past Codex\u2194Claude messages and lifecycle events. Survives daemon restarts. Use for catching up on collaboration history mid-session, or grepping for a specific past exchange.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              limit: {
+                type: "number",
+                description: "Max number of records to return, most recent first. Default 50."
+              },
+              since_ms: {
+                type: "number",
+                description: "Only include records with timestamp >= this (ms since epoch). Use for incremental tailing."
+              },
+              kind: {
+                type: "string",
+                enum: ["msg", "evt"],
+                description: "Filter to messages only or events only. Omit for both."
+              }
+            },
+            required: []
+          }
         }
       ]
     }));
@@ -13934,11 +14107,37 @@ ${formatted}`
       if (name === "get_messages") {
         return this.drainMessages();
       }
+      if (name === "transcript") {
+        return this.handleTranscript(args);
+      }
       return {
         content: [{ type: "text", text: `Unknown tool: ${name}` }],
         isError: true
       };
     });
+  }
+  handleTranscript(args) {
+    const limit = typeof args?.limit === "number" ? args.limit : 50;
+    const sinceMs = typeof args?.since_ms === "number" ? args.since_ms : 0;
+    const rawKind = args?.kind;
+    const kind = rawKind === "msg" || rawKind === "evt" ? rawKind : undefined;
+    const records = this.audit.queryRecent({ limit, sinceMs, kind });
+    if (records.length === 0) {
+      return {
+        content: [{ type: "text", text: "No audit records match." }]
+      };
+    }
+    const text = records.map((r) => JSON.stringify(r)).join(`
+`);
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Audit transcript (${records.length} record${records.length === 1 ? "" : "s"}):
+${text}`
+        }
+      ]
+    };
   }
   async handleReply(args) {
     const text = args?.text;
@@ -14185,7 +14384,7 @@ class DaemonClient extends EventEmitter2 {
 
 // src/daemon-lifecycle.ts
 import { spawn, execFileSync } from "child_process";
-import { existsSync as existsSync2, readFileSync, unlinkSync, writeFileSync, openSync, closeSync, constants } from "fs";
+import { existsSync as existsSync3, readFileSync as readFileSync2, unlinkSync as unlinkSync2, writeFileSync, openSync as openSync2, closeSync as closeSync2, constants } from "fs";
 import { fileURLToPath } from "url";
 var DAEMON_ENTRY = process.env.AGENTBRIDGE_DAEMON_ENTRY ?? "./daemon.ts";
 var DAEMON_PATH = fileURLToPath(new URL(DAEMON_ENTRY, import.meta.url));
@@ -14275,7 +14474,7 @@ class DaemonLifecycle {
   }
   readStatus() {
     try {
-      const raw = readFileSync(this.stateDir.statusFile, "utf-8");
+      const raw = readFileSync2(this.stateDir.statusFile, "utf-8");
       return JSON.parse(raw);
     } catch {
       return null;
@@ -14288,7 +14487,7 @@ class DaemonLifecycle {
   }
   readPid() {
     try {
-      const raw = readFileSync(this.stateDir.pidFile, "utf-8").trim();
+      const raw = readFileSync2(this.stateDir.pidFile, "utf-8").trim();
       if (!raw)
         return null;
       const pid = Number.parseInt(raw, 10);
@@ -14304,12 +14503,12 @@ class DaemonLifecycle {
   }
   removePidFile() {
     try {
-      unlinkSync(this.stateDir.pidFile);
+      unlinkSync2(this.stateDir.pidFile);
     } catch {}
   }
   removeStatusFile() {
     try {
-      unlinkSync(this.stateDir.statusFile);
+      unlinkSync2(this.stateDir.statusFile);
     } catch {}
   }
   markKilled() {
@@ -14319,11 +14518,11 @@ class DaemonLifecycle {
   }
   clearKilled() {
     try {
-      unlinkSync(this.stateDir.killedFile);
+      unlinkSync2(this.stateDir.killedFile);
     } catch {}
   }
   wasKilled() {
-    return existsSync2(this.stateDir.killedFile);
+    return existsSync3(this.stateDir.killedFile);
   }
   launch() {
     this.stateDir.ensure();
@@ -14351,15 +14550,15 @@ class DaemonLifecycle {
     }
     this.stateDir.ensure();
     try {
-      const fd = openSync(this.stateDir.lockFile, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY);
+      const fd = openSync2(this.stateDir.lockFile, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY);
       writeFileSync(fd, `${process.pid}
 `);
-      closeSync(fd);
+      closeSync2(fd);
       return true;
     } catch (err) {
       if (err.code === "EEXIST") {
         try {
-          const holderPid = Number.parseInt(readFileSync(this.stateDir.lockFile, "utf-8").trim(), 10);
+          const holderPid = Number.parseInt(readFileSync2(this.stateDir.lockFile, "utf-8").trim(), 10);
           if (Number.isFinite(holderPid) && !isProcessAlive(holderPid)) {
             this.log(`Stale lock file from dead process ${holderPid}, removing`);
             this.releaseLock();
@@ -14378,7 +14577,7 @@ class DaemonLifecycle {
   }
   releaseLock() {
     try {
-      unlinkSync(this.stateDir.lockFile);
+      unlinkSync2(this.stateDir.lockFile);
     } catch {}
   }
   async kill(gracefulTimeoutMs = 3000) {
@@ -14445,8 +14644,8 @@ function isProcessAlive(pid) {
 }
 
 // src/config-service.ts
-import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync2, existsSync as existsSync3 } from "fs";
-import { join as join2 } from "path";
+import { readFileSync as readFileSync3, writeFileSync as writeFileSync2, mkdirSync as mkdirSync3, existsSync as existsSync4 } from "fs";
+import { join as join3 } from "path";
 var DEFAULT_CONFIG = {
   version: "1.0",
   codex: {
@@ -14498,15 +14697,15 @@ class ConfigService {
   configPath;
   constructor(projectRoot) {
     const root = projectRoot ?? process.cwd();
-    this.configDir = join2(root, CONFIG_DIR);
-    this.configPath = join2(this.configDir, CONFIG_FILE);
+    this.configDir = join3(root, CONFIG_DIR);
+    this.configPath = join3(this.configDir, CONFIG_FILE);
   }
   hasConfig() {
-    return existsSync3(this.configPath);
+    return existsSync4(this.configPath);
   }
   load() {
     try {
-      const raw = readFileSync2(this.configPath, "utf-8");
+      const raw = readFileSync3(this.configPath, "utf-8");
       return normalizeConfig(JSON.parse(raw));
     } catch {
       return null;
@@ -14523,7 +14722,7 @@ class ConfigService {
   initDefaults() {
     this.ensureConfigDir();
     const created = [];
-    if (!existsSync3(this.configPath)) {
+    if (!existsSync4(this.configPath)) {
       this.save(DEFAULT_CONFIG);
       created.push(this.configPath);
     }
@@ -14533,8 +14732,8 @@ class ConfigService {
     return this.configPath;
   }
   ensureConfigDir() {
-    if (!existsSync3(this.configDir)) {
-      mkdirSync2(this.configDir, { recursive: true });
+    if (!existsSync4(this.configDir)) {
+      mkdirSync3(this.configDir, { recursive: true });
     }
   }
 }

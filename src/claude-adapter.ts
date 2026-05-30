@@ -22,6 +22,7 @@ import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
 import { appendFileSync } from "node:fs";
 import { StateDirResolver } from "./state-dir";
+import { AuditLog, defaultAuditLogPath } from "./audit-log";
 import type { BridgeMessage } from "./types";
 
 export type ReplySender = (msg: BridgeMessage, requireReply?: boolean) => Promise<{ success: boolean; error?: string }>;
@@ -77,9 +78,14 @@ export class ClaudeAdapter extends EventEmitter {
   private readonly maxBufferedMessages: number;
   private droppedMessageCount = 0;
 
+  // Read-only handle on the daemon's audit log so the `transcript` tool
+  // can query historical messages without going through the control WS.
+  private readonly audit: AuditLog;
+
   constructor(logFile = new StateDirResolver().logFile) {
     super();
     this.logFile = logFile;
+    this.audit = new AuditLog(defaultAuditLogPath(new StateDirResolver().dir));
     this.instanceId = randomUUID().slice(0, 8);
     this.sessionId = `codex_${Date.now()}`;
     this.notificationIdPrefix = randomUUID().replace(/-/g, "").slice(0, 12);
@@ -272,6 +278,30 @@ export class ClaudeAdapter extends EventEmitter {
             required: [],
           },
         },
+        {
+          name: "transcript",
+          description:
+            "Replay the durable audit log of past Codex↔Claude messages and lifecycle events. Survives daemon restarts. Use for catching up on collaboration history mid-session, or grepping for a specific past exchange.",
+          inputSchema: {
+            type: "object" as const,
+            properties: {
+              limit: {
+                type: "number",
+                description: "Max number of records to return, most recent first. Default 50.",
+              },
+              since_ms: {
+                type: "number",
+                description: "Only include records with timestamp >= this (ms since epoch). Use for incremental tailing.",
+              },
+              kind: {
+                type: "string",
+                enum: ["msg", "evt"],
+                description: "Filter to messages only or events only. Omit for both.",
+              },
+            },
+            required: [],
+          },
+        },
       ],
     }));
 
@@ -286,11 +316,39 @@ export class ClaudeAdapter extends EventEmitter {
         return this.drainMessages();
       }
 
+      if (name === "transcript") {
+        return this.handleTranscript(args as Record<string, unknown>);
+      }
+
       return {
         content: [{ type: "text" as const, text: `Unknown tool: ${name}` }],
         isError: true,
       };
     });
+  }
+
+  private handleTranscript(args: Record<string, unknown>) {
+    const limit = typeof args?.limit === "number" ? args.limit : 50;
+    const sinceMs = typeof args?.since_ms === "number" ? args.since_ms : 0;
+    const rawKind = args?.kind;
+    const kind = rawKind === "msg" || rawKind === "evt" ? rawKind : undefined;
+    const records = this.audit.queryRecent({ limit, sinceMs, kind });
+    if (records.length === 0) {
+      return {
+        content: [{ type: "text" as const, text: "No audit records match." }],
+      };
+    }
+    // Render compactly: one record per line, JSON. Keeps token cost low
+    // while still being grep-friendly for the model.
+    const text = records.map((r) => JSON.stringify(r)).join("\n");
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `Audit transcript (${records.length} record${records.length === 1 ? "" : "s"}):\n${text}`,
+        },
+      ],
+    };
   }
 
   private async handleReply(args: Record<string, unknown>) {

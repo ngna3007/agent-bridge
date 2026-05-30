@@ -14,6 +14,7 @@ import { TuiConnectionState } from "./tui-connection-state";
 import { DaemonLifecycle } from "./daemon-lifecycle";
 import { StateDirResolver } from "./state-dir";
 import { ConfigService } from "./config-service";
+import { AuditLog, defaultAuditLogPath } from "./audit-log";
 import {
   CLOSE_CODE_REPLACED,
   CLOSE_CODE_EVICTED_STALE,
@@ -50,6 +51,11 @@ const daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_POR
 
 const codex = new CodexAdapter(CODEX_APP_PORT, CODEX_PROXY_PORT, stateDir.logFile);
 const attachCmd = `codex --enable tui_app_server --remote ${codex.proxyUrl}`;
+
+const audit = new AuditLog(defaultAuditLogPath(stateDir.dir), {
+  maxBytes: parseInt(process.env.AGENTBRIDGE_AUDIT_MAX_BYTES ?? String(10 * 1024 * 1024), 10),
+  maxRotations: parseInt(process.env.AGENTBRIDGE_AUDIT_MAX_ROTATIONS ?? "3", 10),
+});
 
 let controlServer: ReturnType<typeof Bun.serve> | null = null;
 let attachedClaude: ServerWebSocket<ControlSocketData> | null = null;
@@ -196,6 +202,7 @@ codex.on("ready", (threadId: string) => {
   tuiConnectionState.markBridgeReady();
   log(`Codex ready — thread ${threadId}`);
   log("Bridge fully operational");
+  audit.appendEvent("codex_ready", { thread_id: threadId });
 
   emitToClaude(
     systemMessage("system_ready", currentReadyMessage()),
@@ -210,22 +217,26 @@ codex.on("tuiConnected", (connId: number) => {
   tuiConnectionState.handleTuiConnected(connId);
   cancelIdleShutdown();
   log(`Codex TUI connected (conn #${connId})`);
+  audit.appendEvent("tui_connected", { conn_id: connId });
   broadcastStatus();
 });
 
 codex.on("tuiDisconnected", (connId: number) => {
   tuiConnectionState.handleTuiDisconnected(connId);
   log(`Codex TUI disconnected (conn #${connId})`);
+  audit.appendEvent("tui_disconnected", { conn_id: connId });
   broadcastStatus();
   scheduleIdleShutdown();
 });
 
 codex.on("error", (err: Error) => {
   log(`Codex error: ${err.message}`);
+  audit.appendEvent("codex_error", { message: err.message });
 });
 
 codex.on("exit", (code: number | null) => {
   log(`Codex process exited (code ${code})`);
+  audit.appendEvent("codex_exit", { code });
   codexBootstrapped = false;
   statusBuffer.flush("codex exited");
   tuiConnectionState.handleCodexExit();
@@ -353,6 +364,7 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
         return;
       }
       clearAttentionWindow(); // Claude successfully replied, end attention window
+      audit.appendMessage(message.message);
       sendProtocolMessage(ws, {
         type: "claude_to_codex_result",
         requestId: message.requestId,
@@ -430,6 +442,7 @@ async function attachClaude(ws: ServerWebSocket<ControlSocketData>) {
   ws.data.attached = true;
   cancelIdleShutdown();
   log(`Claude frontend attached (#${ws.data.clientId})`);
+  audit.appendEvent("claude_attached", { client_id: ws.data.clientId });
 
   statusBuffer.flush("claude reconnected");
   sendStatus(ws);
@@ -461,6 +474,7 @@ function detachClaude(ws: ServerWebSocket<ControlSocketData>, reason: string) {
   attachedClaude = null;
   ws.data.attached = false;
   log(`Claude frontend detached (#${ws.data.clientId}, ${reason})`);
+  audit.appendEvent("claude_detached", { client_id: ws.data.clientId, reason });
 
   scheduleClaudeDisconnectNotification(ws.data.clientId);
 
@@ -600,6 +614,10 @@ function scheduleClaudeDisconnectNotification(clientId: number) {
 }
 
 function emitToClaude(message: BridgeMessage) {
+  // Audit at the chokepoint so every codex→claude delivery (real or
+  // synthesized system message) is recorded exactly once.
+  audit.appendMessage(message);
+
   if (attachedClaude && attachedClaude.readyState === WebSocket.OPEN) {
     if (trySendBridgeMessage(attachedClaude, message)) return;
     // Send failed — fall through to buffer

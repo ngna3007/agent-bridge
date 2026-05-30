@@ -1839,6 +1839,154 @@ class ConfigService {
   }
 }
 
+// src/audit-log.ts
+import { existsSync as existsSync4, statSync, renameSync, unlinkSync as unlinkSync2, openSync as openSync2, closeSync as closeSync2, writeSync, fsyncSync, mkdirSync as mkdirSync3, readFileSync as readFileSync3 } from "fs";
+import { dirname, join as join3 } from "path";
+
+class AuditLog {
+  path;
+  maxBytes;
+  maxRotations;
+  writing = false;
+  queue = [];
+  constructor(path, opts = {}) {
+    this.path = path;
+    this.maxBytes = opts.maxBytes ?? 10 * 1024 * 1024;
+    this.maxRotations = opts.maxRotations ?? 3;
+    try {
+      mkdirSync3(dirname(path), { recursive: true });
+    } catch {}
+  }
+  get filePath() {
+    return this.path;
+  }
+  append(record) {
+    this.queue.push(record);
+    if (!this.writing) {
+      this.drain();
+    }
+  }
+  appendMessage(msg) {
+    const to = msg.source === "claude" ? "codex" : "claude";
+    this.append({
+      t: Date.now(),
+      k: "msg",
+      from: msg.source,
+      to,
+      id: msg.id,
+      content: msg.content
+    });
+  }
+  appendEvent(event, meta) {
+    this.append({
+      t: Date.now(),
+      k: "evt",
+      event,
+      ...meta && Object.keys(meta).length > 0 ? { meta } : {}
+    });
+  }
+  queryRecent(opts = {}) {
+    if (!existsSync4(this.path))
+      return [];
+    const limit = opts.limit ?? 100;
+    const sinceMs = opts.sinceMs ?? 0;
+    const wantKind = opts.kind;
+    const records = [];
+    const raw = readFileSync3(this.path, "utf-8");
+    for (const line of raw.split(`
+`)) {
+      if (!line)
+        continue;
+      let parsed;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (parsed.t < sinceMs)
+        continue;
+      if (wantKind && parsed.k !== wantKind)
+        continue;
+      records.push(parsed);
+    }
+    return records.slice(-limit);
+  }
+  rotateNow() {
+    this.rotateIfNeeded(this.maxBytes + 1);
+  }
+  async drain() {
+    this.writing = true;
+    try {
+      while (this.queue.length > 0) {
+        const batch = this.queue.splice(0, this.queue.length);
+        await this.writeBatch(batch);
+      }
+    } finally {
+      this.writing = false;
+    }
+  }
+  async writeBatch(batch) {
+    const payload = batch.map((r) => JSON.stringify(r)).join(`
+`) + `
+`;
+    const currentSize = this.currentFileSize();
+    if (currentSize + payload.length > this.maxBytes && currentSize > 0) {
+      this.rotateIfNeeded(currentSize + payload.length);
+    }
+    let fd = null;
+    try {
+      fd = openSync2(this.path, "a", 420);
+      writeSync(fd, payload);
+      fsyncSync(fd);
+    } catch (err) {
+      process.stderr.write(`[audit-log] write failed: ${err instanceof Error ? err.message : String(err)}
+`);
+    } finally {
+      if (fd !== null) {
+        try {
+          closeSync2(fd);
+        } catch {}
+      }
+    }
+  }
+  currentFileSize() {
+    if (!existsSync4(this.path))
+      return 0;
+    try {
+      return statSync(this.path).size;
+    } catch {
+      return 0;
+    }
+  }
+  rotateIfNeeded(currentSize) {
+    if (currentSize <= this.maxBytes)
+      return;
+    const oldest = `${this.path}.${this.maxRotations}`;
+    if (existsSync4(oldest)) {
+      try {
+        unlinkSync2(oldest);
+      } catch {}
+    }
+    for (let i = this.maxRotations - 1;i >= 1; i--) {
+      const src = `${this.path}.${i}`;
+      const dst = `${this.path}.${i + 1}`;
+      if (existsSync4(src)) {
+        try {
+          renameSync(src, dst);
+        } catch {}
+      }
+    }
+    if (existsSync4(this.path)) {
+      try {
+        renameSync(this.path, `${this.path}.1`);
+      } catch {}
+    }
+  }
+}
+function defaultAuditLogPath(stateDir) {
+  return join3(stateDir, "audit.jsonl");
+}
+
 // src/control-protocol.ts
 var CLOSE_CODE_REPLACED = 4001;
 var CLOSE_CODE_EVICTED_STALE = 4002;
@@ -1902,6 +2050,10 @@ var ATTENTION_WINDOW_MS = parseInt(process.env.AGENTBRIDGE_ATTENTION_WINDOW_MS ?
 var daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_PORT, log });
 var codex = new CodexAdapter(CODEX_APP_PORT, CODEX_PROXY_PORT, stateDir.logFile);
 var attachCmd = `codex --enable tui_app_server --remote ${codex.proxyUrl}`;
+var audit = new AuditLog(defaultAuditLogPath(stateDir.dir), {
+  maxBytes: parseInt(process.env.AGENTBRIDGE_AUDIT_MAX_BYTES ?? String(10 * 1024 * 1024), 10),
+  maxRotations: parseInt(process.env.AGENTBRIDGE_AUDIT_MAX_ROTATIONS ?? "3", 10)
+});
 var controlServer = null;
 var attachedClaude = null;
 var nextControlClientId = 0;
@@ -1994,6 +2146,7 @@ codex.on("ready", (threadId) => {
   tuiConnectionState.markBridgeReady();
   log(`Codex ready \u2014 thread ${threadId}`);
   log("Bridge fully operational");
+  audit.appendEvent("codex_ready", { thread_id: threadId });
   emitToClaude(systemMessage("system_ready", currentReadyMessage()));
   if (attachedClaude && shouldNotifyCodexClaudeOnline()) {
     notifyCodexClaudeOnline();
@@ -2003,19 +2156,23 @@ codex.on("tuiConnected", (connId) => {
   tuiConnectionState.handleTuiConnected(connId);
   cancelIdleShutdown();
   log(`Codex TUI connected (conn #${connId})`);
+  audit.appendEvent("tui_connected", { conn_id: connId });
   broadcastStatus();
 });
 codex.on("tuiDisconnected", (connId) => {
   tuiConnectionState.handleTuiDisconnected(connId);
   log(`Codex TUI disconnected (conn #${connId})`);
+  audit.appendEvent("tui_disconnected", { conn_id: connId });
   broadcastStatus();
   scheduleIdleShutdown();
 });
 codex.on("error", (err) => {
   log(`Codex error: ${err.message}`);
+  audit.appendEvent("codex_error", { message: err.message });
 });
 codex.on("exit", (code) => {
   log(`Codex process exited (code ${code})`);
+  audit.appendEvent("codex_exit", { code });
   codexBootstrapped = false;
   statusBuffer.flush("codex exited");
   tuiConnectionState.handleCodexExit();
@@ -2129,6 +2286,7 @@ function handleControlMessage(ws, raw) {
         return;
       }
       clearAttentionWindow();
+      audit.appendMessage(message.message);
       sendProtocolMessage(ws, {
         type: "claude_to_codex_result",
         requestId: message.requestId,
@@ -2179,6 +2337,7 @@ async function attachClaude(ws) {
   ws.data.attached = true;
   cancelIdleShutdown();
   log(`Claude frontend attached (#${ws.data.clientId})`);
+  audit.appendEvent("claude_attached", { client_id: ws.data.clientId });
   statusBuffer.flush("claude reconnected");
   sendStatus(ws);
   const now = Date.now();
@@ -2203,6 +2362,7 @@ function detachClaude(ws, reason) {
   attachedClaude = null;
   ws.data.attached = false;
   log(`Claude frontend detached (#${ws.data.clientId}, ${reason})`);
+  audit.appendEvent("claude_detached", { client_id: ws.data.clientId, reason });
   scheduleClaudeDisconnectNotification(ws.data.clientId);
   scheduleIdleShutdown();
 }
@@ -2306,6 +2466,7 @@ function scheduleClaudeDisconnectNotification(clientId) {
   }, CLAUDE_DISCONNECT_GRACE_MS);
 }
 function emitToClaude(message) {
+  audit.appendMessage(message);
   if (attachedClaude && attachedClaude.readyState === WebSocket.OPEN) {
     if (trySendBridgeMessage(attachedClaude, message))
       return;
