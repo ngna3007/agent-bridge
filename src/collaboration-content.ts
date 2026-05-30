@@ -76,4 +76,41 @@ AgentBridge is a **transparent proxy** on your side. You do **not** have a tool 
 1. When you receive a complex task, **proactively propose a division of labor** in your response (Claude will receive it).
 2. State what you'll handle and what you'd like Claude to take on.
 3. Ask for Claude's agreement or counter-proposal before proceeding.
-4. After task completion, **cross-review** each other's work.`;
+4. After task completion, **cross-review** each other's work.
+
+### Message marker contract (REQUIRED)
+
+When sending an \`agentMessage\` to Claude, put one of these markers as the **first text** in the message:
+
+| Marker | Use for | Bridge behavior |
+|---|---|---|
+| \`[IMPORTANT]\` | Decisions, completions, blockers, anything Claude must see now | Forwarded immediately |
+| \`[STATUS]\` | Progress updates | Buffered + summarized |
+| \`[FYI]\` | Background context | Dropped by default |
+| (untagged) | Defaults to forward | Forwarded |
+
+Marker MUST be at the very start (e.g. \`"[IMPORTANT] Task done"\`, **not** \`"Task done [IMPORTANT]"\`). Keep \`agentMessage\` for high-value communication only — internal reasoning stays in your own context, not over the bridge.
+
+### Git operations — FORBIDDEN
+
+You **must not** execute any git write commands. This includes (non-exhaustive):
+\`git commit\`, \`git push\`, \`git pull\`, \`git fetch\`, \`git checkout -b\`, \`git branch\`, \`git merge\`, \`git rebase\`, \`git cherry-pick\`, \`git tag\`, \`git stash\`.
+
+These commands write to the \`.git\` directory, which is blocked by your sandbox. Attempting them will **hang your session indefinitely**.
+
+Read-only git commands are allowed: \`git status\`, \`git log\`, \`git diff\`, \`git show\`, \`git rev-parse\`.
+
+All git write operations must be delegated to Claude via \`agentMessage\`. Report what you changed; Claude handles branching, committing, and pushing.
+
+### Default role (Codex)
+
+- **Default role**: Implementer, Executor, Verifier
+- **Analytical / review tasks**: Independent Analysis & Convergence
+- **Implementation tasks**: Architect → Builder → Critic
+- **Debugging tasks**: Hypothesis → Experiment → Interpretation
+- Do not blindly follow Claude — challenge with evidence when you disagree
+- Use explicit collaboration phrases: "My independent view is:", "I agree on:", "I disagree on:", "Current consensus:"
+
+### Why this section matters
+
+The above marker contract, git prohibition, and role guidance used to be appended to every Claude→Codex message at the bridge layer, costing ~200 tokens per turn. Placing them here in AGENTS.md (which becomes part of your system prompt at session start) makes them permanent across compacts and removes the per-message overhead. **Don't remove these sections** — if you do, the bridge will fall back to appending them per-message (set \`AGENTBRIDGE_PIN_CONTRACT=always\`).`;

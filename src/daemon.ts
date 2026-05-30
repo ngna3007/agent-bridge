@@ -69,6 +69,20 @@ let codexCollaborationKickoffSent = false;
 let lastAttachStatusSentTs = 0;
 const ATTACH_STATUS_COOLDOWN_MS = 30_000; // Don't re-send status on rapid reattach
 
+// Token-saving: the BRIDGE_CONTRACT_REMINDER content (marker contract +
+// git-write prohibition + role guidance) lives in AGENTS.md after
+// `abg init` and becomes part of Codex's system prompt at session start.
+// System prompt survives /compact, so we don't need to re-inject the
+// contract per-message. Default mode is "off" (skip per-msg append).
+//
+// Modes:
+//   "off"    — never append (default; AGENTS.md handles it)
+//   "once"   — append on first msg of each Codex thread (legacy mid-state)
+//   "always" — append to every msg (legacy backstop for setups without
+//              AGENTS.md, or while debugging contract drift)
+const PIN_CONTRACT_MODE = (process.env.AGENTBRIDGE_PIN_CONTRACT ?? "off").toLowerCase();
+let lastPinnedContractThreadId: string | null = null;
+
 // Liveness probe used by challenge-on-contest admission. Issue #68: OS may never
 // surface FIN on a half-open TCP, so readyState alone can't tell us the old peer
 // is gone. When a new frontend arrives while a socket is still OPEN, we ping the
@@ -232,6 +246,8 @@ codex.on("exit", (code: number | null) => {
   clearPendingClaudeDisconnect("Codex process exited");
   claudeOnlineNoticeSent = false;
   claudeOfflineNoticeShown = false;
+  // Codex thread is gone; next thread needs the contract pinned again.
+  lastPinnedContractThreadId = null;
   emitToClaude(
     systemMessage(
       "system_codex_exit",
@@ -330,15 +346,30 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
       }
 
       const requireReply = !!message.requireReply;
-      let contentWithReminder = message.message.content + "\n\n" + BRIDGE_CONTRACT_REMINDER;
+      // Pin contract once per Codex thread. Cuts ~200 tokens per
+      // Claude→Codex msg after the first. Falls back to per-msg append
+      // when AGENTBRIDGE_PIN_CONTRACT=always (legacy mode for users who
+      // see contract drift mid-session).
+      const activeThreadId = codex.activeThreadId;
+      const needsContract =
+        PIN_CONTRACT_MODE === "always" ||
+        (PIN_CONTRACT_MODE === "once" && activeThreadId !== lastPinnedContractThreadId);
+      let contentToSend = message.message.content;
+      if (needsContract) {
+        contentToSend += "\n\n" + BRIDGE_CONTRACT_REMINDER;
+        if (PIN_CONTRACT_MODE === "once" && activeThreadId) {
+          lastPinnedContractThreadId = activeThreadId;
+          log(`Pinned BRIDGE_CONTRACT_REMINDER for thread ${activeThreadId.slice(0, 8)}; subsequent msgs skip the reminder`);
+        }
+      }
       if (requireReply) {
-        contentWithReminder += REPLY_REQUIRED_INSTRUCTION;
+        contentToSend += REPLY_REQUIRED_INSTRUCTION;
         replyRequired = true;
         replyReceivedDuringTurn = false;
         log(`Reply required flag set for this message`);
       }
-      log(`Forwarding Claude → Codex (${message.message.content.length} chars, requireReply=${requireReply})`);
-      const injected = codex.injectMessage(contentWithReminder);
+      log(`Forwarding Claude → Codex (${message.message.content.length} chars, requireReply=${requireReply}, pinnedContract=${needsContract})`);
+      const injected = codex.injectMessage(contentToSend);
       if (!injected) {
         const reason = codex.turnInProgress
           ? "Codex is busy executing a turn. Wait for it to finish before sending another message."

@@ -1919,6 +1919,8 @@ var claudeOfflineNoticeShown = false;
 var codexCollaborationKickoffSent = false;
 var lastAttachStatusSentTs = 0;
 var ATTACH_STATUS_COOLDOWN_MS = 30000;
+var PIN_CONTRACT_MODE = (process.env.AGENTBRIDGE_PIN_CONTRACT ?? "off").toLowerCase();
+var lastPinnedContractThreadId = null;
 var LIVENESS_PROBE_TIMEOUT_MS = parsePositiveIntEnv("AGENTBRIDGE_LIVENESS_PROBE_TIMEOUT_MS", 3000, log);
 var LIVENESS_PROBE_POLL_MS = 50;
 var challengeInProgress = false;
@@ -2022,6 +2024,7 @@ codex.on("exit", (code) => {
   clearPendingClaudeDisconnect("Codex process exited");
   claudeOnlineNoticeSent = false;
   claudeOfflineNoticeShown = false;
+  lastPinnedContractThreadId = null;
   emitToClaude(systemMessage("system_codex_exit", `\u26A0\uFE0F Codex app-server exited (code ${code ?? "unknown"}). AgentBridge daemon is still running, but the Codex side needs to be restarted.`));
   broadcastStatus();
 });
@@ -2106,17 +2109,26 @@ function handleControlMessage(ws, raw) {
         return;
       }
       const requireReply = !!message.requireReply;
-      let contentWithReminder = message.message.content + `
+      const activeThreadId = codex.activeThreadId;
+      const needsContract = PIN_CONTRACT_MODE === "always" || PIN_CONTRACT_MODE === "once" && activeThreadId !== lastPinnedContractThreadId;
+      let contentToSend = message.message.content;
+      if (needsContract) {
+        contentToSend += `
 
 ` + BRIDGE_CONTRACT_REMINDER;
+        if (PIN_CONTRACT_MODE === "once" && activeThreadId) {
+          lastPinnedContractThreadId = activeThreadId;
+          log(`Pinned BRIDGE_CONTRACT_REMINDER for thread ${activeThreadId.slice(0, 8)}; subsequent msgs skip the reminder`);
+        }
+      }
       if (requireReply) {
-        contentWithReminder += REPLY_REQUIRED_INSTRUCTION;
+        contentToSend += REPLY_REQUIRED_INSTRUCTION;
         replyRequired = true;
         replyReceivedDuringTurn = false;
         log(`Reply required flag set for this message`);
       }
-      log(`Forwarding Claude \u2192 Codex (${message.message.content.length} chars, requireReply=${requireReply})`);
-      const injected = codex.injectMessage(contentWithReminder);
+      log(`Forwarding Claude \u2192 Codex (${message.message.content.length} chars, requireReply=${requireReply}, pinnedContract=${needsContract})`);
+      const injected = codex.injectMessage(contentToSend);
       if (!injected) {
         const reason = codex.turnInProgress ? "Codex is busy executing a turn. Wait for it to finish before sending another message." : "Injection failed: no active thread or WebSocket not connected.";
         log(`Injection rejected: ${reason}`);
