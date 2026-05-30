@@ -41,6 +41,10 @@ async function main() {
       const { runKill } = await import("./cli/kill");
       await runKill();
       break;
+    case "shell-init":
+      const { runShellInit } = await import("./cli/shell-init");
+      await runShellInit(restArgs);
+      break;
     case "--help":
     case "-h":
     case undefined:
@@ -71,18 +75,26 @@ Commands:
   claude [args...]  Start Claude Code with push channel enabled
   codex [args...]   Start Codex TUI connected to AgentBridge daemon
   kill              Force kill all AgentBridge processes
+  shell-init [sh]   Emit a shell snippet adding \`--abg\` opt-in for codex/claude
 
 Options:
   --help, -h        Show this help message
   --version, -v     Show version
 
 Examples:
-  abg init                     # First-time setup
-  abg claude                   # Start Claude Code
-  abg claude --resume          # Start Claude Code and resume session
-  abg codex                    # Start Codex TUI
-  abg codex --model o3         # Start Codex with specific model
-  abg kill                     # Emergency: kill all processes
+  abg init                          # First-time setup
+  abg claude                        # Start Claude Code
+  abg claude --resume               # Start Claude Code and resume session
+  abg codex                         # Start Codex TUI
+  abg codex --model o3              # Start Codex with specific model
+  abg kill                          # Emergency: kill all processes
+
+  # Shell integration (one-time install):
+  eval "$(abg shell-init)"          # this shell session only
+  abg shell-init bash >> ~/.bashrc  # persist for new shells
+  # After install:
+  codex --abg                       # opt into bridge for this invocation
+  codex                             # native codex, no bridge
 `.trim());
 }
 
