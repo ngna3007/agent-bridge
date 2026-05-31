@@ -140,10 +140,53 @@ describe("Dual-mode transport: pull mode message queue", () => {
     const firstId = notifications[0].params.meta.message_id as string;
     const secondId = notifications[1].params.meta.message_id as string;
 
-    expect(firstId).toMatch(/^codex_msg_[a-f0-9]{12}_1$/);
-    expect(secondId).toMatch(/^codex_msg_[a-f0-9]{12}_2$/);
-    expect(firstId.replace(/_1$/, "")).toBe(secondId.replace(/_2$/, ""));
-    expect(firstId).not.toBe("codex_msg_1");
+    // Format: <4-hex-random-prefix><seq> (e.g. "9c8d1", "9c8d2").
+    // The random prefix prevents per-process collisions: a bare "1"
+    // could be reused across restarts and confuse Claude Code's dedup.
+    expect(firstId).toMatch(/^[a-f0-9]{4}1$/);
+    expect(secondId).toMatch(/^[a-f0-9]{4}2$/);
+    expect(firstId.slice(0, -1)).toBe(secondId.slice(0, -1));
+    // Regression guard: msgId must NOT collapse to just a sequence number.
+    expect(firstId).not.toBe("1");
+  });
+
+  test("push mode meta uses compact chat_id and message_id (token economy)", async () => {
+    // Every Claude-facing message wraps in a <channel chat_id="..."
+    // message_id="..." ...> tag. Each unnecessary character is paid in
+    // tokens by the Claude session for the lifetime of every message.
+    // This test pins a generous upper bound on the two identifier
+    // fields we control, so a regression that inflates them (e.g.
+    // reverting to "codex_<epoch>" or "codex_msg_<uuid>_<seq>") fails
+    // loudly here before reaching production.
+    const adapter = createAdapter("push");
+    adapter.resolveMode();
+
+    const notifications: any[] = [];
+    adapter.server = {
+      notification: async (payload: any) => {
+        notifications.push(payload);
+      },
+    };
+
+    await adapter.pushNotification(makeBridgeMessage("hi", 1705312200000));
+    const meta = notifications[0].params.meta as Record<string, string>;
+
+    // chat_id: "c" + 4 hex chars = exactly 5 characters.
+    expect(meta.chat_id).toMatch(/^c[a-f0-9]{4}$/);
+    expect(meta.chat_id.length).toBe(5);
+
+    // message_id: 4 hex prefix + 1+ digit sequence. Allow growth in
+    // sequence width (more than 9999 messages will reach 5 digits) but
+    // hard-cap the prefix so the field cannot quietly grow back.
+    expect(meta.message_id).toMatch(/^[a-f0-9]{4}\d+$/);
+    expect(meta.message_id.length).toBeLessThanOrEqual(10);
+
+    // All other fields must still be present so Claude Code's renderer
+    // emits the same tag attributes (no surprise downgrades).
+    expect(meta.user).toBe("Codex");
+    expect(meta.user_id).toBe("codex");
+    expect(meta.source_type).toBe("codex");
+    expect(meta.ts).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
   });
 
   test("pushNotification falls back to the pull queue when push delivery throws", async () => {

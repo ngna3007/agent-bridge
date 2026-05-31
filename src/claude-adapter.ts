@@ -81,8 +81,14 @@ export class ClaudeAdapter extends EventEmitter {
     super();
     this.logFile = logFile;
     this.instanceId = randomUUID().slice(0, 8);
-    this.sessionId = `codex_${Date.now()}`;
-    this.notificationIdPrefix = randomUUID().replace(/-/g, "").slice(0, 12);
+    // Short, opaque identifiers. Claude Code renders chat_id and
+    // message_id as attributes inside every inbound <channel> tag, so
+    // every saved character is a per-message token saving across the
+    // session. We keep a 4-char random prefix to prevent collisions
+    // across concurrent or restarted processes that might otherwise
+    // both emit message_id="1".
+    this.sessionId = `c${randomUUID().replace(/-/g, "").slice(0, 4)}`;
+    this.notificationIdPrefix = randomUUID().replace(/-/g, "").slice(0, 4);
     this.log(`ClaudeAdapter created (instance=${this.instanceId})`);
 
     const envMode = process.env.AGENTBRIDGE_MODE as DeliveryMode | undefined;
@@ -158,7 +164,7 @@ export class ClaudeAdapter extends EventEmitter {
   }
 
   private async pushViaChannel(message: BridgeMessage) {
-    const msgId = `codex_msg_${this.notificationIdPrefix}_${++this.notificationSeq}`;
+    const msgId = `${this.notificationIdPrefix}${++this.notificationSeq}`;
     const ts = new Date(message.timestamp).toISOString();
 
     try {

@@ -13853,8 +13853,8 @@ class ClaudeAdapter extends EventEmitter {
     super();
     this.logFile = logFile;
     this.instanceId = randomUUID().slice(0, 8);
-    this.sessionId = `codex_${Date.now()}`;
-    this.notificationIdPrefix = randomUUID().replace(/-/g, "").slice(0, 12);
+    this.sessionId = `c${randomUUID().replace(/-/g, "").slice(0, 4)}`;
+    this.notificationIdPrefix = randomUUID().replace(/-/g, "").slice(0, 4);
     this.log(`ClaudeAdapter created (instance=${this.instanceId})`);
     const envMode = process.env.AGENTBRIDGE_MODE;
     this.configuredMode = envMode && ["push", "pull", "auto"].includes(envMode) ? envMode : "auto";
@@ -13904,7 +13904,7 @@ class ClaudeAdapter extends EventEmitter {
     }
   }
   async pushViaChannel(message) {
-    const msgId = `codex_msg_${this.notificationIdPrefix}_${++this.notificationSeq}`;
+    const msgId = `${this.notificationIdPrefix}${++this.notificationSeq}`;
     const ts = new Date(message.timestamp).toISOString();
     try {
       await this.server.notification({
