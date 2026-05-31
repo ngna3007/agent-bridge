@@ -5,7 +5,6 @@ import {
   closeSync,
   writeFileSync,
   unlinkSync,
-  appendFileSync,
   existsSync,
   mkdirSync,
 } from "node:fs";
@@ -14,11 +13,13 @@ import { StateDirResolver } from "../state-dir";
 import { ConfigService } from "../config-service";
 import { DaemonLifecycle } from "../daemon-lifecycle";
 import { StderrRingBuffer } from "../stderr-ring-buffer";
+import { getRotatingLogger } from "../log-rotator";
 import { checkOwnedFlagConflicts } from "./claude";
 
 /**
  * Write a timestamped entry to the codex wrapper log.
  *
+ * Routed through the shared rotating logger so this file is also bounded.
  * Silent on IO failure — logging must never break the wrapper itself.
  */
 function appendWrapperLog(path: string, entry: string): void {
@@ -27,10 +28,10 @@ function appendWrapperLog(path: string, entry: string): void {
     if (!existsSync(dir)) {
       mkdirSync(dir, { recursive: true });
     }
-    appendFileSync(path, `[${new Date().toISOString()}] ${entry}\n`, "utf-8");
   } catch {
-    /* ignore */
+    /* ignore — getRotatingLogger.write also catches IO errors */
   }
+  getRotatingLogger(path).write(`[${new Date().toISOString()}] ${entry}\n`);
 }
 
 /**

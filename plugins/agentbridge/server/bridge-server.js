@@ -6517,9 +6517,6 @@ var require_dist = __commonJS((exports, module) => {
   exports.default = formatsPlugin;
 });
 
-// src/bridge.ts
-import { appendFileSync as appendFileSync2 } from "fs";
-
 // node_modules/zod/v4/core/core.js
 var NEVER = Object.freeze({
   status: "aborted"
@@ -13662,7 +13659,6 @@ class StdioServerTransport {
 // src/claude-adapter.ts
 import { EventEmitter } from "events";
 import { randomUUID } from "crypto";
-import { appendFileSync } from "fs";
 
 // src/state-dir.ts
 import { mkdirSync, existsSync } from "fs";
@@ -13714,6 +13710,94 @@ class StateDirResolver {
   get killedFile() {
     return join(this.stateDir, "killed");
   }
+}
+
+// src/log-rotator.ts
+import { appendFileSync, statSync, renameSync, unlinkSync } from "fs";
+var DEFAULT_MAX_BYTES = 50000000;
+var DEFAULT_MAX_FILES = 3;
+var MIN_MAX_BYTES = 1024;
+var MIN_MAX_FILES = 1;
+function parseEnvInt(name, fallback, min) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "")
+    return fallback;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < min)
+    return fallback;
+  return n;
+}
+
+class RotatingLogger {
+  path;
+  bytesWritten = 0;
+  maxBytes;
+  maxFiles;
+  constructor(path, opts = {}) {
+    this.path = path;
+    this.maxBytes = opts.maxBytes ?? parseEnvInt("AGENTBRIDGE_LOG_MAX_BYTES", DEFAULT_MAX_BYTES, MIN_MAX_BYTES);
+    this.maxFiles = opts.maxFiles ?? parseEnvInt("AGENTBRIDGE_LOG_MAX_FILES", DEFAULT_MAX_FILES, MIN_MAX_FILES);
+    this.seed();
+  }
+  write(line) {
+    try {
+      const bytes = Buffer.byteLength(line, "utf8");
+      if (this.bytesWritten + bytes > this.maxBytes) {
+        this.rotate();
+      }
+      appendFileSync(this.path, line);
+      this.bytesWritten += bytes;
+    } catch {}
+  }
+  rotate() {
+    try {
+      const oldest = this.generationPath(this.maxFiles);
+      this.silentUnlink(oldest);
+      for (let i = this.maxFiles - 1;i >= 1; i--) {
+        this.silentRename(this.generationPath(i), this.generationPath(i + 1));
+      }
+      this.silentRename(this.path, this.generationPath(1));
+      this.bytesWritten = 0;
+    } catch {}
+  }
+  getBytesWritten() {
+    return this.bytesWritten;
+  }
+  seed() {
+    try {
+      const st = statSync(this.path);
+      if (st.size > this.maxBytes) {
+        this.bytesWritten = st.size;
+        this.rotate();
+      } else {
+        this.bytesWritten = st.size;
+      }
+    } catch {
+      this.bytesWritten = 0;
+    }
+  }
+  generationPath(n) {
+    return `${this.path}.${n}`;
+  }
+  silentRename(from, to) {
+    try {
+      renameSync(from, to);
+    } catch {}
+  }
+  silentUnlink(p) {
+    try {
+      unlinkSync(p);
+    } catch {}
+  }
+}
+var cache = new Map;
+function getRotatingLogger(path, opts) {
+  let inst = cache.get(path);
+  if (!inst) {
+    inst = new RotatingLogger(path, opts);
+    cache.set(path, inst);
+  }
+  return inst;
 }
 
 // src/claude-adapter.ts
@@ -13983,9 +14067,7 @@ ${formatted}`
     const line = `[${new Date().toISOString()}] [ClaudeAdapter] ${msg}
 `;
     process.stderr.write(line);
-    try {
-      appendFileSync(this.logFile, line);
-    } catch {}
+    getRotatingLogger(this.logFile).write(line);
   }
 }
 
@@ -14185,7 +14267,7 @@ class DaemonClient extends EventEmitter2 {
 
 // src/daemon-lifecycle.ts
 import { spawn, execFileSync } from "child_process";
-import { existsSync as existsSync2, readFileSync, unlinkSync, writeFileSync, openSync, closeSync, constants } from "fs";
+import { existsSync as existsSync2, readFileSync, unlinkSync as unlinkSync2, writeFileSync, openSync, closeSync, constants } from "fs";
 import { fileURLToPath } from "url";
 var DAEMON_ENTRY = process.env.AGENTBRIDGE_DAEMON_ENTRY ?? "./daemon.ts";
 var DAEMON_PATH = fileURLToPath(new URL(DAEMON_ENTRY, import.meta.url));
@@ -14304,12 +14386,12 @@ class DaemonLifecycle {
   }
   removePidFile() {
     try {
-      unlinkSync(this.stateDir.pidFile);
+      unlinkSync2(this.stateDir.pidFile);
     } catch {}
   }
   removeStatusFile() {
     try {
-      unlinkSync(this.stateDir.statusFile);
+      unlinkSync2(this.stateDir.statusFile);
     } catch {}
   }
   markKilled() {
@@ -14319,7 +14401,7 @@ class DaemonLifecycle {
   }
   clearKilled() {
     try {
-      unlinkSync(this.stateDir.killedFile);
+      unlinkSync2(this.stateDir.killedFile);
     } catch {}
   }
   wasKilled() {
@@ -14378,7 +14460,7 @@ class DaemonLifecycle {
   }
   releaseLock() {
     try {
-      unlinkSync(this.stateDir.lockFile);
+      unlinkSync2(this.stateDir.lockFile);
     } catch {}
   }
   async kill(gracefulTimeoutMs = 3000) {
@@ -14884,9 +14966,7 @@ function log(msg) {
   const line = `[${new Date().toISOString()}] [AgentBridgeFrontend] ${msg}
 `;
   process.stderr.write(line);
-  try {
-    appendFileSync2(stateDir.logFile, line);
-  } catch {}
+  getRotatingLogger(stateDir.logFile).write(line);
 }
 log(`Starting AgentBridge frontend (daemon ws ${CONTROL_WS_URL})`);
 (async () => {

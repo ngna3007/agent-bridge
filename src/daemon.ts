@@ -1,8 +1,8 @@
 #!/usr/bin/env bun
 
-import { appendFileSync } from "node:fs";
 import type { ServerWebSocket } from "bun";
 import { CodexAdapter } from "./codex-adapter";
+import { getRotatingLogger } from "./log-rotator";
 import {
   BRIDGE_CONTRACT_REMINDER,
   REPLY_REQUIRED_INSTRUCTION,
@@ -824,9 +824,7 @@ process.on("unhandledRejection", (reason: any) => {
 function log(msg: string) {
   const line = `[${new Date().toISOString()}] [AgentBridgeDaemon] ${msg}\n`;
   process.stderr.write(line);
-  try {
-    appendFileSync(stateDir.logFile, line);
-  } catch {}
+  getRotatingLogger(stateDir.logFile).write(line);
 }
 
 // Refuse to start if user intentionally killed the daemon.
