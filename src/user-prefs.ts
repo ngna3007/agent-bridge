@@ -37,6 +37,23 @@ export interface UserPrefs {
    * Used to gate the first-run prompt - once answered, we don't re-ask.
    */
   statusLineAsked?: boolean;
+  /**
+   * User has expressed interest in the caveman Claude Code skill
+   * (terse, compressed responses). AgentBridge does not install or
+   * enable caveman; this flag exists so future integrations (e.g. a
+   * suggestion in the kickoff message) can respect the user's choice.
+   */
+  cavemanOptIn?: boolean;
+  /** Whether the first-run prompt for caveman has been answered. */
+  cavemanAsked?: boolean;
+  /**
+   * User has expressed interest in rtk (Rust Token Killer CLI proxy).
+   * Same semantics as cavemanOptIn: a forward-looking preference flag,
+   * not a switch that AgentBridge currently acts on by itself.
+   */
+  rtkOptIn?: boolean;
+  /** Whether the first-run prompt for rtk has been answered. */
+  rtkAsked?: boolean;
 }
 
 const PREFS_FILE = "user-prefs.json";
@@ -94,6 +111,26 @@ export class UserPrefsService {
     return this.load().statusLineAsked === true;
   }
 
+  /** Has the user been asked about the caveman skill yet? */
+  hasBeenAskedCaveman(): boolean {
+    return this.load().cavemanAsked === true;
+  }
+
+  /** Has the user been asked about rtk yet? */
+  hasBeenAskedRtk(): boolean {
+    return this.load().rtkAsked === true;
+  }
+
+  /** True when user opted in to caveman during onboarding. */
+  isCavemanOptedIn(): boolean {
+    return this.load().cavemanOptIn === true;
+  }
+
+  /** True when user opted in to rtk during onboarding. */
+  isRtkOptedIn(): boolean {
+    return this.load().rtkOptIn === true;
+  }
+
   /** Read the raw object (preserves unknown keys for merge). */
   private loadRaw(): Record<string, unknown> {
     try {
@@ -110,9 +147,11 @@ export class UserPrefsService {
     if (raw.statusLineMode === "channel" || raw.statusLineMode === "line") {
       out.statusLineMode = raw.statusLineMode;
     }
-    if (raw.statusLineAsked === true) {
-      out.statusLineAsked = true;
-    }
+    if (raw.statusLineAsked === true) out.statusLineAsked = true;
+    if (raw.cavemanOptIn === true) out.cavemanOptIn = true;
+    if (raw.cavemanAsked === true) out.cavemanAsked = true;
+    if (raw.rtkOptIn === true) out.rtkOptIn = true;
+    if (raw.rtkAsked === true) out.rtkAsked = true;
     return out;
   }
 

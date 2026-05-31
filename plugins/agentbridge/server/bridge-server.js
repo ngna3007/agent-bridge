@@ -14697,6 +14697,18 @@ class UserPrefsService {
   hasBeenAskedStatusLine() {
     return this.load().statusLineAsked === true;
   }
+  hasBeenAskedCaveman() {
+    return this.load().cavemanAsked === true;
+  }
+  hasBeenAskedRtk() {
+    return this.load().rtkAsked === true;
+  }
+  isCavemanOptedIn() {
+    return this.load().cavemanOptIn === true;
+  }
+  isRtkOptedIn() {
+    return this.load().rtkOptIn === true;
+  }
   loadRaw() {
     try {
       const raw = readFileSync3(this.path, "utf-8");
@@ -14711,9 +14723,16 @@ class UserPrefsService {
     if (raw.statusLineMode === "channel" || raw.statusLineMode === "line") {
       out.statusLineMode = raw.statusLineMode;
     }
-    if (raw.statusLineAsked === true) {
+    if (raw.statusLineAsked === true)
       out.statusLineAsked = true;
-    }
+    if (raw.cavemanOptIn === true)
+      out.cavemanOptIn = true;
+    if (raw.cavemanAsked === true)
+      out.cavemanAsked = true;
+    if (raw.rtkOptIn === true)
+      out.rtkOptIn = true;
+    if (raw.rtkAsked === true)
+      out.rtkAsked = true;
     return out;
   }
   ensureDir() {
