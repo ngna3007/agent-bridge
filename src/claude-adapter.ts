@@ -20,8 +20,8 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
-import { appendFileSync } from "node:fs";
 import { StateDirResolver } from "./state-dir";
+import { getRotatingLogger } from "./log-rotator";
 import type { BridgeMessage } from "./types";
 
 export type ReplySender = (msg: BridgeMessage, requireReply?: boolean) => Promise<{ success: boolean; error?: string }>;
@@ -343,8 +343,6 @@ export class ClaudeAdapter extends EventEmitter {
   private log(msg: string) {
     const line = `[${new Date().toISOString()}] [ClaudeAdapter] ${msg}\n`;
     process.stderr.write(line);
-    try {
-      appendFileSync(this.logFile, line);
-    } catch {}
+    getRotatingLogger(this.logFile).write(line);
   }
 }

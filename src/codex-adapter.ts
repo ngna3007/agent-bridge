@@ -12,8 +12,8 @@
 import { spawn, execSync, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
 import { EventEmitter } from "node:events";
-import { appendFileSync } from "node:fs";
 import { StateDirResolver } from "./state-dir";
+import { getRotatingLogger } from "./log-rotator";
 import type { BridgeMessage } from "./types";
 import type { ServerWebSocket } from "bun";
 import {
@@ -1643,6 +1643,6 @@ export class CodexAdapter extends EventEmitter {
   private log(msg: string) {
     const line = `[${new Date().toISOString()}] [CodexAdapter] ${msg}\n`;
     process.stderr.write(line);
-    try { appendFileSync(this.logFile, line); } catch {}
+    getRotatingLogger(this.logFile).write(line);
   }
 }

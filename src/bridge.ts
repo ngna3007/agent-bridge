@@ -1,10 +1,10 @@
 #!/usr/bin/env bun
 
-import { appendFileSync } from "node:fs";
 import { ClaudeAdapter } from "./claude-adapter";
 import { DaemonClient } from "./daemon-client";
 import { DaemonLifecycle } from "./daemon-lifecycle";
 import { StateDirResolver } from "./state-dir";
+import { getRotatingLogger } from "./log-rotator";
 import { ConfigService } from "./config-service";
 import { disabledReplyError, type BridgeDisabledReason } from "./bridge-disabled-state";
 import {
@@ -444,9 +444,7 @@ process.on("unhandledRejection", (reason: any) => {
 function log(msg: string) {
   const line = `[${new Date().toISOString()}] [AgentBridgeFrontend] ${msg}\n`;
   process.stderr.write(line);
-  try {
-    appendFileSync(stateDir.logFile, line);
-  } catch {}
+  getRotatingLogger(stateDir.logFile).write(line);
 }
 
 log(`Starting AgentBridge frontend (daemon ws ${CONTROL_WS_URL})`);
