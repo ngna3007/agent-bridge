@@ -19,11 +19,12 @@ afterEach(() => {
 });
 
 describe("wireStatusLine - first-time setup (no settings.json)", () => {
-  test("creates settings.json with statusLine entry", () => {
+  test("creates settings.json with a fresh statusLine entry", () => {
     const r = wireStatusLine({ settingsPath, statusFilePath: statusPath });
     expect(r.status).toBe("wired");
     if (r.status !== "wired") return;
-    expect(r.backupPath).toBeNull(); // nothing existed to back up
+    expect(r.backupPath).toBeNull();
+    expect(r.command).toBe(`cat ${statusPath}`);
     const written = JSON.parse(readFileSync(settingsPath, "utf-8"));
     expect(written.statusLine.command).toBe(`cat ${statusPath}`);
   });
@@ -36,7 +37,7 @@ describe("wireStatusLine - first-time setup (no settings.json)", () => {
 });
 
 describe("wireStatusLine - existing settings.json with other keys", () => {
-  test("preserves unrelated keys when adding statusLine", () => {
+  test("preserves unrelated keys when adding a fresh statusLine", () => {
     mkdirSync(join(tmp, ".claude"), { recursive: true });
     writeFileSync(settingsPath, JSON.stringify({
       theme: "dark",
@@ -65,7 +66,7 @@ describe("wireStatusLine - existing settings.json with other keys", () => {
 });
 
 describe("wireStatusLine - already-correct detection", () => {
-  test("returns already-correct when settings already point at the same status file", () => {
+  test("returns already-correct when settings already points at the same status file (plain command)", () => {
     mkdirSync(join(tmp, ".claude"), { recursive: true });
     writeFileSync(settingsPath, JSON.stringify({
       statusLine: { command: `cat ${statusPath}` },
@@ -73,36 +74,72 @@ describe("wireStatusLine - already-correct detection", () => {
     const r = wireStatusLine({ settingsPath, statusFilePath: statusPath });
     expect(r.status).toBe("already-correct");
   });
+
+  test("returns already-correct when statusLine is a chained command we wrote previously", () => {
+    mkdirSync(join(tmp, ".claude"), { recursive: true });
+    const chained = `{ bash "/home/x/caveman.sh"; printf ' '; cat ${statusPath}; } | tr -d '\\n'`;
+    writeFileSync(settingsPath, JSON.stringify({ statusLine: { command: chained } }));
+    const r = wireStatusLine({ settingsPath, statusFilePath: statusPath });
+    expect(r.status).toBe("already-correct");
+  });
 });
 
-describe("wireStatusLine - conflict handling", () => {
-  test("reports conflict when an unrelated statusLine command exists", () => {
+describe("wireStatusLine - chaining onto an existing command", () => {
+  test("chains by default instead of overwriting", () => {
     mkdirSync(join(tmp, ".claude"), { recursive: true });
     writeFileSync(settingsPath, JSON.stringify({
-      statusLine: { command: "echo hello" },
+      statusLine: { command: 'bash "/home/x/caveman.sh"' },
     }));
     const r = wireStatusLine({ settingsPath, statusFilePath: statusPath });
-    expect(r.status).toBe("conflict");
-    if (r.status !== "conflict") return;
-    expect(r.existingCommand).toBe("echo hello");
-    // Original file untouched on conflict (no force).
-    const stillThere = JSON.parse(readFileSync(settingsPath, "utf-8"));
-    expect(stillThere.statusLine.command).toBe("echo hello");
+    expect(r.status).toBe("chained");
+    if (r.status !== "chained") return;
+    expect(r.previousCommand).toBe('bash "/home/x/caveman.sh"');
+    // New command must invoke the existing command first, then cat ours.
+    expect(r.command).toContain('bash "/home/x/caveman.sh"');
+    expect(r.command).toContain(`cat ${statusPath}`);
+    // Output is flattened to a single line.
+    expect(r.command).toContain("tr -d '\\n'");
   });
 
-  test("force=true overwrites existing statusLine and preserves siblings inside it", () => {
+  test("chained command preserves siblings inside the existing statusLine record", () => {
     mkdirSync(join(tmp, ".claude"), { recursive: true });
     writeFileSync(settingsPath, JSON.stringify({
       statusLine: {
-        command: "echo hello",
+        command: 'bash "/home/x/caveman.sh"',
         someOtherKey: "preserved",
       },
     }));
+    const r = wireStatusLine({ settingsPath, statusFilePath: statusPath });
+    expect(r.status).toBe("chained");
+    const written = JSON.parse(readFileSync(settingsPath, "utf-8"));
+    expect(written.statusLine.someOtherKey).toBe("preserved");
+  });
+
+  test("chain is idempotent: running twice does not double-wrap", () => {
+    mkdirSync(join(tmp, ".claude"), { recursive: true });
+    writeFileSync(settingsPath, JSON.stringify({
+      statusLine: { command: 'bash "/home/x/caveman.sh"' },
+    }));
+    const first = wireStatusLine({ settingsPath, statusFilePath: statusPath });
+    expect(first.status).toBe("chained");
+    const second = wireStatusLine({ settingsPath, statusFilePath: statusPath });
+    expect(second.status).toBe("already-correct");
+    // settings.json command is unchanged on the second run.
+    const written = JSON.parse(readFileSync(settingsPath, "utf-8"));
+    if (first.status !== "chained") return;
+    expect(written.statusLine.command).toBe(first.command);
+  });
+
+  test("force=true overwrites instead of chaining", () => {
+    mkdirSync(join(tmp, ".claude"), { recursive: true });
+    writeFileSync(settingsPath, JSON.stringify({
+      statusLine: { command: 'bash "/home/x/caveman.sh"' },
+    }));
     const r = wireStatusLine({ settingsPath, statusFilePath: statusPath, force: true });
     expect(r.status).toBe("wired");
-    const written = JSON.parse(readFileSync(settingsPath, "utf-8"));
-    expect(written.statusLine.command).toBe(`cat ${statusPath}`);
-    expect(written.statusLine.someOtherKey).toBe("preserved");
+    if (r.status !== "wired") return;
+    expect(r.command).toBe(`cat ${statusPath}`);
+    expect(r.command).not.toContain("caveman");
   });
 });
 
@@ -114,7 +151,6 @@ describe("wireStatusLine - error paths", () => {
     expect(r.status).toBe("error");
     if (r.status !== "error") return;
     expect(r.reason).toContain("not valid JSON");
-    // File preserved as-is.
     expect(readFileSync(settingsPath, "utf-8")).toBe("{ not valid json");
   });
 
