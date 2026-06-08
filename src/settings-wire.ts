@@ -80,13 +80,26 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 }
 
 /**
+ * Build a shell command that prints AgentBridge's status tag only
+ * when this Claude session was launched via `abg claude`. That
+ * sessions sets AGENTBRIDGE_ACTIVE=1 in its environment, which
+ * propagates to the statusLine command's subshell. Plain `claude` /
+ * `claude -c` sessions (which don't set the flag) get a silent
+ * pass-through so the user doesn't see stale bridge state.
+ */
+function gatedCat(statusFilePath: string): string {
+  return `[ "$AGENTBRIDGE_ACTIVE" = "1" ] && cat ${statusFilePath}`;
+}
+
+/**
  * Build a one-line shell command that runs `existing` first, then
- * appends a space and the contents of `statusFilePath`. The whole
- * thing is piped through `tr -d '\n'` so embedded newlines from
- * either source don't push the statusbar to a second line.
+ * conditionally appends a space and the contents of `statusFilePath`
+ * (only when AGENTBRIDGE_ACTIVE=1). The whole thing is piped through
+ * `tr -d '\n'` so embedded newlines from either source don't push
+ * the statusbar to a second line.
  */
 function composeChainedCommand(existing: string, statusFilePath: string): string {
-  return `{ ${existing}; printf ' '; cat ${statusFilePath}; } | tr -d '\\n'`;
+  return `{ ${existing}; [ "$AGENTBRIDGE_ACTIVE" = "1" ] && { printf ' '; cat ${statusFilePath}; }; } | tr -d '\\n'`;
 }
 
 /** True when `command` already contains our `cat <statusFilePath>` snippet. */
@@ -101,7 +114,7 @@ function alreadyChained(command: string, statusFilePath: string): boolean {
  */
 export function wireStatusLine(opts: WireStatusLineOptions): WireStatusLineResult {
   const settingsPath = opts.settingsPath ?? defaultSettingsPath();
-  const standaloneCommand = `cat ${opts.statusFilePath}`;
+  const standaloneCommand = gatedCat(opts.statusFilePath);
 
   // Load current settings (or start from {} if the file doesn't exist).
   let raw: Record<string, unknown> = {};

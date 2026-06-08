@@ -19,14 +19,17 @@ afterEach(() => {
 });
 
 describe("wireStatusLine - first-time setup (no settings.json)", () => {
-  test("creates settings.json with a fresh statusLine entry", () => {
+  test("creates settings.json with a fresh, env-gated statusLine entry", () => {
     const r = wireStatusLine({ settingsPath, statusFilePath: statusPath });
     expect(r.status).toBe("wired");
     if (r.status !== "wired") return;
     expect(r.backupPath).toBeNull();
-    expect(r.command).toBe(`cat ${statusPath}`);
+    // Env-gated: the cat only runs when AGENTBRIDGE_ACTIVE=1 (set by
+    // `abg claude`). Plain claude sessions see nothing.
+    expect(r.command).toContain('"$AGENTBRIDGE_ACTIVE" = "1"');
+    expect(r.command).toContain(`cat ${statusPath}`);
     const written = JSON.parse(readFileSync(settingsPath, "utf-8"));
-    expect(written.statusLine.command).toBe(`cat ${statusPath}`);
+    expect(written.statusLine.command).toBe(r.command);
   });
 
   test("creates parent ~/.claude directory if missing", () => {
@@ -48,7 +51,8 @@ describe("wireStatusLine - existing settings.json with other keys", () => {
     const written = JSON.parse(readFileSync(settingsPath, "utf-8"));
     expect(written.theme).toBe("dark");
     expect(written.env).toEqual({ FOO: "bar" });
-    expect(written.statusLine.command).toBe(`cat ${statusPath}`);
+    expect(written.statusLine.command).toContain('"$AGENTBRIDGE_ACTIVE" = "1"');
+    expect(written.statusLine.command).toContain(`cat ${statusPath}`);
   });
 
   test("creates a backup file before writing", () => {
@@ -138,7 +142,8 @@ describe("wireStatusLine - chaining onto an existing command", () => {
     const r = wireStatusLine({ settingsPath, statusFilePath: statusPath, force: true });
     expect(r.status).toBe("wired");
     if (r.status !== "wired") return;
-    expect(r.command).toBe(`cat ${statusPath}`);
+    expect(r.command).toContain('"$AGENTBRIDGE_ACTIVE" = "1"');
+    expect(r.command).toContain(`cat ${statusPath}`);
     expect(r.command).not.toContain("caveman");
   });
 });
