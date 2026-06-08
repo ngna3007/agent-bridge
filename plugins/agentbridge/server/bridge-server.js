@@ -14711,10 +14711,34 @@ claude.setReplySender(async (msg, requireReply) => {
   }
   return daemonClient.sendReply(msg, requireReply);
 });
+var DAEMON_LIFECYCLE_TAGS = {
+  system_ready: "[CODEX]",
+  system_waiting: "[WAITING]",
+  system_codex_start_failed: "[CODEX-FAIL]"
+};
 daemonClient.on("codexMessage", (message) => {
+  const tag = isDaemonLifecycle(message.id);
+  if (tag) {
+    log(`Daemon lifecycle event ${message.id} \u2192 status.line`);
+    statusLine.write(tag);
+    return;
+  }
   log(`Forwarding daemon \u2192 Claude (${message.content.length} chars)`);
   claude.pushNotification(message);
 });
+function isDaemonLifecycle(id) {
+  const match = /^([a-z_]+?)_\d+$/.exec(id);
+  if (!match)
+    return null;
+  const prefix = match[1];
+  if (prefix in DAEMON_LIFECYCLE_TAGS) {
+    return DAEMON_LIFECYCLE_TAGS[prefix];
+  }
+  if (prefix.startsWith("system_")) {
+    return `[${prefix.replace(/^system_/, "").toUpperCase()}]`;
+  }
+  return null;
+}
 daemonClient.on("status", (status) => {
   log(`Daemon status: ready=${status.bridgeReady} tui=${status.tuiConnected} thread=${status.threadId ?? "none"} queued=${status.queuedMessageCount}`);
   if (!hasSeenTuiConnect && status.tuiConnected && !previousTuiConnected) {

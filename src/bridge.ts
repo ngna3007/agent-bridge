@@ -77,10 +77,44 @@ claude.setReplySender(async (msg: BridgeMessage, requireReply?: boolean) => {
   return daemonClient.sendReply(msg, requireReply);
 });
 
+// Map daemon-side system_* notifications to short statusbar tags so
+// they don't bloat Claude's context. The MCP channel only carries
+// Codex's real agentMessage replies; anything system-tagged from the
+// daemon is treated as a lifecycle event and routed to status.line.
+const DAEMON_LIFECYCLE_TAGS: Record<string, string> = {
+  system_ready:             "[CODEX]",
+  system_waiting:           "[WAITING]",
+  system_codex_start_failed: "[CODEX-FAIL]",
+};
+
 daemonClient.on("codexMessage", (message) => {
+  const tag = isDaemonLifecycle(message.id);
+  if (tag) {
+    log(`Daemon lifecycle event ${message.id} → status.line`);
+    statusLine.write(tag);
+    return;
+  }
   log(`Forwarding daemon → Claude (${message.content.length} chars)`);
   void claude.pushNotification(message);
 });
+
+function isDaemonLifecycle(id: string): string | null {
+  // Daemon-side BridgeMessage ids are formatted as "<prefix>_<ts>",
+  // e.g. "system_waiting_1717000000000". Extract the prefix portion
+  // (everything before the trailing _<digits>) and look it up.
+  const match = /^([a-z_]+?)_\d+$/.exec(id);
+  if (!match) return null;
+  const prefix = match[1];
+  if (prefix in DAEMON_LIFECYCLE_TAGS) {
+    return DAEMON_LIFECYCLE_TAGS[prefix];
+  }
+  // Unknown system_* prefix: still treat as lifecycle so it doesn't
+  // leak into Claude's chat. Fall back to a sanitized tag.
+  if (prefix.startsWith("system_")) {
+    return `[${prefix.replace(/^system_/, "").toUpperCase()}]`;
+  }
+  return null;
+}
 
 daemonClient.on("status", (status) => {
   log(
