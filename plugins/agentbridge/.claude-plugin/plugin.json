@@ -4,9 +4,9 @@
   "description": "Bridge Claude Code and Codex with a shared daemon, push channel delivery, and bidirectional reply tooling.",
   "author": {
     "name": "AgentBridge Contributors",
-    "email": "raysonmeng@qq.com"
+    "email": "ngocanh3007.forwork@outlook.com"
   },
-  "homepage": "https://github.com/raysonmeng/agent-bridge#readme",
-  "repository": "https://github.com/raysonmeng/agent-bridge",
+  "homepage": "https://github.com/ngna3007/agent-bridge#readme",
+  "repository": "https://github.com/ngna3007/agent-bridge",
   "license": "MIT"
 }

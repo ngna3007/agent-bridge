@@ -2,8 +2,8 @@
   "name": "agentbridge",
   "owner": {
     "name": "AgentBridge Contributors",
-    "email": "raysonmeng@qq.com",
-    "url": "https://github.com/raysonmeng/agent-bridge"
+    "email": "ngocanh3007.forwork@outlook.com",
+    "url": "https://github.com/ngna3007/agent-bridge"
   },
   "metadata": {
     "description": "Marketplace for the AgentBridge Claude Code plugin and supporting runtime integration."
@@ -15,7 +15,7 @@
       "version": "0.1.6",
       "author": {
         "name": "AgentBridge Contributors",
-        "email": "raysonmeng@qq.com"
+        "email": "ngocanh3007.forwork@outlook.com"
       },
       "source": "./plugins/agentbridge",
       "category": "development"

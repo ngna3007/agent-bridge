@@ -1,6 +1,6 @@
 # AgentBridge
 
-[![CI](https://github.com/raysonmeng/agent-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/raysonmeng/agent-bridge/actions/workflows/ci.yml)
+[![CI](https://github.com/ngna3007/agent-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/ngna3007/agent-bridge/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 [中文文档](README.zh-CN.md)
@@ -80,7 +80,7 @@ Install AgentBridge directly from Claude Code using the plugin marketplace:
 
 ```bash
 # 1. In Claude Code, add the AgentBridge marketplace
-/plugin marketplace add raysonmeng/agent-bridge
+/plugin marketplace add ngna3007/agent-bridge
 
 # 2. Install the plugin
 /plugin install agentbridge@agentbridge
@@ -93,7 +93,7 @@ Then install the CLI tool:
 
 ```bash
 # 4. Install the CLI globally
-npm install -g @raysonmeng/agentbridge
+npm install -g @rowanng/agentbridge
 
 # 5. Generate project config (optional)
 abg init
@@ -126,7 +126,7 @@ If you want to modify AgentBridge source code, use the local development setup i
 
 ```bash
 # 1. Clone and install dependencies
-git clone https://github.com/raysonmeng/agent-bridge.git
+git clone https://github.com/ngna3007/agent-bridge.git
 cd agent-bridge
 bun install
 bun link
@@ -239,6 +239,70 @@ agent_bridge/
 └── tsconfig.json
 ```
 
+## Fork features (additions over upstream)
+
+This fork layers a set of quality-of-life additions on top of the [upstream](https://github.com/quilin-ai/agent-bridge) bridge. None of them change the core protocol; they are all opt-in or auto-detected.
+
+### First-run welcome screen
+
+`abg claude` shows a one-time intro screen on the user's first invocation. It prints an ASCII-art logo, a two-line description of what the bridge does, and a single "Got it - continue" confirmation. Pressing Esc aborts the launch silently (no Claude spawn, no state changes). The acknowledgement is persisted in `<state-dir>/user-prefs.json` so the screen never appears twice.
+
+### Auto-wired statusbar
+
+After the intro (and on every subsequent `abg claude` launch, idempotently), the bridge patches `~/.claude/settings.json` so its current state shows up in Claude Code's statusbar.
+
+- The chain preserves any existing `statusLine.command` (e.g. caveman's hook) by composing the two commands: `{ <existing>; [ "$AGENTBRIDGE_ACTIVE" = "1" ] && { printf ' '; cat <state-dir>/status.line; }; } | tr -d '\n'`.
+- The `$AGENTBRIDGE_ACTIVE` gate means plain `claude` / `claude -c` sessions see only the existing tag (no `[CODEX READY]` leaking into non-bridge sessions).
+- The previous `settings.json` is copied to `settings.json.bak.<mtime>` before each write. The wirer keeps the 5 newest backups and prunes older ones.
+- `AGENTBRIDGE_SETTINGS_PATH` overrides the target file (used by tests).
+
+### Statusbar tags
+
+The daemon writes a short colored tag to `<state-dir>/status.line` on every lifecycle event:
+
+| Event | Tag | Color |
+|---|---|---|
+| Codex connected / idle / reconnected | `[CODEX READY]` | green |
+| Codex mid-turn | `[CODEX THINKING]` | yellow |
+| Daemon ready, waiting for Codex | `[WAITING FOR CODEX]` | yellow |
+| Reconnecting | `[RECONNECTING]` | yellow |
+| Bridge ready | `[BRIDGE READY]` | green |
+| Daemon control connection dropped | `[BRIDGE OFFLINE]` | red |
+| Daemon failed to start | `[BRIDGE FAILED]` | red |
+| Codex failed to start | `[CODEX FAILED]` | red |
+| Required reply missing | `[CODEX NO REPLY]` | red |
+| Evicted by a newer session | `[REPLACED BY NEWER SESSION]` | red |
+| Another session active | `[ANOTHER SESSION ACTIVE]` | red |
+| Recovery exhausted | `[RECONNECT FAILED]` | red |
+| `agentbridge kill` was run | `[BRIDGE STOPPED]` | dim |
+
+These tags replace the in-band system notifications that the upstream bridge pushed into Claude's MCP channel. The MCP channel is now reserved exclusively for Codex's real `agentMessage` replies, keeping routine lifecycle events out of Claude's context.
+
+### Opt-in env gate (`AGENTBRIDGE_ACTIVE`)
+
+The agentbridge plugin is auto-loaded by every `claude` invocation -- the manifest controls that, not the bridge. The bridge MCP server self-exits at startup unless `AGENTBRIDGE_ACTIVE=1` is set in its environment. `abg claude` sets the flag on the spawned child; plain `claude` / `claude -c` do not. The result: only `abg`-launched sessions claim the daemon's single Claude slot, and stray editor or background sessions cannot accidentally hold it.
+
+### Pinned bridge contract via `AGENTS.md`
+
+`abg init` writes the BRIDGE_CONTRACT_REMINDER (Codex's role, the `[IMPORTANT]/[STATUS]/[FYI]` marker contract, the git-write prohibition) into `AGENTS.md`. Codex picks it up at session start as part of its system prompt, so the daemon no longer needs to re-append it to every Claude→Codex turn. `AGENTBRIDGE_PIN_CONTRACT=once|always` brings the legacy per-message append back if `AGENTS.md` is missing.
+
+### Compact `<channel>` metadata
+
+The `chat_id` and `message_id` values inside every inbound `<channel>` tag are shortened to a 4-hex random prefix plus a small sequence (e.g. `chat_id="c1a2b"`, `message_id="9c8d1"`). Roughly 30 chars saved per message in Claude's context.
+
+### Rotating daemon log
+
+`agentbridge.log` is now a rotating file with a hard size ceiling: defaults to 50 MB active + 3 generations (200 MB total). Tunable via `AGENTBRIDGE_LOG_MAX_BYTES` and `AGENTBRIDGE_LOG_MAX_FILES`. The writer is path-shared across all log sites (bridge, daemon, claude-adapter, codex-adapter, cli/codex), counts bytes in memory to avoid a stat per write, and rotates atomically.
+
+### Companion-tool recommendations
+
+The intro screen recommends two optional tools that play well with AgentBridge:
+
+- [caveman](https://github.com/anthropics/skills) -- a Claude Code skill that asks Claude to reply in short fragment-style prose. Cuts output tokens roughly 30-60% per turn. Install via the Claude Code plugin marketplace.
+- [rtk](https://github.com/anthropic-experimental/rtk) (Rust Token Killer) -- a CLI proxy that shrinks dev-command output (e.g. `git log` 1000 lines → 20-line summary) before Claude reads it. Install with `cargo install rtk` and add its shell hook.
+
+AgentBridge does not install or configure either tool for you; the intro just points at them.
+
 ## Configuration
 
 ### Environment Variables
@@ -252,6 +316,11 @@ agent_bridge/
 | `AGENTBRIDGE_STATE_DIR` | Platform default | State directory for pid, status, logs (macOS: `~/Library/Application Support/agentbridge/`, Linux: `$XDG_STATE_HOME/agentbridge/`) |
 | `AGENTBRIDGE_MODE` | `push` | Message delivery mode (`push` for channels, `pull` for API key mode) |
 | `AGENTBRIDGE_DAEMON_ENTRY` | `./daemon.ts` | Override daemon entry point (used by plugin bundles) |
+| `AGENTBRIDGE_ACTIVE` | unset | Opt-in gate read by the bridge MCP plugin. `abg claude` sets this in the spawned child's env; plain `claude` / `claude -c` invocations do not, and their bridge plugin self-exits before claiming the daemon's single Claude slot. Set to `1` manually only if you want a non-`abg` Claude session to attach to the bridge. |
+| `AGENTBRIDGE_SETTINGS_PATH` | `~/.claude/settings.json` | Path to the Claude Code settings file that `wireStatusLine` patches. Tests and headless harnesses set this to redirect off the real settings. |
+| `AGENTBRIDGE_LOG_MAX_BYTES` | `50_000_000` | Per-file size cap for `agentbridge.log` before rotation kicks in. Values below 1 KiB fall back to the default. |
+| `AGENTBRIDGE_LOG_MAX_FILES` | `3` | How many rotated `agentbridge.log.N` generations to retain. |
+| `AGENTBRIDGE_PIN_CONTRACT` | `off` | When `once` (the legacy mid-state) or `always`, the daemon re-appends the BRIDGE_CONTRACT_REMINDER to every Claude→Codex turn. Default `off` because `abg init` writes the same content into `AGENTS.md` so it lives in Codex's system prompt and survives `/compact`. |
 
 ### State Directory
 
@@ -301,12 +370,6 @@ This project was built collaboratively by **Claude Code** (Anthropic) and **Code
 
 In other words, AgentBridge is its own proof of concept: two AI agents from different providers, connected in real time, shipping code side by side.
 
-## Contact
+## Upstream
 
-This is my first open-source project! I'd love to connect with anyone interested in multi-agent collaboration, AI tooling, or just building cool things together. Feel free to reach out:
-
-- **Twitter/X**: [@raysonmeng](https://x.com/raysonmeng)
-- **Xiaohongshu**: [Profile](https://www.xiaohongshu.com/user/profile/62a3709d0000000021028b7e)
-- **WeChat**: Scan the QR code below to add me
-
-<img src="assets/wechat-qr.jpg" alt="WeChat QR Code" width="300" />
+This fork (`@rowanng/agentbridge`) tracks [quilin-ai/agent-bridge](https://github.com/quilin-ai/agent-bridge) (`@raysonmeng/agentbridge` on npm). The upstream project is the canonical implementation; this fork layers onboarding UX, statusbar integration, opt-in env gating, log rotation, and other quality-of-life changes on top.
