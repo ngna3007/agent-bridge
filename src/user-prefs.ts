@@ -1,14 +1,17 @@
 /**
  * Per-user preferences for AgentBridge.
  *
- * Distinct from `.agentbridge/config.json` (which is per-project, committed
- * to repos). User prefs are machine-local choices like "did I opt in to
- * the caveman skill", and live alongside the daemon runtime state under
+ * Distinct from `.agentbridge/config.json` (which is per-project,
+ * committed to repos). User prefs are machine-local choices, like
+ * "has the user seen the AgentBridge welcome screen yet". They live
+ * alongside the daemon runtime state under
  * `$XDG_STATE_HOME/agentbridge/` (or the macOS equivalent).
  *
- * The file format is forward-compatible: unknown keys are preserved on
- * write so a newer agentbridge build doesn't clobber prefs written by an
- * older one (and vice-versa). Missing keys fall back to defaults.
+ * The file format is forward-compatible: unknown keys are preserved
+ * on write so a newer agentbridge build doesn't clobber prefs
+ * written by an older one (and vice-versa). Older fields that this
+ * build no longer needs (cavemanOptIn, rtkOptIn, statusLineAsked,
+ * etc.) are left untouched on disk if they exist.
  */
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
@@ -17,27 +20,11 @@ import { StateDirResolver } from "./state-dir";
 
 export interface UserPrefs {
   /**
-   * Whether the user has been asked about the statusbar / settings.json
-   * wiring yet. Once answered, we don't re-prompt.
+   * Whether the user has already seen and dismissed the first-run
+   * intro screen. Once true we skip the screen for every subsequent
+   * `abg claude` invocation.
    */
-  statusLineAsked?: boolean;
-  /**
-   * User has expressed interest in the caveman Claude Code skill
-   * (terse, compressed responses). AgentBridge does not install or
-   * enable caveman; this flag exists so future integrations (e.g. a
-   * suggestion in the kickoff message) can respect the user's choice.
-   */
-  cavemanOptIn?: boolean;
-  /** Whether the first-run prompt for caveman has been answered. */
-  cavemanAsked?: boolean;
-  /**
-   * User has expressed interest in rtk (Rust Token Killer CLI proxy).
-   * Same semantics as cavemanOptIn: a forward-looking preference flag,
-   * not a switch that AgentBridge currently acts on by itself.
-   */
-  rtkOptIn?: boolean;
-  /** Whether the first-run prompt for rtk has been answered. */
-  rtkAsked?: boolean;
+  introAcknowledged?: boolean;
 }
 
 const PREFS_FILE = "user-prefs.json";
@@ -60,8 +47,8 @@ export class UserPrefsService {
   }
 
   /**
-   * Read prefs from disk. Returns an empty object on any I/O or parse
-   * error - callers should treat missing keys as "use the default".
+   * Read prefs from disk. Returns an empty object on any I/O or
+   * parse error - callers should treat missing keys as defaults.
    */
   load(): UserPrefs {
     try {
@@ -76,7 +63,8 @@ export class UserPrefsService {
 
   /**
    * Merge a partial update into existing prefs and persist. Preserves
-   * unknown keys so future fields written by other tools survive.
+   * unknown keys (including legacy fields from older builds) so
+   * future / past fields survive a write from this version.
    */
   update(patch: Partial<UserPrefs>): void {
     const existing = this.loadRaw();
@@ -85,29 +73,9 @@ export class UserPrefsService {
     writeFileSync(this.path, JSON.stringify(merged, null, 2) + "\n", "utf-8");
   }
 
-  /** Has the user been asked about the statusbar wiring yet? */
-  hasBeenAskedStatusLine(): boolean {
-    return this.load().statusLineAsked === true;
-  }
-
-  /** Has the user been asked about the caveman skill yet? */
-  hasBeenAskedCaveman(): boolean {
-    return this.load().cavemanAsked === true;
-  }
-
-  /** Has the user been asked about rtk yet? */
-  hasBeenAskedRtk(): boolean {
-    return this.load().rtkAsked === true;
-  }
-
-  /** True when user opted in to caveman during onboarding. */
-  isCavemanOptedIn(): boolean {
-    return this.load().cavemanOptIn === true;
-  }
-
-  /** True when user opted in to rtk during onboarding. */
-  isRtkOptedIn(): boolean {
-    return this.load().rtkOptIn === true;
+  /** True when the user has dismissed the first-run intro screen. */
+  hasAcknowledgedIntro(): boolean {
+    return this.load().introAcknowledged === true;
   }
 
   /** Read the raw object (preserves unknown keys for merge). */
@@ -123,11 +91,7 @@ export class UserPrefsService {
 
   private normalize(raw: Record<string, unknown>): UserPrefs {
     const out: UserPrefs = {};
-    if (raw.statusLineAsked === true) out.statusLineAsked = true;
-    if (raw.cavemanOptIn === true) out.cavemanOptIn = true;
-    if (raw.cavemanAsked === true) out.cavemanAsked = true;
-    if (raw.rtkOptIn === true) out.rtkOptIn = true;
-    if (raw.rtkAsked === true) out.rtkAsked = true;
+    if (raw.introAcknowledged === true) out.introAcknowledged = true;
     return out;
   }
 

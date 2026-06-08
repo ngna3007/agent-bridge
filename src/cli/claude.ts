@@ -4,7 +4,6 @@ import { DaemonLifecycle } from "../daemon-lifecycle";
 import { StateDirResolver } from "../state-dir";
 import { UserPrefsService } from "../user-prefs";
 import { arrowPicker } from "./prompt";
-import { detectRtk, detectCaveman } from "./tool-detection";
 import { wireStatusLine } from "../settings-wire";
 
 /** Flags that AgentBridge owns and will inject automatically. */
@@ -25,12 +24,10 @@ export async function runClaude(args: string[]) {
 
   lifecycle.clearKilled();
 
-  // First-run onboarding. Three prompts in sequence (statusLine,
-  // caveman, rtk). Pressing Esc in any prompt aborts the process
-  // entirely (like Ctrl-C): we exit silently without persisting and
-  // without launching Claude. Re-running `abg claude` re-prompts.
-  await maybeAskStatusLineMode(stateDir);
-  await maybeRunOnboardingWizard(stateDir);
+  // First-run intro screen. Shows the AgentBridge logo and a short
+  // description; auto-wires ~/.claude/settings.json for the statusbar.
+  // Esc anywhere in the screen aborts the whole `abg claude` command.
+  await maybeShowIntro(stateDir);
 
   // Channel entry format: "server:<mcp-server-name>" for MCP-based channels,
   // or "plugin:<plugin>@<marketplace>" for plugin-based channels.
@@ -74,133 +71,76 @@ export async function runClaude(args: string[]) {
 }
 
 /**
- * First-run only: ask whether AgentBridge should auto-wire the user's
- * Claude Code statusLine command to show the bridge's current state
- * (e.g. "[CODEX]" or "[OFFLINE]") at the bottom edge of the TUI. The
- * status.line file is always written; this prompt only controls
- * whether settings.json gets patched for the user.
+ * AgentBridge ASCII logo (slant figlet style). Six lines of plain
+ * ASCII so it renders identically across terminals.
  */
-async function maybeAskStatusLineMode(stateDir: StateDirResolver): Promise<void> {
+const LOGO = [
+  "    ___                  __     ____       _      __         ",
+  "   /   |  ____ ____ ___  / /_   / __ )_____(_)____/ /___ ____ ",
+  "  / /| | / __ `/ _ \\__ \\/ __/  / __  / ___/ // __  / __ `/ _ \\",
+  " / ___ |/ /_/ /  __/__/ / /_   / /_/ / /  / // /_/ / /_/ /  __/",
+  "/_/  |_|\\__, /\\___/____/\\__/  /_____/_/  /_/ \\__,_/\\__, /\\___/ ",
+  "       /____/                                     /____/      ",
+].join("\n");
+
+/**
+ * Show the AgentBridge intro screen the first time `abg claude` runs
+ * for this user. Persists `introAcknowledged` so it never re-displays.
+ * Auto-wires the user's ~/.claude/settings.json to surface our status
+ * tag in their statusbar (chained onto whatever statusLine command
+ * already exists, no overwrite).
+ *
+ * Skipped silently in non-interactive environments; we still record
+ * the acknowledgement and still attempt the wire so a one-shot
+ * headless run gets a working statusbar too.
+ */
+async function maybeShowIntro(stateDir: StateDirResolver): Promise<void> {
   const prefs = new UserPrefsService(stateDir);
-  if (prefs.hasBeenAskedStatusLine()) return;
+  if (prefs.hasAcknowledgedIntro()) return;
+
+  const statusFilePath = `${stateDir.dir}/status.line`;
+
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
-    prefs.update({ statusLineAsked: true });
+    // No TTY -> can't show the screen. Wire silently and continue.
+    wireStatusLine({ statusFilePath });
+    prefs.update({ introAcknowledged: true });
     return;
   }
 
-  const statusFilePath = `${stateDir.dir}/status.line`;
-  const example = [
-    "AgentBridge writes the current link state to:",
-    `  ${statusFilePath}`,
+  // Logo lives above the picker so its full width renders without
+  // the picker's two-space indent or single-line title constraint.
+  // The picker's ephemeral cleanup only erases its own rendered
+  // region, so the logo persists in scrollback once shown.
+  process.stdout.write("\n" + LOGO + "\n");
+
+  const body = [
+    "Connects Claude Code and Codex so they can collaborate on the",
+    "same task. Use the reply / get_messages tools to send messages",
+    "between them.",
     "",
-    "Wiring it into Claude Code's statusLine shows it at the bottom",
-    "edge, e.g. [CODEX] when Codex is connected, [OFFLINE] when not.",
+    "Recommended companion tools:",
+    "  caveman   Terse Claude replies. 30-60% fewer tokens per turn.",
+    "  rtk       Shrinks dev-command output before Claude reads it.",
+    "",
+    "AgentBridge will add a one-line statusbar entry to your Claude",
+    "Code settings so [BRIDGE READY] / [CODEX READY] etc. show at the",
+    "bottom edge. Existing statusLine entries (e.g. caveman) are kept.",
   ].join("\n");
 
-  const choice = await arrowPicker<"wire" | "manual" | "skip">({
-    title: "Show bridge status in Claude Code's statusbar?",
-    example,
-    options: [
-      { value: "wire", label: "Edit settings.json for me now" },
-      { value: "manual", label: "I will set it up myself" },
-      { value: "skip", label: "Skip" },
-    ],
+  const choice = await arrowPicker<"continue">({
+    title: "Welcome to AgentBridge",
+    example: body,
+    options: [{ value: "continue", label: "Got it - continue" }],
     defaultIndex: 0,
   });
 
   if (choice === null) {
-    // Esc - exit cleanly without persisting anything or launching
-    // Claude. The user effectively backed out of `abg claude`.
+    // Esc - exit cleanly without persisting or launching Claude.
     process.exit(0);
   }
 
-  prefs.update({ statusLineAsked: true });
-
-  if (choice === "wire") {
-    // Best-effort: wire settings.json silently. If it conflicts or
-    // errors, status.line still gets written; user just won't see
-    // it in the TUI statusbar until they configure manually.
-    wireStatusLine({ statusFilePath });
-  }
-}
-
-/**
- * Walk the user through opt-in prompts for our recommended companion
- * tools. Each tool's prompt runs at most once per user (persisted in
- * user-prefs.json). The wizard never installs or modifies anything;
- * it records the user's preference and prints install pointers.
- *
- * Tools covered:
- *   - caveman: a Claude Code skill that compresses Claude's responses.
- *   - rtk: Rust Token Killer, a CLI proxy that rewrites verbose dev
- *     commands into token-cheap variants.
- */
-async function maybeRunOnboardingWizard(stateDir: StateDirResolver): Promise<void> {
-  const prefs = new UserPrefsService(stateDir);
-
-  if (!process.stdin.isTTY || !process.stdout.isTTY) {
-    // Non-interactive: mark both as asked so we never block startup
-    // and stop ourselves from re-asking on every headless launch.
-    prefs.update({ cavemanAsked: true, rtkAsked: true });
-    return;
-  }
-
-  if (!prefs.hasBeenAskedCaveman()) await askCaveman(prefs);
-  if (!prefs.hasBeenAskedRtk()) await askRtk(prefs);
-}
-
-async function askCaveman(prefs: UserPrefsService): Promise<void> {
-  const status = detectCaveman();
-  const example = [
-    "Claude Code skill. Replies in short caveman style; 30-60% fewer",
-    "tokens per turn. Code, commits, security warnings stay normal.",
-    `Local: ${status.installed ? "installed" : "not installed"}. Install via Claude Code marketplace.`,
-  ].join("\n");
-
-  const choice = await arrowPicker<"opt-in" | "skip">({
-    title: "Use caveman reply style?",
-    example,
-    options: [
-      { value: "opt-in", label: "Yes" },
-      { value: "skip", label: "Skip" },
-    ],
-    defaultIndex: status.installed ? 0 : 1,
-  });
-
-  if (choice === null) {
-    process.exit(0);
-  }
-  const optIn = choice === "opt-in";
-  prefs.update({ cavemanAsked: true, cavemanOptIn: optIn });
-}
-
-async function askRtk(prefs: UserPrefsService): Promise<void> {
-  const status = detectRtk();
-  const detectedLine = status.installed
-    ? `installed${status.version ? ` (${status.version})` : ""}`
-    : "not installed";
-  const example = [
-    "Shell proxy. Shrinks command output before Claude reads it",
-    "(e.g. `git log` 1000 lines becomes 20). 60-90% token cut on",
-    "dev work. Install: `cargo install rtk` + shell hook.",
-    `Local: ${detectedLine}.`,
-  ].join("\n");
-
-  const choice = await arrowPicker<"opt-in" | "skip">({
-    title: "Use rtk to shrink dev-command output?",
-    example,
-    options: [
-      { value: "opt-in", label: "Yes" },
-      { value: "skip", label: "Skip" },
-    ],
-    defaultIndex: status.installed ? 0 : 1,
-  });
-
-  if (choice === null) {
-    process.exit(0);
-  }
-  const optIn = choice === "opt-in";
-  prefs.update({ rtkAsked: true, rtkOptIn: optIn });
+  wireStatusLine({ statusFilePath });
+  prefs.update({ introAcknowledged: true });
 }
 
 /**

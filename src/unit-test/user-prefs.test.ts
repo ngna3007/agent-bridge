@@ -22,68 +22,47 @@ describe("UserPrefsService - defaults", () => {
     expect(prefs.load()).toEqual({});
   });
 
-  test("hasBeenAskedStatusLine is false by default", () => {
-    expect(prefs.hasBeenAskedStatusLine()).toBe(false);
-  });
-
-  test("hasBeenAskedCaveman is false by default", () => {
-    expect(prefs.hasBeenAskedCaveman()).toBe(false);
-  });
-
-  test("hasBeenAskedRtk is false by default", () => {
-    expect(prefs.hasBeenAskedRtk()).toBe(false);
-  });
-
-  test("isCavemanOptedIn / isRtkOptedIn default to false", () => {
-    expect(prefs.isCavemanOptedIn()).toBe(false);
-    expect(prefs.isRtkOptedIn()).toBe(false);
+  test("hasAcknowledgedIntro is false by default", () => {
+    expect(prefs.hasAcknowledgedIntro()).toBe(false);
   });
 });
 
-describe("UserPrefsService - onboarding flags round-trip", () => {
-  test("caveman opt-in is persisted with its asked flag", () => {
-    prefs.update({ cavemanAsked: true, cavemanOptIn: true });
-    expect(prefs.hasBeenAskedCaveman()).toBe(true);
-    expect(prefs.isCavemanOptedIn()).toBe(true);
-  });
-
-  test("rtk opt-in is persisted with its asked flag", () => {
-    prefs.update({ rtkAsked: true, rtkOptIn: true });
-    expect(prefs.hasBeenAskedRtk()).toBe(true);
-    expect(prefs.isRtkOptedIn()).toBe(true);
-  });
-
-  test("asked-but-declined is distinguishable from never-asked", () => {
-    // Important: a declined opt-in must still mark "asked" so we don't
-    // pester the user every launch.
-    prefs.update({ cavemanAsked: true, rtkAsked: true });
-    expect(prefs.hasBeenAskedCaveman()).toBe(true);
-    expect(prefs.hasBeenAskedRtk()).toBe(true);
-    expect(prefs.isCavemanOptedIn()).toBe(false);
-    expect(prefs.isRtkOptedIn()).toBe(false);
-  });
-
-  test("statusLineAsked persists and gates the prompt", () => {
-    prefs.update({ statusLineAsked: true });
-    expect(prefs.hasBeenAskedStatusLine()).toBe(true);
+describe("UserPrefsService - round-trip", () => {
+  test("introAcknowledged is persisted and reread", () => {
+    prefs.update({ introAcknowledged: true });
+    const fresh = new UserPrefsService(new StateDirResolver(tmp));
+    expect(fresh.hasAcknowledgedIntro()).toBe(true);
   });
 });
 
 describe("UserPrefsService - forward compatibility", () => {
   test("unknown keys on disk are preserved on save", () => {
-    // Simulate a newer build wrote a field we don't know about.
-    prefs.update({ statusLineAsked: true });
+    // Simulate a future build wrote a field we don't know about.
+    prefs.update({ introAcknowledged: true });
     const raw = JSON.parse(readFileSync(prefs.filePath, "utf-8"));
     raw.someFutureKey = "preserve-me";
     writeFileSync(prefs.filePath, JSON.stringify(raw, null, 2));
 
-    // Now an update from this older code path should not strip the field.
-    prefs.update({ cavemanAsked: true });
+    // An update from this older code path should not strip the field.
+    prefs.update({});
 
     const reloadedRaw = JSON.parse(readFileSync(prefs.filePath, "utf-8"));
     expect(reloadedRaw.someFutureKey).toBe("preserve-me");
+    expect(reloadedRaw.introAcknowledged).toBe(true);
+  });
+
+  test("legacy fields from older builds survive a write", () => {
+    // Older build wrote cavemanOptIn, statusLineAsked, etc.
+    writeFileSync(prefs.filePath, JSON.stringify({
+      introAcknowledged: false,
+      cavemanOptIn: true,
+      statusLineAsked: true,
+    }));
+    prefs.update({ introAcknowledged: true });
+    const reloadedRaw = JSON.parse(readFileSync(prefs.filePath, "utf-8"));
+    expect(reloadedRaw.cavemanOptIn).toBe(true);
     expect(reloadedRaw.statusLineAsked).toBe(true);
-    expect(reloadedRaw.cavemanAsked).toBe(true);
+    expect(reloadedRaw.introAcknowledged).toBe(true);
   });
 
   test("non-object JSON is treated as empty prefs", () => {
