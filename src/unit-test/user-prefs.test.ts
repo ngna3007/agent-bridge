@@ -22,10 +22,6 @@ describe("UserPrefsService - defaults", () => {
     expect(prefs.load()).toEqual({});
   });
 
-  test("getStatusLineMode defaults to 'channel' when unset", () => {
-    expect(prefs.getStatusLineMode()).toBe("channel");
-  });
-
   test("hasBeenAskedStatusLine is false by default", () => {
     expect(prefs.hasBeenAskedStatusLine()).toBe(false);
   });
@@ -66,24 +62,9 @@ describe("UserPrefsService - onboarding flags round-trip", () => {
     expect(prefs.isCavemanOptedIn()).toBe(false);
     expect(prefs.isRtkOptedIn()).toBe(false);
   });
-});
 
-describe("UserPrefsService - round-trip", () => {
-  test("update persists statusLineMode", () => {
-    prefs.update({ statusLineMode: "line" });
-    const fresh = new UserPrefsService(new StateDirResolver(tmp));
-    expect(fresh.getStatusLineMode()).toBe("line");
-  });
-
-  test("update persists statusLineAsked flag", () => {
+  test("statusLineAsked persists and gates the prompt", () => {
     prefs.update({ statusLineAsked: true });
-    expect(prefs.hasBeenAskedStatusLine()).toBe(true);
-  });
-
-  test("update merges partial patches without losing other keys", () => {
-    prefs.update({ statusLineMode: "line" });
-    prefs.update({ statusLineAsked: true });
-    expect(prefs.getStatusLineMode()).toBe("line");
     expect(prefs.hasBeenAskedStatusLine()).toBe(true);
   });
 });
@@ -91,23 +72,18 @@ describe("UserPrefsService - round-trip", () => {
 describe("UserPrefsService - forward compatibility", () => {
   test("unknown keys on disk are preserved on save", () => {
     // Simulate a newer build wrote a field we don't know about.
-    prefs.update({ statusLineMode: "channel" });
+    prefs.update({ statusLineAsked: true });
     const raw = JSON.parse(readFileSync(prefs.filePath, "utf-8"));
     raw.someFutureKey = "preserve-me";
     writeFileSync(prefs.filePath, JSON.stringify(raw, null, 2));
 
     // Now an update from this older code path should not strip the field.
-    prefs.update({ statusLineAsked: true });
+    prefs.update({ cavemanAsked: true });
 
     const reloadedRaw = JSON.parse(readFileSync(prefs.filePath, "utf-8"));
     expect(reloadedRaw.someFutureKey).toBe("preserve-me");
-    expect(reloadedRaw.statusLineMode).toBe("channel");
     expect(reloadedRaw.statusLineAsked).toBe(true);
-  });
-
-  test("invalid statusLineMode value is ignored (defaults applied)", () => {
-    writeFileSync(prefs.filePath, JSON.stringify({ statusLineMode: "garbage" }));
-    expect(prefs.getStatusLineMode()).toBe("channel");
+    expect(reloadedRaw.cavemanAsked).toBe(true);
   });
 
   test("non-object JSON is treated as empty prefs", () => {

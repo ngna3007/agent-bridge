@@ -2,10 +2,9 @@
  * Per-user preferences for AgentBridge.
  *
  * Distinct from `.agentbridge/config.json` (which is per-project, committed
- * to repos). User prefs are machine-local choices like "did I already
- * opt in to the statusLine integration", and live alongside the daemon
- * runtime state under `$XDG_STATE_HOME/agentbridge/` (or the macOS
- * equivalent).
+ * to repos). User prefs are machine-local choices like "did I opt in to
+ * the caveman skill", and live alongside the daemon runtime state under
+ * `$XDG_STATE_HOME/agentbridge/` (or the macOS equivalent).
  *
  * The file format is forward-compatible: unknown keys are preserved on
  * write so a newer agentbridge build doesn't clobber prefs written by an
@@ -16,25 +15,10 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { StateDirResolver } from "./state-dir";
 
-/** Where lifecycle events are routed. */
-export type StatusLineMode = "channel" | "line";
-
 export interface UserPrefs {
   /**
-   * Where lifecycle events (kickoff, reconnect, etc.) are delivered.
-   *
-   * - "channel" (default): events appear in Claude's MCP channel.
-   * - "line": events are written to the status.line file only,
-   *   for the user's own statusLine shell command to pick up.
-   *
-   * Actionable events (evicted, disabled, connect_failed) always go
-   * through the MCP channel regardless of this setting - they require
-   * Claude's attention, not just the human's.
-   */
-  statusLineMode?: StatusLineMode;
-  /**
-   * Whether the user has been asked about statusLineMode at least once.
-   * Used to gate the first-run prompt - once answered, we don't re-ask.
+   * Whether the user has been asked about the statusbar / settings.json
+   * wiring yet. Once answered, we don't re-prompt.
    */
   statusLineAsked?: boolean;
   /**
@@ -101,12 +85,7 @@ export class UserPrefsService {
     writeFileSync(this.path, JSON.stringify(merged, null, 2) + "\n", "utf-8");
   }
 
-  /** Get the current status-line mode, defaulting to "channel". */
-  getStatusLineMode(): StatusLineMode {
-    return this.load().statusLineMode ?? "channel";
-  }
-
-  /** Has the user been asked about statusLine yet? */
+  /** Has the user been asked about the statusbar wiring yet? */
   hasBeenAskedStatusLine(): boolean {
     return this.load().statusLineAsked === true;
   }
@@ -144,9 +123,6 @@ export class UserPrefsService {
 
   private normalize(raw: Record<string, unknown>): UserPrefs {
     const out: UserPrefs = {};
-    if (raw.statusLineMode === "channel" || raw.statusLineMode === "line") {
-      out.statusLineMode = raw.statusLineMode;
-    }
     if (raw.statusLineAsked === true) out.statusLineAsked = true;
     if (raw.cavemanOptIn === true) out.cavemanOptIn = true;
     if (raw.cavemanAsked === true) out.cavemanAsked = true;

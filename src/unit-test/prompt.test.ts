@@ -253,7 +253,7 @@ describe("arrowPicker - rendering", () => {
     setImmediate(() => stdin.write("\r"));
     await promise;
     expect(stdout.output).toContain("Pick one");
-    expect(stdout.output).toContain("Esc cancels");
+    expect(stdout.output).toContain("Esc to cancel");
   });
 
   test("example block appears between header and options", async () => {

@@ -1,5 +1,20 @@
 #!/usr/bin/env bun
 
+// Opt-in gate: bridge-server is loaded by the agentbridge plugin in
+// every Claude Code launch (the plugin manifest controls that, not
+// our code). We only want to attach to the daemon when the session
+// was started via `abg claude`, which sets AGENTBRIDGE_ACTIVE=1 in
+// the child env. Without that flag, exit silently before importing
+// any heavy modules or touching the network. This prevents stray
+// `claude` / `claude -c` sessions from holding the daemon's single
+// Claude slot and starving the actual `abg claude` session.
+//
+// Tests / CI override the gate by setting AGENTBRIDGE_ACTIVE=1 in
+// their own environment.
+if (process.env.AGENTBRIDGE_ACTIVE !== "1") {
+  process.exit(0);
+}
+
 import { ClaudeAdapter } from "./claude-adapter";
 import { DaemonClient } from "./daemon-client";
 import { DaemonLifecycle } from "./daemon-lifecycle";
@@ -7,7 +22,6 @@ import { StateDirResolver } from "./state-dir";
 import { getRotatingLogger } from "./log-rotator";
 import { ConfigService } from "./config-service";
 import { StatusLineWriter } from "./status-line-writer";
-import { UserPrefsService } from "./user-prefs";
 import { disabledReplyError, type BridgeDisabledReason } from "./bridge-disabled-state";
 import {
   CLOSE_CODE_EVICTED_STALE,
@@ -27,7 +41,6 @@ const CONTROL_WS_URL = daemonLifecycle.controlWsUrl;
 const claude = new ClaudeAdapter(stateDir.logFile);
 const daemonClient = new DaemonClient(CONTROL_WS_URL);
 const statusLine = new StatusLineWriter(stateDir);
-const userPrefs = new UserPrefsService(stateDir);
 
 let shuttingDown = false;
 let daemonDisabled = false;
@@ -77,17 +90,8 @@ daemonClient.on("status", (status) => {
   // Kickoff message on first TUI connect transition (not reconnects)
   if (!hasSeenTuiConnect && status.tuiConnected && !previousTuiConnected) {
     hasSeenTuiConnect = true;
-    log("First TUI connect detected — sending kickoff message to Claude");
-    void emitLifecycle(
-      "system_tui_kickoff",
-      [
-        "🤝 Codex has connected via AgentBridge.",
-        "You are now in a multi-agent collaboration session.",
-        "When you receive a complex task, propose a division of labor to Codex.",
-        "Use `reply` to send messages and `get_messages` to check for responses.",
-      ].join("\n"),
-      "ux",
-    );
+    log("First TUI connect detected");
+    emitLifecycle("system_tui_kickoff");
   }
   previousTuiConnected = status.tuiConnected;
 });
@@ -100,13 +104,9 @@ daemonClient.on("disconnect", () => {
   const now = Date.now();
   if (now - lastDisconnectNotifyTs >= RECONNECT_NOTIFY_COOLDOWN_MS) {
     lastDisconnectNotifyTs = now;
-    void emitLifecycle(
-      "system_daemon_disconnected",
-      "⚠️ AgentBridge daemon control connection lost. Attempting to reconnect...",
-      "ux",
-    );
+    emitLifecycle("system_daemon_disconnected");
   } else {
-    log("Suppressing duplicate disconnect notification (within cooldown)");
+    log("Suppressing duplicate disconnect statusbar update (within cooldown)");
   }
   void reconnectToDaemon();
 });
@@ -116,22 +116,18 @@ daemonClient.on("rejected", async (code: number) => {
 
   let reason: BridgeDisabledReason;
   let notificationId: string;
-  let notificationContent: string;
   switch (code) {
     case CLOSE_CODE_EVICTED_STALE:
       reason = "evicted";
       notificationId = "system_bridge_evicted";
-      notificationContent = "⚠️ AgentBridge evicted this session because it stopped responding to liveness probes — a newer Claude Code session has taken over. Close this session and start a new one with `agentbridge claude` if you want to reconnect. AgentBridge 因此会话未响应存活探测而将其驱逐——更新的 Claude Code 会话已接管。如需重连，请关闭此会话并运行 `agentbridge claude` 启动新会话。";
       break;
     case CLOSE_CODE_PROBE_IN_PROGRESS:
       reason = "probe_in_progress";
       notificationId = "system_bridge_probe_in_progress";
-      notificationContent = "⚠️ AgentBridge rejected this session — a liveness probe is currently checking whether the incumbent Claude session is still alive. Retry in a few seconds with `agentbridge claude`. AgentBridge 拒绝了此会话——正在通过存活探测检查现有 Claude 会话是否仍然在线。请稍后用 `agentbridge claude` 重试。";
       break;
     default:
       reason = "rejected";
       notificationId = "system_bridge_replaced";
-      notificationContent = "⚠️ AgentBridge daemon rejected this session — another Claude Code session is already connected. Close the other session first, or run `agentbridge kill` to reset. AgentBridge 守护进程拒绝了此会话——另一个 Claude Code 会话已在连接中。请先关闭另一个会话，或运行 `agentbridge kill` 重置。";
       break;
   }
   log(`Daemon rejected this session (close code ${code}, reason=${reason})`);
@@ -143,7 +139,7 @@ daemonClient.on("rejected", async (code: number) => {
   // and let it auto-reconnect once the slot becomes available.
   daemonDisabled = true;
   daemonDisabledReason = reason;
-  await emitLifecycle(notificationId, notificationContent, "actionable");
+  emitLifecycle(notificationId);
   await daemonClient.disconnect();
   if (reason === "probe_in_progress") {
     disabledRecoveryAttempts = 0;
@@ -154,10 +150,7 @@ daemonClient.on("rejected", async (code: number) => {
 claude.on("ready", async () => {
   log(`MCP server ready (delivery mode: ${claude.getDeliveryMode()}) — ensuring AgentBridge daemon...`);
   if (daemonLifecycle.wasKilled()) {
-    await enterDisabledState(
-      "Killed sentinel found — bridge staying idle",
-      "⛔ AgentBridge was stopped by `agentbridge kill`. Bridge is staying idle. Restart Claude Code (`agentbridge claude`), switch to a new conversation, or run `/resume` to reconnect.",
-    );
+    await enterDisabledState("Killed sentinel found — bridge staying idle");
     return;
   }
   await connectToDaemon();
@@ -175,30 +168,22 @@ async function connectToDaemon(isReconnect = false) {
     daemonClient.attachClaude();
     daemonDisabledReason = null;
     if (!isReconnect) {
-      void emitLifecycle(
-        "system_bridge_ready",
-        "✅ AgentBridge bridge is ready. Daemon connected. Start Codex in another terminal with: agentbridge codex",
-        "ux",
-      );
+      emitLifecycle("system_bridge_ready");
     }
   } catch (err: any) {
     log(`Failed to connect to daemon: ${err.message}`);
-    await emitLifecycle(
-      "system_daemon_connect_failed",
-      `❌ AgentBridge daemon failed to start or is unreachable: ${err.message}`,
-      "actionable",
-    );
+    emitLifecycle("system_daemon_connect_failed");
     throw err;
   }
 }
 
-async function enterDisabledState(logMessage: string, notificationContent: string) {
+async function enterDisabledState(logMessage: string) {
   if (daemonDisabled) return;
 
   daemonDisabled = true;
   daemonDisabledReason = "killed";
   log(logMessage);
-  await emitLifecycle("system_bridge_disabled", notificationContent, "actionable");
+  emitLifecycle("system_bridge_disabled");
   await daemonClient.disconnect();
   startDisabledRecoveryPoller();
 }
@@ -209,10 +194,7 @@ let reconnectTask: Promise<void> | null = null;
 async function notifyIfDaemonKilled(logMessage: string) {
   if (!daemonLifecycle.wasKilled()) return false;
 
-  await enterDisabledState(
-    logMessage,
-    "⛔ AgentBridge was stopped by `agentbridge kill`. Bridge is staying idle. Restart Claude Code (`agentbridge claude`), switch to a new conversation, or run `/resume` to reconnect.",
-  );
+  await enterDisabledState(logMessage);
   return true;
 }
 
@@ -252,13 +234,9 @@ function reconnectToDaemon(): Promise<void> {
           const now = Date.now();
           if (now - lastReconnectNotifyTs >= RECONNECT_NOTIFY_COOLDOWN_MS) {
             lastReconnectNotifyTs = now;
-            void emitLifecycle(
-              "system_daemon_reconnected",
-              "✅ AgentBridge daemon reconnected successfully.",
-              "ux",
-            );
+            emitLifecycle("system_daemon_reconnected");
           } else {
-            log("Suppressing duplicate reconnect notification (within cooldown)");
+            log("Suppressing duplicate reconnect statusbar update (within cooldown)");
           }
           return;
         } catch {
@@ -316,11 +294,7 @@ async function pollDisabledRecovery() {
           daemonDisabledReason = "auto_recovery_exhausted";
           disabledRecoveryAttempts = 0;
           stopDisabledRecoveryPoller();
-          void emitLifecycle(
-            "system_bridge_auto_recovery_gave_up",
-            "⚠️ AgentBridge auto-recovery gave up after exhausting its retry budget for the in-flight liveness probe contention. Retry manually with `agentbridge claude`. AgentBridge 自动恢复已放弃——存活探测争用的重试预算已用尽。请使用 `agentbridge claude` 手动重试。",
-            "actionable",
-          );
+          emitLifecycle("system_bridge_auto_recovery_gave_up");
           return;
         }
 
@@ -351,11 +325,7 @@ async function pollDisabledRecovery() {
           // recoveredFrom to that single value, so use the matching message
           // directly. The outer switch (with its `never` exhaustive default)
           // is what enforces compile-time coverage of every BridgeDisabledReason.
-          void emitLifecycle(
-            "system_bridge_recovered",
-            "✅ AgentBridge recovered after the liveness probe completed. Daemon reconnected.",
-            "ux",
-          );
+          emitLifecycle("system_bridge_recovered");
         } catch (err: any) {
           log(`Disabled-state probe_in_progress recovery attempt failed: ${err.message}`);
           await daemonClient.disconnect();
@@ -377,11 +347,7 @@ async function pollDisabledRecovery() {
           daemonDisabledReason = null;
           disabledRecoveryAttempts = 0;
           stopDisabledRecoveryPoller();
-          void emitLifecycle(
-            "system_bridge_recovered",
-            "✅ AgentBridge recovered after the killed sentinel was cleared. Daemon reconnected.",
-            "ux",
-          );
+          emitLifecycle("system_bridge_recovered");
         } catch (err: any) {
           log(`Disabled-state direct reconnect failed: ${err.message}`);
           daemonDisabled = false;
@@ -411,46 +377,39 @@ async function pollDisabledRecovery() {
   }
 }
 
-function systemMessage(idPrefix: string, content: string): BridgeMessage {
-  return {
-    id: `${idPrefix}_${Date.now()}`,
-    source: "codex",
-    content,
-    timestamp: Date.now(),
-  };
-}
-
 /**
- * Severity of a lifecycle event.
+ * Map every lifecycle event id to a compact statusbar tag. The MCP
+ * channel is reserved for Codex's actual agentMessage replies; every
+ * bridge / daemon / TUI state change goes only to the status.line
+ * file. Users (or their statusLine shell command) read it to know
+ * "what's the link doing right now".
  *
- * - "actionable": Claude (the agent) likely needs to know — bridge dead,
- *   peer unreachable, recovery exhausted. These ALWAYS reach the MCP
- *   channel regardless of user preference.
- * - "ux": Pure human-visible state changes (connect, disconnect,
- *   reconnect succeeded). When the user has opted into status.line
- *   delivery these are suppressed from the MCP channel to save tokens.
+ * Keep tags short (3-12 chars) and shaped like "[FOO]" so they slot
+ * neatly into Claude Code's bottom-edge statusbar.
  */
-type LifecycleSeverity = "actionable" | "ux";
+const LIFECYCLE_TAGS: Record<string, string> = {
+  system_tui_kickoff:                   "[CODEX]",
+  system_daemon_disconnected:           "[OFFLINE]",
+  system_daemon_reconnected:            "[CODEX]",
+  system_bridge_ready:                  "[BRIDGE]",
+  system_daemon_connect_failed:         "[DAEMON-FAIL]",
+  system_bridge_evicted:                "[EVICTED]",
+  system_bridge_probe_in_progress:      "[PROBING]",
+  system_bridge_replaced:               "[REPLACED]",
+  system_bridge_disabled:               "[OFFLINE]",
+  system_bridge_auto_recovery_gave_up:  "[RECOVERY-FAIL]",
+  system_bridge_recovered:              "[CODEX]",
+};
 
 /**
- * Emit a lifecycle event. The current state is always mirrored to the
- * status.line file (so a user-supplied statusLine command can read it).
- * Whether the event also reaches Claude's context depends on severity
- * and the user's statusLineMode preference.
+ * Write a lifecycle event to status.line. Never touches the MCP
+ * channel: only Codex's own replies cross that boundary. If the id is
+ * unknown we fall back to a sanitized version of it so a missing tag
+ * never breaks the statusbar.
  */
-function emitLifecycle(
-  idPrefix: string,
-  content: string,
-  severity: LifecycleSeverity,
-): Promise<void> {
-  statusLine.write({ message: content });
-  const mode = userPrefs.getStatusLineMode();
-  const sendToChannel = severity === "actionable" || mode === "channel";
-  if (!sendToChannel) {
-    log(`emitLifecycle ${idPrefix} suppressed from channel (mode=line, severity=ux)`);
-    return Promise.resolve();
-  }
-  return claude.pushNotification(systemMessage(idPrefix, content));
+function emitLifecycle(idPrefix: string): void {
+  const tag = LIFECYCLE_TAGS[idPrefix] ?? `[${idPrefix.replace(/^system_/, "").toUpperCase()}]`;
+  statusLine.write(tag);
 }
 
 function shutdown(reason: string) {

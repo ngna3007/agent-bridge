@@ -14633,12 +14633,11 @@ class StatusLineWriter {
   get filePath() {
     return this.path;
   }
-  write(snapshot) {
+  write(tag) {
     try {
       this.ensureDir();
-      const ts = snapshot.timestamp ?? new Date().toISOString();
-      const oneLine = snapshot.message.replace(/[\r\n]+/g, " ").trim();
-      writeFileSync3(this.path, `${ts}	${oneLine}
+      const oneLine = tag.replace(/[\r\n]+/g, " ").trim();
+      writeFileSync3(this.path, `${oneLine}
 `, "utf-8");
     } catch {}
   }
@@ -14652,93 +14651,6 @@ class StatusLineWriter {
     const dir = dirname(this.path);
     if (!existsSync4(dir)) {
       mkdirSync3(dir, { recursive: true });
-    }
-  }
-}
-
-// src/user-prefs.ts
-import { readFileSync as readFileSync3, writeFileSync as writeFileSync4, mkdirSync as mkdirSync4, existsSync as existsSync5 } from "fs";
-import { dirname as dirname2, join as join4 } from "path";
-var PREFS_FILE = "user-prefs.json";
-function isRecord2(v) {
-  return typeof v === "object" && v !== null && !Array.isArray(v);
-}
-
-class UserPrefsService {
-  path;
-  constructor(stateDir) {
-    const dir = (stateDir ?? new StateDirResolver).dir;
-    this.path = join4(dir, PREFS_FILE);
-  }
-  get filePath() {
-    return this.path;
-  }
-  load() {
-    try {
-      const raw = readFileSync3(this.path, "utf-8");
-      const parsed = JSON.parse(raw);
-      if (!isRecord2(parsed))
-        return {};
-      return this.normalize(parsed);
-    } catch {
-      return {};
-    }
-  }
-  update(patch) {
-    const existing = this.loadRaw();
-    const merged = { ...existing, ...patch };
-    this.ensureDir();
-    writeFileSync4(this.path, JSON.stringify(merged, null, 2) + `
-`, "utf-8");
-  }
-  getStatusLineMode() {
-    return this.load().statusLineMode ?? "channel";
-  }
-  hasBeenAskedStatusLine() {
-    return this.load().statusLineAsked === true;
-  }
-  hasBeenAskedCaveman() {
-    return this.load().cavemanAsked === true;
-  }
-  hasBeenAskedRtk() {
-    return this.load().rtkAsked === true;
-  }
-  isCavemanOptedIn() {
-    return this.load().cavemanOptIn === true;
-  }
-  isRtkOptedIn() {
-    return this.load().rtkOptIn === true;
-  }
-  loadRaw() {
-    try {
-      const raw = readFileSync3(this.path, "utf-8");
-      const parsed = JSON.parse(raw);
-      return isRecord2(parsed) ? parsed : {};
-    } catch {
-      return {};
-    }
-  }
-  normalize(raw) {
-    const out = {};
-    if (raw.statusLineMode === "channel" || raw.statusLineMode === "line") {
-      out.statusLineMode = raw.statusLineMode;
-    }
-    if (raw.statusLineAsked === true)
-      out.statusLineAsked = true;
-    if (raw.cavemanOptIn === true)
-      out.cavemanOptIn = true;
-    if (raw.cavemanAsked === true)
-      out.cavemanAsked = true;
-    if (raw.rtkOptIn === true)
-      out.rtkOptIn = true;
-    if (raw.rtkAsked === true)
-      out.rtkAsked = true;
-    return out;
-  }
-  ensureDir() {
-    const dir = dirname2(this.path);
-    if (!existsSync5(dir)) {
-      mkdirSync4(dir, { recursive: true });
     }
   }
 }
@@ -14760,6 +14672,9 @@ function disabledReplyError(reason) {
 }
 
 // src/bridge.ts
+if (process.env.AGENTBRIDGE_ACTIVE !== "1") {
+  process.exit(0);
+}
 var stateDir = new StateDirResolver;
 stateDir.ensure();
 var configService = new ConfigService;
@@ -14770,7 +14685,6 @@ var CONTROL_WS_URL = daemonLifecycle.controlWsUrl;
 var claude = new ClaudeAdapter(stateDir.logFile);
 var daemonClient = new DaemonClient(CONTROL_WS_URL);
 var statusLine = new StatusLineWriter(stateDir);
-var userPrefs = new UserPrefsService(stateDir);
 var shuttingDown = false;
 var daemonDisabled = false;
 var daemonDisabledReason = null;
@@ -14805,14 +14719,8 @@ daemonClient.on("status", (status) => {
   log(`Daemon status: ready=${status.bridgeReady} tui=${status.tuiConnected} thread=${status.threadId ?? "none"} queued=${status.queuedMessageCount}`);
   if (!hasSeenTuiConnect && status.tuiConnected && !previousTuiConnected) {
     hasSeenTuiConnect = true;
-    log("First TUI connect detected \u2014 sending kickoff message to Claude");
-    emitLifecycle("system_tui_kickoff", [
-      "\uD83E\uDD1D Codex has connected via AgentBridge.",
-      "You are now in a multi-agent collaboration session.",
-      "When you receive a complex task, propose a division of labor to Codex.",
-      "Use `reply` to send messages and `get_messages` to check for responses."
-    ].join(`
-`), "ux");
+    log("First TUI connect detected");
+    emitLifecycle("system_tui_kickoff");
   }
   previousTuiConnected = status.tuiConnected;
 });
@@ -14823,9 +14731,9 @@ daemonClient.on("disconnect", () => {
   const now = Date.now();
   if (now - lastDisconnectNotifyTs >= RECONNECT_NOTIFY_COOLDOWN_MS) {
     lastDisconnectNotifyTs = now;
-    emitLifecycle("system_daemon_disconnected", "\u26A0\uFE0F AgentBridge daemon control connection lost. Attempting to reconnect...", "ux");
+    emitLifecycle("system_daemon_disconnected");
   } else {
-    log("Suppressing duplicate disconnect notification (within cooldown)");
+    log("Suppressing duplicate disconnect statusbar update (within cooldown)");
   }
   reconnectToDaemon();
 });
@@ -14834,28 +14742,24 @@ daemonClient.on("rejected", async (code) => {
     return;
   let reason;
   let notificationId;
-  let notificationContent;
   switch (code) {
     case CLOSE_CODE_EVICTED_STALE:
       reason = "evicted";
       notificationId = "system_bridge_evicted";
-      notificationContent = "\u26A0\uFE0F AgentBridge evicted this session because it stopped responding to liveness probes \u2014 a newer Claude Code session has taken over. Close this session and start a new one with `agentbridge claude` if you want to reconnect. AgentBridge \u56E0\u6B64\u4F1A\u8BDD\u672A\u54CD\u5E94\u5B58\u6D3B\u63A2\u6D4B\u800C\u5C06\u5176\u9A71\u9010\u2014\u2014\u66F4\u65B0\u7684 Claude Code \u4F1A\u8BDD\u5DF2\u63A5\u7BA1\u3002\u5982\u9700\u91CD\u8FDE\uFF0C\u8BF7\u5173\u95ED\u6B64\u4F1A\u8BDD\u5E76\u8FD0\u884C `agentbridge claude` \u542F\u52A8\u65B0\u4F1A\u8BDD\u3002";
       break;
     case CLOSE_CODE_PROBE_IN_PROGRESS:
       reason = "probe_in_progress";
       notificationId = "system_bridge_probe_in_progress";
-      notificationContent = "\u26A0\uFE0F AgentBridge rejected this session \u2014 a liveness probe is currently checking whether the incumbent Claude session is still alive. Retry in a few seconds with `agentbridge claude`. AgentBridge \u62D2\u7EDD\u4E86\u6B64\u4F1A\u8BDD\u2014\u2014\u6B63\u5728\u901A\u8FC7\u5B58\u6D3B\u63A2\u6D4B\u68C0\u67E5\u73B0\u6709 Claude \u4F1A\u8BDD\u662F\u5426\u4ECD\u7136\u5728\u7EBF\u3002\u8BF7\u7A0D\u540E\u7528 `agentbridge claude` \u91CD\u8BD5\u3002";
       break;
     default:
       reason = "rejected";
       notificationId = "system_bridge_replaced";
-      notificationContent = "\u26A0\uFE0F AgentBridge daemon rejected this session \u2014 another Claude Code session is already connected. Close the other session first, or run `agentbridge kill` to reset. AgentBridge \u5B88\u62A4\u8FDB\u7A0B\u62D2\u7EDD\u4E86\u6B64\u4F1A\u8BDD\u2014\u2014\u53E6\u4E00\u4E2A Claude Code \u4F1A\u8BDD\u5DF2\u5728\u8FDE\u63A5\u4E2D\u3002\u8BF7\u5148\u5173\u95ED\u53E6\u4E00\u4E2A\u4F1A\u8BDD\uFF0C\u6216\u8FD0\u884C `agentbridge kill` \u91CD\u7F6E\u3002";
       break;
   }
   log(`Daemon rejected this session (close code ${code}, reason=${reason})`);
   daemonDisabled = true;
   daemonDisabledReason = reason;
-  await emitLifecycle(notificationId, notificationContent, "actionable");
+  emitLifecycle(notificationId);
   await daemonClient.disconnect();
   if (reason === "probe_in_progress") {
     disabledRecoveryAttempts = 0;
@@ -14865,7 +14769,7 @@ daemonClient.on("rejected", async (code) => {
 claude.on("ready", async () => {
   log(`MCP server ready (delivery mode: ${claude.getDeliveryMode()}) \u2014 ensuring AgentBridge daemon...`);
   if (daemonLifecycle.wasKilled()) {
-    await enterDisabledState("Killed sentinel found \u2014 bridge staying idle", "\u26D4 AgentBridge was stopped by `agentbridge kill`. Bridge is staying idle. Restart Claude Code (`agentbridge claude`), switch to a new conversation, or run `/resume` to reconnect.");
+    await enterDisabledState("Killed sentinel found \u2014 bridge staying idle");
     return;
   }
   await connectToDaemon();
@@ -14881,21 +14785,21 @@ async function connectToDaemon(isReconnect = false) {
     daemonClient.attachClaude();
     daemonDisabledReason = null;
     if (!isReconnect) {
-      emitLifecycle("system_bridge_ready", "\u2705 AgentBridge bridge is ready. Daemon connected. Start Codex in another terminal with: agentbridge codex", "ux");
+      emitLifecycle("system_bridge_ready");
     }
   } catch (err) {
     log(`Failed to connect to daemon: ${err.message}`);
-    await emitLifecycle("system_daemon_connect_failed", `\u274C AgentBridge daemon failed to start or is unreachable: ${err.message}`, "actionable");
+    emitLifecycle("system_daemon_connect_failed");
     throw err;
   }
 }
-async function enterDisabledState(logMessage, notificationContent) {
+async function enterDisabledState(logMessage) {
   if (daemonDisabled)
     return;
   daemonDisabled = true;
   daemonDisabledReason = "killed";
   log(logMessage);
-  await emitLifecycle("system_bridge_disabled", notificationContent, "actionable");
+  emitLifecycle("system_bridge_disabled");
   await daemonClient.disconnect();
   startDisabledRecoveryPoller();
 }
@@ -14904,7 +14808,7 @@ var reconnectTask = null;
 async function notifyIfDaemonKilled(logMessage) {
   if (!daemonLifecycle.wasKilled())
     return false;
-  await enterDisabledState(logMessage, "\u26D4 AgentBridge was stopped by `agentbridge kill`. Bridge is staying idle. Restart Claude Code (`agentbridge claude`), switch to a new conversation, or run `/resume` to reconnect.");
+  await enterDisabledState(logMessage);
   return true;
 }
 function reconnectToDaemon() {
@@ -14936,9 +14840,9 @@ function reconnectToDaemon() {
           const now = Date.now();
           if (now - lastReconnectNotifyTs >= RECONNECT_NOTIFY_COOLDOWN_MS) {
             lastReconnectNotifyTs = now;
-            emitLifecycle("system_daemon_reconnected", "\u2705 AgentBridge daemon reconnected successfully.", "ux");
+            emitLifecycle("system_daemon_reconnected");
           } else {
-            log("Suppressing duplicate reconnect notification (within cooldown)");
+            log("Suppressing duplicate reconnect statusbar update (within cooldown)");
           }
           return;
         } catch {}
@@ -14985,7 +14889,7 @@ async function pollDisabledRecovery() {
           daemonDisabledReason = "auto_recovery_exhausted";
           disabledRecoveryAttempts = 0;
           stopDisabledRecoveryPoller();
-          emitLifecycle("system_bridge_auto_recovery_gave_up", "\u26A0\uFE0F AgentBridge auto-recovery gave up after exhausting its retry budget for the in-flight liveness probe contention. Retry manually with `agentbridge claude`. AgentBridge \u81EA\u52A8\u6062\u590D\u5DF2\u653E\u5F03\u2014\u2014\u5B58\u6D3B\u63A2\u6D4B\u4E89\u7528\u7684\u91CD\u8BD5\u9884\u7B97\u5DF2\u7528\u5C3D\u3002\u8BF7\u4F7F\u7528 `agentbridge claude` \u624B\u52A8\u91CD\u8BD5\u3002", "actionable");
+          emitLifecycle("system_bridge_auto_recovery_gave_up");
           return;
         }
         disabledRecoveryAttempts += 1;
@@ -15002,7 +14906,7 @@ async function pollDisabledRecovery() {
           daemonDisabledReason = null;
           disabledRecoveryAttempts = 0;
           stopDisabledRecoveryPoller();
-          emitLifecycle("system_bridge_recovered", "\u2705 AgentBridge recovered after the liveness probe completed. Daemon reconnected.", "ux");
+          emitLifecycle("system_bridge_recovered");
         } catch (err) {
           log(`Disabled-state probe_in_progress recovery attempt failed: ${err.message}`);
           await daemonClient.disconnect();
@@ -15021,7 +14925,7 @@ async function pollDisabledRecovery() {
           daemonDisabledReason = null;
           disabledRecoveryAttempts = 0;
           stopDisabledRecoveryPoller();
-          emitLifecycle("system_bridge_recovered", "\u2705 AgentBridge recovered after the killed sentinel was cleared. Daemon reconnected.", "ux");
+          emitLifecycle("system_bridge_recovered");
         } catch (err) {
           log(`Disabled-state direct reconnect failed: ${err.message}`);
           daemonDisabled = false;
@@ -15048,23 +14952,22 @@ async function pollDisabledRecovery() {
     disabledRecoveryInFlight = false;
   }
 }
-function systemMessage(idPrefix, content) {
-  return {
-    id: `${idPrefix}_${Date.now()}`,
-    source: "codex",
-    content,
-    timestamp: Date.now()
-  };
-}
-function emitLifecycle(idPrefix, content, severity) {
-  statusLine.write({ message: content });
-  const mode = userPrefs.getStatusLineMode();
-  const sendToChannel = severity === "actionable" || mode === "channel";
-  if (!sendToChannel) {
-    log(`emitLifecycle ${idPrefix} suppressed from channel (mode=line, severity=ux)`);
-    return Promise.resolve();
-  }
-  return claude.pushNotification(systemMessage(idPrefix, content));
+var LIFECYCLE_TAGS = {
+  system_tui_kickoff: "[CODEX]",
+  system_daemon_disconnected: "[OFFLINE]",
+  system_daemon_reconnected: "[CODEX]",
+  system_bridge_ready: "[BRIDGE]",
+  system_daemon_connect_failed: "[DAEMON-FAIL]",
+  system_bridge_evicted: "[EVICTED]",
+  system_bridge_probe_in_progress: "[PROBING]",
+  system_bridge_replaced: "[REPLACED]",
+  system_bridge_disabled: "[OFFLINE]",
+  system_bridge_auto_recovery_gave_up: "[RECOVERY-FAIL]",
+  system_bridge_recovered: "[CODEX]"
+};
+function emitLifecycle(idPrefix) {
+  const tag = LIFECYCLE_TAGS[idPrefix] ?? `[${idPrefix.replace(/^system_/, "").toUpperCase()}]`;
+  statusLine.write(tag);
 }
 function shutdown(reason) {
   if (shuttingDown)

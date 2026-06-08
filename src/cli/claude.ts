@@ -4,7 +4,8 @@ import { DaemonLifecycle } from "../daemon-lifecycle";
 import { StateDirResolver } from "../state-dir";
 import { UserPrefsService } from "../user-prefs";
 import { arrowPicker } from "./prompt";
-import { detectRtk, detectCaveman, type ToolStatus } from "./tool-detection";
+import { detectRtk, detectCaveman } from "./tool-detection";
+import { wireStatusLine } from "../settings-wire";
 
 /** Flags that AgentBridge owns and will inject automatically. */
 const OWNED_FLAGS = ["--channels", "--dangerously-load-development-channels"];
@@ -24,13 +25,11 @@ export async function runClaude(args: string[]) {
 
   lifecycle.clearKilled();
 
-  // First-run prompt: ask whether lifecycle events should route to a
-  // status.line file (zero token cost) or remain in Claude's MCP channel.
-  // Skipped silently in non-interactive environments - the default applies.
+  // First-run onboarding. Three prompts in sequence (statusLine,
+  // caveman, rtk). Pressing Esc in any prompt aborts the process
+  // entirely (like Ctrl-C): we exit silently without persisting and
+  // without launching Claude. Re-running `abg claude` re-prompts.
   await maybeAskStatusLineMode(stateDir);
-
-  // First-run onboarding for companion tools (caveman, rtk). Each one
-  // is independent and self-gating: already-answered prompts are skipped.
   await maybeRunOnboardingWizard(stateDir);
 
   // Channel entry format: "server:<mcp-server-name>" for MCP-based channels,
@@ -47,9 +46,16 @@ export async function runClaude(args: string[]) {
     ...args,
   ];
 
+  // AGENTBRIDGE_ACTIVE is the opt-in gate read by bridge.ts. Only
+  // claude sessions launched via `abg claude` get it; a plain `claude`
+  // or `claude -c` still loads the agentbridge plugin (Claude can't
+  // know to skip it) but its bridge-server.js will self-exit before
+  // claiming the daemon's single Claude slot. Without this gate any
+  // background claude session would silently hold the slot and block
+  // future `abg claude` launches.
   const child = spawn("claude", fullArgs, {
     stdio: "inherit",
-    env: process.env,
+    env: { ...process.env, AGENTBRIDGE_ACTIVE: "1" },
   });
 
   child.on("exit", (code) => {
@@ -68,74 +74,53 @@ export async function runClaude(args: string[]) {
 }
 
 /**
- * First-run only: ask the user whether lifecycle events (kickoff,
- * disconnect, reconnect) should be routed to the status.line file
- * instead of Claude's MCP channel. The choice is persisted so we never
- * re-ask. Skipped automatically when stdin/stdout are not a TTY.
+ * First-run only: ask whether AgentBridge should auto-wire the user's
+ * Claude Code statusLine command to show the bridge's current state
+ * (e.g. "[CODEX]" or "[OFFLINE]") at the bottom edge of the TUI. The
+ * status.line file is always written; this prompt only controls
+ * whether settings.json gets patched for the user.
  */
 async function maybeAskStatusLineMode(stateDir: StateDirResolver): Promise<void> {
   const prefs = new UserPrefsService(stateDir);
   if (prefs.hasBeenAskedStatusLine()) return;
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
-    // No way to ask - remember that we tried so we don't keep checking,
-    // and leave the mode at its default ("channel"). Users running
-    // headlessly can set the mode explicitly via the prefs file.
     prefs.update({ statusLineAsked: true });
     return;
   }
 
+  const statusFilePath = `${stateDir.dir}/status.line`;
   const example = [
-    "If you enable statusLine, lifecycle events show up here instead",
-    "of in Claude's context:",
+    "AgentBridge writes the current link state to:",
+    `  ${statusFilePath}`,
     "",
-    "  $ cat ~/.local/state/agentbridge/status.line",
-    "  2026-01-01T12:34:56Z\t🤝 Codex has connected via AgentBridge.",
-    "",
-    "IMPORTANT: this only writes the status file. To actually see it,",
-    "you must manually add a statusLine command to your Claude Code",
-    "settings at ~/.claude/settings.json:",
-    "",
-    '  "statusLine": {',
-    '    "command": "cat ~/.local/state/agentbridge/status.line"',
-    "  }",
-    "",
-    "AgentBridge will NOT edit settings.json for you. If you enable",
-    "this and skip the settings.json edit, you will simply stop seeing",
-    "routine connect/disconnect events (urgent events like \"bridge",
-    "evicted\" still reach Claude either way).",
+    "Wiring it into Claude Code's statusLine shows it at the bottom",
+    "edge, e.g. [CODEX] when Codex is connected, [OFFLINE] when not.",
   ].join("\n");
 
-  const choice = await arrowPicker<"line" | "channel">({
-    title: "Route AgentBridge lifecycle events to a status.line file?",
+  const choice = await arrowPicker<"wire" | "manual" | "skip">({
+    title: "Show bridge status in Claude Code's statusbar?",
     example,
     options: [
-      {
-        value: "line",
-        label: "Yes, use status.line",
-        description: "saves tokens. requires one-time settings.json edit",
-      },
-      {
-        value: "channel",
-        label: "No, keep events in Claude's channel",
-        description: "current behavior. no extra setup",
-      },
+      { value: "wire", label: "Edit settings.json for me now" },
+      { value: "manual", label: "I will set it up myself" },
+      { value: "skip", label: "Skip" },
     ],
     defaultIndex: 0,
   });
 
   if (choice === null) {
-    // Cancelled (Esc/Ctrl-C) - don't persist. Will re-ask next run.
-    console.error("[agentbridge] No choice made - will ask again next launch.");
-    return;
+    // Esc - exit cleanly without persisting anything or launching
+    // Claude. The user effectively backed out of `abg claude`.
+    process.exit(0);
   }
 
-  prefs.update({ statusLineMode: choice, statusLineAsked: true });
-  if (choice === "line") {
-    console.error("[agentbridge] statusLine mode enabled. Status file: " + stateDir.dir + "/status.line");
-    console.error("[agentbridge] REMINDER: add the statusLine command to ~/.claude/settings.json yourself, or you will not see routine lifecycle events.");
-    console.error("[agentbridge] To reverse this choice later, delete the 'statusLineMode' key in " + stateDir.dir + "/user-prefs.json");
-  } else {
-    console.error("[agentbridge] Keeping events in Claude's channel (default behavior).");
+  prefs.update({ statusLineAsked: true });
+
+  if (choice === "wire") {
+    // Best-effort: wire settings.json silently. If it conflicts or
+    // errors, status.line still gets written; user just won't see
+    // it in the TUI statusbar until they configure manually.
+    wireStatusLine({ statusFilePath });
   }
 }
 
@@ -160,117 +145,62 @@ async function maybeRunOnboardingWizard(stateDir: StateDirResolver): Promise<voi
     return;
   }
 
-  if (!prefs.hasBeenAskedCaveman()) {
-    await askCaveman(prefs);
-  }
-  if (!prefs.hasBeenAskedRtk()) {
-    await askRtk(prefs);
-  }
+  if (!prefs.hasBeenAskedCaveman()) await askCaveman(prefs);
+  if (!prefs.hasBeenAskedRtk()) await askRtk(prefs);
 }
 
 async function askCaveman(prefs: UserPrefsService): Promise<void> {
   const status = detectCaveman();
-  const example = renderToolExample({
-    name: "caveman",
-    summary: "Claude Code skill that compresses Claude's replies to a terse, fragment-style \"smart caveman\" register. Code and commit messages are exempt.",
-    benefit: "Big cut in output tokens per turn (often 30-60%) without losing technical substance.",
-    installHint: "Install via the Claude Code plugin marketplace, then enable in ~/.claude/settings.json under \"skills\".",
-    status,
-  });
+  const example = [
+    "Claude Code skill. Replies in short caveman style; 30-60% fewer",
+    "tokens per turn. Code, commits, security warnings stay normal.",
+    `Local: ${status.installed ? "installed" : "not installed"}. Install via Claude Code marketplace.`,
+  ].join("\n");
 
   const choice = await arrowPicker<"opt-in" | "skip">({
-    title: "Enable caveman mode for Claude Code?",
+    title: "Use caveman reply style?",
     example,
     options: [
-      { value: "opt-in", label: "Yes, I want caveman", description: status.installed ? "already installed, just enable in settings" : "not installed yet, AgentBridge will print pointers" },
-      { value: "skip", label: "No, skip for now", description: "you can change this later in user-prefs.json" },
+      { value: "opt-in", label: "Yes" },
+      { value: "skip", label: "Skip" },
     ],
     defaultIndex: status.installed ? 0 : 1,
   });
 
   if (choice === null) {
-    console.error("[agentbridge] caveman: no choice made, will ask again next launch.");
-    return;
+    process.exit(0);
   }
   const optIn = choice === "opt-in";
   prefs.update({ cavemanAsked: true, cavemanOptIn: optIn });
-  if (optIn) {
-    if (status.installed) {
-      console.error(`[agentbridge] caveman: detected at ${status.path}. Enable it in ~/.claude/settings.json under "skills" if not already active.`);
-    } else {
-      console.error("[agentbridge] caveman: not detected. Install via the Claude Code plugin marketplace, then re-run for it to take effect.");
-    }
-  } else {
-    console.error("[agentbridge] caveman: skipped.");
-  }
 }
 
 async function askRtk(prefs: UserPrefsService): Promise<void> {
   const status = detectRtk();
-  const example = renderToolExample({
-    name: "rtk",
-    summary: "Rust Token Killer is a CLI proxy that rewrites chatty dev commands (git, npm, etc.) into token-cheap output equivalents.",
-    benefit: "60-90% token savings on routine dev operations. Transparent via a shell hook: `git status` becomes `rtk git status` automatically.",
-    installHint: "See https://github.com/anthropic-experimental/rtk (cargo install rtk). Beware of the name collision with reachingforthejack/rtk (Rust Type Kit).",
-    status,
-  });
+  const detectedLine = status.installed
+    ? `installed${status.version ? ` (${status.version})` : ""}`
+    : "not installed";
+  const example = [
+    "Shell proxy. Shrinks command output before Claude reads it",
+    "(e.g. `git log` 1000 lines becomes 20). 60-90% token cut on",
+    "dev work. Install: `cargo install rtk` + shell hook.",
+    `Local: ${detectedLine}.`,
+  ].join("\n");
 
   const choice = await arrowPicker<"opt-in" | "skip">({
-    title: "Enable rtk (Rust Token Killer) integration?",
+    title: "Use rtk to shrink dev-command output?",
     example,
     options: [
-      { value: "opt-in", label: "Yes, I want rtk", description: status.installed ? `detected ${status.version ?? "(version unknown)"}` : "not installed yet, AgentBridge will print pointers" },
-      { value: "skip", label: "No, skip for now", description: "you can change this later in user-prefs.json" },
+      { value: "opt-in", label: "Yes" },
+      { value: "skip", label: "Skip" },
     ],
     defaultIndex: status.installed ? 0 : 1,
   });
 
   if (choice === null) {
-    console.error("[agentbridge] rtk: no choice made, will ask again next launch.");
-    return;
+    process.exit(0);
   }
   const optIn = choice === "opt-in";
   prefs.update({ rtkAsked: true, rtkOptIn: optIn });
-  if (optIn) {
-    if (status.installed) {
-      console.error(`[agentbridge] rtk: detected at ${status.path} (${status.version}). Hook it into your shell so it auto-rewrites commands.`);
-    } else {
-      console.error("[agentbridge] rtk: not detected on PATH. Install the real rtk (cargo install rtk) and re-run.");
-      if (status.note) console.error(`[agentbridge] rtk: detection note: ${status.note}`);
-    }
-  } else {
-    console.error("[agentbridge] rtk: skipped.");
-  }
-}
-
-interface ToolExampleInput {
-  name: string;
-  summary: string;
-  benefit: string;
-  installHint: string;
-  status: ToolStatus;
-}
-
-function renderToolExample(input: ToolExampleInput): string {
-  const lines: string[] = [];
-  lines.push(`${input.name}:`);
-  lines.push(`  ${input.summary}`);
-  lines.push("");
-  lines.push(`  Benefit: ${input.benefit}`);
-  lines.push("");
-  lines.push(`  Install / enable: ${input.installHint}`);
-  lines.push("");
-  if (input.status.installed) {
-    lines.push(`  Detected: yes${input.status.path ? ` at ${input.status.path}` : ""}`);
-    if (input.status.version) lines.push(`  Version:  ${input.status.version}`);
-  } else {
-    lines.push("  Detected: no");
-    if (input.status.note) lines.push(`  Note:     ${input.status.note}`);
-  }
-  lines.push("");
-  lines.push("AgentBridge will NOT install or auto-configure this for you;");
-  lines.push("opting in only records your preference and prints pointers.");
-  return lines.join("\n");
 }
 
 /**

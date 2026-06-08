@@ -45,22 +45,23 @@ interface Colors {
   reset: string;
   bold: string;
   dim: string;
-  green: string;
-  cyan: string;
-  yellow: string;
+  italic: string;
+  /** Accent color for the selected option (matches Claude Code's prompt style). */
+  selected: string;
 }
 
 function makeColors(enabled: boolean): Colors {
   if (!enabled) {
-    return { reset: "", bold: "", dim: "", green: "", cyan: "", yellow: "" };
+    return { reset: "", bold: "", dim: "", italic: "", selected: "" };
   }
   return {
     reset: "\x1b[0m",
     bold: "\x1b[1m",
     dim: "\x1b[2m",
-    green: "\x1b[32m",
-    cyan: "\x1b[36m",
-    yellow: "\x1b[33m",
+    italic: "\x1b[3m",
+    // Bright blue, matching the highlight Claude Code uses for the
+    // current option in its own dev-channels confirmation prompt.
+    selected: "\x1b[94m",
   };
 }
 
@@ -98,36 +99,72 @@ export async function arrowPicker<V>(input: PickerInput<V>): Promise<V | null> {
     return input.options[defaultIdx].value;
   }
 
-  // Header (title + hint)
-  stdout.write(`${c.bold}? ${input.title}${c.reset}  ${c.dim}(↑/↓ Enter · Esc cancels)${c.reset}\n`);
+  // Track total lines emitted so we can erase the whole prompt on
+  // exit. The prompt is ephemeral: when the user picks (or cancels)
+  // the rendered region is wiped, leaving the terminal as it was
+  // before. The next prompt then renders in the same spot.
+  const ruleWidth = Math.min(80, Math.max(40, (stdout as any).columns ?? 64));
+  let linesEmitted = 0;
+  const writeLine = (s: string): void => {
+    stdout.write(s);
+    linesEmitted++;
+  };
 
-  // Example block (rendered once - never overwritten by re-renders)
+  // Header: top rule + title.
+  writeLine(`${c.dim}${"─".repeat(ruleWidth)}${c.reset}\n`);
+  writeLine("\n");
+  writeLine(`  ${c.bold}${input.title}${c.reset}\n`);
+
+  // Example block.
   if (input.example) {
-    stdout.write("\n");
+    writeLine("\n");
     for (const line of input.example.split("\n")) {
-      stdout.write(`  ${c.dim}│${c.reset} ${line}\n`);
+      writeLine(`  ${line}\n`);
     }
-    stdout.write("\n");
   }
 
+  writeLine("\n");
+
   let idx = defaultIdx;
+  // Count of "live" lines that re-render on each navigation
+  // (option lines + blank + footer line).
+  const liveLines = input.options.length + 2;
 
   const render = (first: boolean): void => {
     if (!first) {
-      // Move cursor up to overwrite the previous option block.
-      stdout.write(`\x1b[${input.options.length}A`);
+      // Move cursor up over the live region to overwrite in place.
+      stdout.write(`\x1b[${liveLines}A`);
     }
     for (let i = 0; i < input.options.length; i++) {
       const opt = input.options[i];
-      const selected = i === idx;
-      const marker = selected ? `${c.green}▸${c.reset}` : " ";
-      const labelStyle = selected ? c.bold : c.dim;
-      let line = `  ${marker} ${labelStyle}${opt.label}${c.reset}`;
-      if (opt.description) line += `  ${c.dim}- ${opt.description}${c.reset}`;
-      // \r + \x1b[K = carriage-return + clear-to-end-of-line, so a longer
-      // previous render does not leave artifacts behind a shorter new one.
-      stdout.write(`\r${line}\x1b[K\n`);
+      const isSel = i === idx;
+      const marker = isSel ? `${c.selected}❯${c.reset}` : " ";
+      const num = `${i + 1}.`;
+      const labelColor = isSel ? c.selected : "";
+      let line = `  ${marker} ${labelColor}${num} ${opt.label}${c.reset}`;
+      if (opt.description) {
+        line += `  ${c.dim}${opt.description}${c.reset}`;
+      }
+      if (first) writeLine(`\r${line}\x1b[K\n`);
+      else stdout.write(`\r${line}\x1b[K\n`);
     }
+    if (first) {
+      writeLine(`\x1b[K\n`);
+      writeLine(`  ${c.italic}${c.dim}Enter to confirm · Esc to cancel${c.reset}\x1b[K\n`);
+    } else {
+      stdout.write(`\x1b[K\n`);
+      stdout.write(`  ${c.italic}${c.dim}Enter to confirm · Esc to cancel${c.reset}\x1b[K\n`);
+    }
+  };
+
+  // Erase every line we have written so the next prompt (or the
+  // shell) starts from a clean position. Called on every exit path.
+  const eraseAll = (): void => {
+    if (linesEmitted <= 0) return;
+    // Move cursor to the start of the first emitted line then clear
+    // everything from there down.
+    stdout.write(`\r\x1b[${linesEmitted}A\x1b[J`);
+    linesEmitted = 0;
   };
 
   render(true);
@@ -164,7 +201,7 @@ export async function arrowPicker<V>(input: PickerInput<V>): Promise<V | null> {
         // Ctrl-C
         if (ch === "\x03") {
           cleanup();
-          stdout.write("\n");
+          eraseAll();
           resolve(null);
           return;
         }
@@ -172,7 +209,7 @@ export async function arrowPicker<V>(input: PickerInput<V>): Promise<V | null> {
         // Enter
         if (ch === "\r" || ch === "\n") {
           cleanup();
-          stdout.write("\n");
+          eraseAll();
           resolve(input.options[idx].value);
           return;
         }
@@ -190,7 +227,7 @@ export async function arrowPicker<V>(input: PickerInput<V>): Promise<V | null> {
           }
           // Standalone Esc - cancel
           cleanup();
-          stdout.write("\n");
+          eraseAll();
           resolve(null);
           return;
         }
@@ -213,8 +250,7 @@ export async function arrowPicker<V>(input: PickerInput<V>): Promise<V | null> {
           if (n < input.options.length) {
             idx = n;
             cleanup();
-            render(false);
-            stdout.write("\n");
+            eraseAll();
             resolve(input.options[idx].value);
             return;
           }

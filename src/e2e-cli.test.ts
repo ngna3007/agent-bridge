@@ -203,7 +203,11 @@ class CliE2EHarness {
     await this.releaseDaemonPortReservations();
     return this.spawnProcess(process.execPath, ["run", BRIDGE_PATH], {
       cwd: this.projectDir,
-      env: this.env,
+      // bridge.ts self-exits when AGENTBRIDGE_ACTIVE is unset (the
+      // opt-in gate that keeps stray claude sessions from claiming
+      // the daemon's slot). E2E tests exercise bridge.ts directly,
+      // so we set the flag explicitly here.
+      env: { ...this.env, AGENTBRIDGE_ACTIVE: "1" },
     });
   }
 

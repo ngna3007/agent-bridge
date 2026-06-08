@@ -1,30 +1,24 @@
 /**
  * Single-line "current status" file.
  *
- * Writes one line representing the most recent lifecycle event (TUI
- * connected, daemon disconnected, evicted, etc.) so users can wire it
- * into their Claude Code statusLine shell command:
+ * Holds one compact tag representing the bridge's current state,
+ * e.g. "[CODEX]" when Codex is connected or "[OFFLINE]" when the
+ * link is down. Users wire it into Claude Code's statusLine command
+ * to display it at the bottom edge of the TUI:
  *
  *   "statusLine": { "command": "cat ~/.local/state/agentbridge/status.line" }
  *
- * The file is overwritten in full on every event - there's no history
- * here, just "what's true right now". A history audit log lives
- * separately (see AuditLog in src/audit-log.ts).
+ * The file is overwritten in full on every state change - there is
+ * no history here, just "what's true right now". A history audit log
+ * lives separately (see AuditLog in src/audit-log.ts).
  *
- * The writer never throws. Logging that takes down the daemon would be
- * worse than missing a status update.
+ * The writer never throws. Logging that takes down the daemon would
+ * be worse than missing a status update.
  */
 
 import { writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { StateDirResolver } from "./state-dir";
-
-export interface StatusLineSnapshot {
-  /** Compact one-line message (no newlines). */
-  message: string;
-  /** ISO-8601 timestamp at which the event was emitted. */
-  timestamp?: string;
-}
 
 export class StatusLineWriter {
   private readonly path: string;
@@ -40,16 +34,15 @@ export class StatusLineWriter {
   }
 
   /**
-   * Overwrite the status file with a single line. Newlines in the
-   * message are flattened so users' statusLine commands never see
+   * Overwrite the status file with a single tag. Newlines inside the
+   * tag are flattened so users' statusLine commands never see
    * multi-line garbage.
    */
-  write(snapshot: StatusLineSnapshot): void {
+  write(tag: string): void {
     try {
       this.ensureDir();
-      const ts = snapshot.timestamp ?? new Date().toISOString();
-      const oneLine = snapshot.message.replace(/[\r\n]+/g, " ").trim();
-      writeFileSync(this.path, `${ts}\t${oneLine}\n`, "utf-8");
+      const oneLine = tag.replace(/[\r\n]+/g, " ").trim();
+      writeFileSync(this.path, `${oneLine}\n`, "utf-8");
     } catch {
       // Silently ignore - status writes must not crash the daemon.
     }

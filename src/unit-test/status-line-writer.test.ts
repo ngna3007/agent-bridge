@@ -18,49 +18,38 @@ afterEach(() => {
 });
 
 describe("StatusLineWriter - basic writes", () => {
-  test("writes a single line containing timestamp + message", () => {
-    writer.write({ message: "codex ready", timestamp: "2026-01-01T00:00:00Z" });
-    const content = readFileSync(writer.filePath, "utf-8");
-    expect(content).toBe("2026-01-01T00:00:00Z\tcodex ready\n");
-  });
-
-  test("auto-generates timestamp when omitted", () => {
-    writer.write({ message: "hello" });
-    const content = readFileSync(writer.filePath, "utf-8");
-    expect(content).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
-    expect(content).toContain("\thello\n");
+  test("writes the tag verbatim followed by a single newline", () => {
+    writer.write("[CODEX]");
+    expect(readFileSync(writer.filePath, "utf-8")).toBe("[CODEX]\n");
   });
 
   test("overwrites previous content on each call", () => {
-    writer.write({ message: "first", timestamp: "2026-01-01T00:00:00Z" });
-    writer.write({ message: "second", timestamp: "2026-01-01T00:00:01Z" });
-    const content = readFileSync(writer.filePath, "utf-8");
-    expect(content).toBe("2026-01-01T00:00:01Z\tsecond\n");
-    // No trace of "first" left behind.
-    expect(content).not.toContain("first");
+    writer.write("[CODEX]");
+    writer.write("[OFFLINE]");
+    expect(readFileSync(writer.filePath, "utf-8")).toBe("[OFFLINE]\n");
   });
 });
 
 describe("StatusLineWriter - newline flattening", () => {
-  test("LF in message is collapsed to a space", () => {
-    writer.write({ message: "line1\nline2", timestamp: "2026-01-01T00:00:00Z" });
-    expect(readFileSync(writer.filePath, "utf-8")).toBe("2026-01-01T00:00:00Z\tline1 line2\n");
+  test("LF inside the tag is collapsed to a space", () => {
+    writer.write("line1\nline2");
+    expect(readFileSync(writer.filePath, "utf-8")).toBe("line1 line2\n");
   });
 
-  test("CRLF in message is collapsed too", () => {
-    writer.write({ message: "a\r\nb", timestamp: "2026-01-01T00:00:00Z" });
-    expect(readFileSync(writer.filePath, "utf-8")).toBe("2026-01-01T00:00:00Z\ta b\n");
+  test("CRLF is collapsed too", () => {
+    writer.write("a\r\nb");
+    expect(readFileSync(writer.filePath, "utf-8")).toBe("a b\n");
   });
 
-  test("trims leading/trailing whitespace from message", () => {
-    writer.write({ message: "  padded  ", timestamp: "2026-01-01T00:00:00Z" });
-    expect(readFileSync(writer.filePath, "utf-8")).toBe("2026-01-01T00:00:00Z\tpadded\n");
+  test("leading and trailing whitespace is trimmed", () => {
+    writer.write("  [CODEX]  ");
+    expect(readFileSync(writer.filePath, "utf-8")).toBe("[CODEX]\n");
   });
 });
 
 describe("StatusLineWriter - clear", () => {
   test("clear empties the file", () => {
-    writer.write({ message: "before" });
+    writer.write("[CODEX]");
     writer.clear();
     expect(readFileSync(writer.filePath, "utf-8")).toBe("");
   });
@@ -73,7 +62,7 @@ describe("StatusLineWriter - clear", () => {
 describe("StatusLineWriter - never throws contract", () => {
   test("write to an unwritable path silently degrades", () => {
     const bad = new StatusLineWriter(new StateDirResolver("/dev/null/cannot-write"));
-    expect(() => bad.write({ message: "x" })).not.toThrow();
+    expect(() => bad.write("x")).not.toThrow();
     expect(existsSync(bad.filePath)).toBe(false);
   });
 });
