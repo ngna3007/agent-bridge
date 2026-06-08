@@ -25,9 +25,18 @@ export async function runClaude(args: string[]) {
   lifecycle.clearKilled();
 
   // First-run intro screen. Shows the AgentBridge logo and a short
-  // description; auto-wires ~/.claude/settings.json for the statusbar.
-  // Esc anywhere in the screen aborts the whole `abg claude` command.
+  // description. Esc aborts the launch silently.
   await maybeShowIntro(stateDir);
+
+  // Auto-wire (or migrate) the user's ~/.claude/settings.json on every
+  // `abg claude` invocation. wireStatusLine is idempotent: it
+  // returns "already-correct" without touching the file when the
+  // command is already in the current gated format. Running it on
+  // every launch ensures that users who were wired by an older
+  // build (before the env gate landed) get migrated automatically
+  // the next time they run `abg claude` -- no need to re-trigger
+  // the intro screen.
+  wireStatusLine({ statusFilePath: `${stateDir.dir}/status.line` });
 
   // Channel entry format: "server:<mcp-server-name>" for MCP-based channels,
   // or "plugin:<plugin>@<marketplace>" for plugin-based channels.
@@ -98,11 +107,9 @@ async function maybeShowIntro(stateDir: StateDirResolver): Promise<void> {
   const prefs = new UserPrefsService(stateDir);
   if (prefs.hasAcknowledgedIntro()) return;
 
-  const statusFilePath = `${stateDir.dir}/status.line`;
-
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
-    // No TTY -> can't show the screen. Wire silently and continue.
-    wireStatusLine({ statusFilePath });
+    // No TTY -> can't show the screen. Record acknowledgement and
+    // let runClaude handle the (idempotent) wire after we return.
     prefs.update({ introAcknowledged: true });
     return;
   }
@@ -134,7 +141,8 @@ async function maybeShowIntro(stateDir: StateDirResolver): Promise<void> {
     process.exit(0);
   }
 
-  wireStatusLine({ statusFilePath });
+  // Wire is also called in runClaude after this returns, so we
+  // don't double-wire here. Just record acknowledgement.
   prefs.update({ introAcknowledged: true });
 }
 
