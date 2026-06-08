@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, mkdirSync, utimesSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { wireStatusLine } from "../settings-wire";
@@ -99,6 +99,67 @@ describe("wireStatusLine - already-correct detection (gated format only)", () =>
     // File unchanged.
     const written = JSON.parse(readFileSync(settingsPath, "utf-8"));
     expect(written.statusLine.command).toBe(gatedChain);
+  });
+});
+
+describe("wireStatusLine - backup retention", () => {
+  test("keeps only the newest 5 backups, deletes older ones", () => {
+    mkdirSync(join(tmp, ".claude"), { recursive: true });
+    writeFileSync(settingsPath, JSON.stringify({
+      statusLine: { command: 'echo zero' },
+    }));
+    const claudeDir = join(tmp, ".claude");
+    // Seed 7 stale backups with explicit ascending mtimes so the
+    // prune sort is well-defined (writeFileSync alone gives them all
+    // the same "now" mtime, which would make the sort order undefined).
+    const seedTimes = [
+      1700_000_000,
+      1710_000_000,
+      1720_000_000,
+      1730_000_000,
+      1740_000_000,
+      1750_000_000,
+      1760_000_000,
+    ];
+    for (const ts of seedTimes) {
+      const path = join(claudeDir, `settings.json.bak.${ts}`);
+      writeFileSync(path, `bak${ts}`);
+      utimesSync(path, ts, ts);
+    }
+
+    const r = wireStatusLine({ settingsPath, statusFilePath: statusPath });
+    expect(r.status).toBe("chained");
+
+    const remaining = require("node:fs")
+      .readdirSync(claudeDir)
+      .filter((n: string) => n.startsWith("settings.json.bak."));
+    expect(remaining.length).toBe(5);
+    // Oldest two seeds must be gone, newest (and the just-created
+    // wire backup) must survive.
+    expect(remaining).not.toContain(`settings.json.bak.${seedTimes[0]}`);
+    expect(remaining).not.toContain(`settings.json.bak.${seedTimes[1]}`);
+    expect(remaining).toContain(`settings.json.bak.${seedTimes[6]}`);
+  });
+
+  test("never deletes the freshly-created backup", () => {
+    mkdirSync(join(tmp, ".claude"), { recursive: true });
+    writeFileSync(settingsPath, JSON.stringify({
+      statusLine: { command: 'echo zero' },
+    }));
+    const claudeDir = join(tmp, ".claude");
+    // Seed many older backups with mtime in the distant past so they
+    // rank LOWER than the freshly-created backup. The fresh backup
+    // must survive the prune.
+    for (let i = 0; i < 10; i++) {
+      const path = join(claudeDir, `settings.json.bak.old_${i}`);
+      writeFileSync(path, `o${i}`);
+      const t = 1_000_000_000 + i; // year 2001 epoch
+      utimesSync(path, t, t);
+    }
+    const r = wireStatusLine({ settingsPath, statusFilePath: statusPath });
+    expect(r.status).toBe("chained");
+    if (r.status !== "chained") return;
+    expect(existsSync(r.backupPath!)).toBe(true);
   });
 });
 

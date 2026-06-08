@@ -25,8 +25,17 @@
  *      nothing.
  */
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync, copyFileSync, statSync } from "node:fs";
-import { dirname, join } from "node:path";
+import {
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  existsSync,
+  copyFileSync,
+  statSync,
+  readdirSync,
+  unlinkSync,
+} from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { homedir } from "node:os";
 
 export interface WireStatusLineOptions {
@@ -87,6 +96,14 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 const GATE_MARKER = '"$AGENTBRIDGE_ACTIVE" = "1"';
 
 /**
+ * How many `.bak.*` files to keep alongside settings.json. Older
+ * ones are deleted after every successful write. Set high enough
+ * that a user has a few generations to roll back to, low enough
+ * that a long-lived install does not accumulate hundreds.
+ */
+const BACKUP_RETENTION = 5;
+
+/**
  * Build a shell command that prints AgentBridge's status tag only
  * when this Claude session was launched via `abg claude`. That
  * sessions sets AGENTBRIDGE_ACTIVE=1 in its environment, which
@@ -126,6 +143,42 @@ function composeChainedCommand(existing: string, statusFilePath: string): string
  */
 function alreadyChained(command: string, _statusFilePath: string): boolean {
   return command.includes(GATE_MARKER);
+}
+
+/**
+ * Delete oldest `<settingsPath>.bak.*` siblings beyond
+ * BACKUP_RETENTION. Pure best-effort: ignores any I/O error so a
+ * read-only directory or a permission glitch never blocks a wire.
+ */
+function pruneBackups(settingsPath: string): void {
+  try {
+    const dir = dirname(settingsPath);
+    const prefix = basename(settingsPath) + ".bak.";
+    const candidates = readdirSync(dir)
+      .filter((name) => name.startsWith(prefix))
+      .map((name) => {
+        const full = join(dir, name);
+        try {
+          return { path: full, mtimeMs: statSync(full).mtimeMs };
+        } catch {
+          return null;
+        }
+      })
+      .filter((c): c is { path: string; mtimeMs: number } => c !== null)
+      // Newest first.
+      .sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+    for (const old of candidates.slice(BACKUP_RETENTION)) {
+      try {
+        unlinkSync(old.path);
+      } catch {
+        // Already gone or unreadable - move on.
+      }
+    }
+  } catch {
+    // No directory access -> nothing to prune; the user's main
+    // settings.json write has already completed safely.
+  }
 }
 
 /**
@@ -247,6 +300,11 @@ export function wireStatusLine(opts: WireStatusLineOptions): WireStatusLineResul
   } catch (e: any) {
     return { status: "error", reason: `cannot write ${settingsPath}: ${e.message}` };
   }
+
+  // Keep only the newest BACKUP_RETENTION .bak.* files alongside
+  // settings.json. We do this AFTER the main write succeeds so a
+  // failed wire never deletes the user's previous backups.
+  pruneBackups(settingsPath);
 
   if (chainedFrom !== null) {
     return { status: "chained", backupPath, previousCommand: chainedFrom, command: newCommand };
