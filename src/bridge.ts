@@ -111,6 +111,10 @@ const DAEMON_LIFECYCLE_TAGS: Record<string, string> = {
   system_turn_started:       wrap(C_YELLOW, "[CODEX THINKING]"),
   system_turn_completed:     wrap(C_GREEN,  "[CODEX READY]"),
   system_reply_missing:      wrap(C_RED,    "[CODEX NO REPLY]"),
+  // Codex TUI dropped but daemon + codex app-server still alive.
+  // Yellow because it's recoverable: user just reopens `abg codex`.
+  system_tui_disconnected:   wrap(C_YELLOW, "[CODEX UI OFFLINE]"),
+  system_tui_reconnected:    wrap(C_GREEN,  "[CODEX READY]"),
 };
 
 daemonClient.on("codexMessage", (message, deliveryHint) => {
