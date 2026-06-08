@@ -79,6 +79,8 @@ function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
+const GATE_MARKER = '"$AGENTBRIDGE_ACTIVE" = "1"';
+
 /**
  * Build a shell command that prints AgentBridge's status tag only
  * when this Claude session was launched via `abg claude`. That
@@ -88,7 +90,7 @@ function isRecord(v: unknown): v is Record<string, unknown> {
  * pass-through so the user doesn't see stale bridge state.
  */
 function gatedCat(statusFilePath: string): string {
-  return `[ "$AGENTBRIDGE_ACTIVE" = "1" ] && cat ${statusFilePath}`;
+  return `[ ${GATE_MARKER} ] && cat ${statusFilePath}`;
 }
 
 /**
@@ -99,12 +101,32 @@ function gatedCat(statusFilePath: string): string {
  * the statusbar to a second line.
  */
 function composeChainedCommand(existing: string, statusFilePath: string): string {
-  return `{ ${existing}; [ "$AGENTBRIDGE_ACTIVE" = "1" ] && { printf ' '; cat ${statusFilePath}; }; } | tr -d '\\n'`;
+  return `{ ${existing}; [ ${GATE_MARKER} ] && { printf ' '; cat ${statusFilePath}; }; } | tr -d '\\n'`;
 }
 
-/** True when `command` already contains our `cat <statusFilePath>` snippet. */
+/**
+ * True when the command is already in the current gated format
+ * (contains both our cat AND the env gate). We treat anything else
+ * containing `cat <path>` as an upgrade candidate.
+ */
 function alreadyChained(command: string, statusFilePath: string): boolean {
-  return command.includes(`cat ${statusFilePath}`);
+  return command.includes(`cat ${statusFilePath}`) && command.includes(GATE_MARKER);
+}
+
+/**
+ * Detect AgentBridge's previous (ungated) chained format and return
+ * the user's original pre-AgentBridge command (e.g. the caveman
+ * statusLine script). Returns null when the command isn't our old
+ * chain shape.
+ *
+ * Old format (no env gate):
+ *   { <original>; printf ' '; cat <path>; } | tr -d '\n'
+ */
+function tryParseOldChain(command: string, statusFilePath: string): string | null {
+  const prefix = "{ ";
+  const tail = `; printf ' '; cat ${statusFilePath}; } | tr -d '\\n'`;
+  if (!command.startsWith(prefix) || !command.endsWith(tail)) return null;
+  return command.slice(prefix.length, command.length - tail.length);
 }
 
 /**
@@ -148,7 +170,6 @@ export function wireStatusLine(opts: WireStatusLineOptions): WireStatusLineResul
   const existing = raw.statusLine;
   let newCommand: string = standaloneCommand;
   let chainedFrom: string | null = null;
-  const isFreshWire = !(isRecord(existing) && typeof existing.command === "string");
 
   if (isRecord(existing) && typeof existing.command === "string") {
     const existingCommand = existing.command;
@@ -158,8 +179,23 @@ export function wireStatusLine(opts: WireStatusLineOptions): WireStatusLineResul
     if (opts.force) {
       newCommand = standaloneCommand;
     } else {
-      newCommand = composeChainedCommand(existingCommand, opts.statusFilePath);
-      chainedFrom = existingCommand;
+      // Migration: detect AgentBridge's previous ungated chain and
+      // rebuild from the original prefix so we don't nest a chain
+      // inside another chain (which would double-print our cat).
+      const oldChainOriginal = tryParseOldChain(existingCommand, opts.statusFilePath);
+      if (oldChainOriginal !== null) {
+        newCommand = composeChainedCommand(oldChainOriginal, opts.statusFilePath);
+        chainedFrom = oldChainOriginal;
+      } else if (existingCommand === `cat ${opts.statusFilePath}`) {
+        // Old ungated standalone -> upgrade to gated standalone.
+        newCommand = standaloneCommand;
+      } else {
+        // Unknown command (user hand-edit or third-party) -> chain
+        // onto it. We trust the user's existing tooling and only
+        // append our gated cat after it.
+        newCommand = composeChainedCommand(existingCommand, opts.statusFilePath);
+        chainedFrom = existingCommand;
+      }
     }
   }
 

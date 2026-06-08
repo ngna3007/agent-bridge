@@ -69,22 +69,53 @@ describe("wireStatusLine - existing settings.json with other keys", () => {
   });
 });
 
-describe("wireStatusLine - already-correct detection", () => {
-  test("returns already-correct when settings already points at the same status file (plain command)", () => {
+describe("wireStatusLine - already-correct detection (gated format only)", () => {
+  test("returns already-correct when settings already uses the current gated chain", () => {
+    mkdirSync(join(tmp, ".claude"), { recursive: true });
+    const gatedChain = `{ bash "/home/x/caveman.sh"; [ "$AGENTBRIDGE_ACTIVE" = "1" ] && { printf ' '; cat ${statusPath}; }; } | tr -d '\\n'`;
+    writeFileSync(settingsPath, JSON.stringify({ statusLine: { command: gatedChain } }));
+    const r = wireStatusLine({ settingsPath, statusFilePath: statusPath });
+    expect(r.status).toBe("already-correct");
+  });
+
+  test("returns already-correct when settings already uses the gated standalone", () => {
+    mkdirSync(join(tmp, ".claude"), { recursive: true });
+    const gatedStandalone = `[ "$AGENTBRIDGE_ACTIVE" = "1" ] && cat ${statusPath}`;
+    writeFileSync(settingsPath, JSON.stringify({ statusLine: { command: gatedStandalone } }));
+    const r = wireStatusLine({ settingsPath, statusFilePath: statusPath });
+    expect(r.status).toBe("already-correct");
+  });
+});
+
+describe("wireStatusLine - migration from old ungated formats", () => {
+  test("migrates the old ungated chain (no $AGENTBRIDGE_ACTIVE gate) to the new gated chain", () => {
+    mkdirSync(join(tmp, ".claude"), { recursive: true });
+    const oldChain = `{ bash "/home/x/caveman.sh"; printf ' '; cat ${statusPath}; } | tr -d '\\n'`;
+    writeFileSync(settingsPath, JSON.stringify({ statusLine: { command: oldChain } }));
+    const r = wireStatusLine({ settingsPath, statusFilePath: statusPath });
+    expect(r.status).toBe("chained");
+    if (r.status !== "chained") return;
+    // Migration reconstructs from the user's original prefix command,
+    // not by nesting another chain around the old chain.
+    expect(r.previousCommand).toBe('bash "/home/x/caveman.sh"');
+    expect(r.command).toContain('"$AGENTBRIDGE_ACTIVE" = "1"');
+    expect(r.command).toContain(`cat ${statusPath}`);
+    // No nested wrapping: the only occurrence of "{ " should be the
+    // outermost group.
+    expect(r.command.match(/\{ /g)!.length).toBe(2); // outer + inner (gate's && {)
+    expect(r.command).not.toContain(oldChain); // not nested
+  });
+
+  test("migrates the old ungated standalone (plain cat) to the gated standalone", () => {
     mkdirSync(join(tmp, ".claude"), { recursive: true });
     writeFileSync(settingsPath, JSON.stringify({
       statusLine: { command: `cat ${statusPath}` },
     }));
     const r = wireStatusLine({ settingsPath, statusFilePath: statusPath });
-    expect(r.status).toBe("already-correct");
-  });
-
-  test("returns already-correct when statusLine is a chained command we wrote previously", () => {
-    mkdirSync(join(tmp, ".claude"), { recursive: true });
-    const chained = `{ bash "/home/x/caveman.sh"; printf ' '; cat ${statusPath}; } | tr -d '\\n'`;
-    writeFileSync(settingsPath, JSON.stringify({ statusLine: { command: chained } }));
-    const r = wireStatusLine({ settingsPath, statusFilePath: statusPath });
-    expect(r.status).toBe("already-correct");
+    expect(r.status).toBe("wired");
+    if (r.status !== "wired") return;
+    expect(r.command).toContain('"$AGENTBRIDGE_ACTIVE" = "1"');
+    expect(r.command).toContain(`cat ${statusPath}`);
   });
 });
 
