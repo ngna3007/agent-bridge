@@ -14,9 +14,17 @@ function makeMsg(content: string, ts?: number): BridgeMessage {
 }
 
 describe("parseMarker", () => {
-  test("extracts [IMPORTANT] marker", () => {
+  test("extracts [REPLY] marker", () => {
+    const r = parseMarker("[REPLY] task done");
+    expect(r.marker).toBe("reply");
+    expect(r.body).toBe("task done");
+  });
+
+  test("accepts legacy [IMPORTANT] spelling as a synonym for [REPLY]", () => {
+    // Older AGENTS.md files in user projects still emit [IMPORTANT].
+    // The bridge must keep accepting it until a fresh `abg init` runs.
     const r = parseMarker("[IMPORTANT] task done");
-    expect(r.marker).toBe("important");
+    expect(r.marker).toBe("reply");
     expect(r.body).toBe("task done");
   });
 
@@ -45,15 +53,19 @@ describe("parseMarker", () => {
   });
 
   test("handles leading newline before marker", () => {
-    const r = parseMarker("\n[IMPORTANT] urgent");
-    expect(r.marker).toBe("important");
+    const r = parseMarker("\n[REPLY] urgent");
+    expect(r.marker).toBe("reply");
     expect(r.body).toBe("urgent");
   });
 });
 
 describe("classifyMessage", () => {
-  test("forwards IMPORTANT in filtered mode", () => {
-    expect(classifyMessage("[IMPORTANT] x", "filtered")).toEqual({ action: "forward", marker: "important" });
+  test("forwards REPLY in filtered mode", () => {
+    expect(classifyMessage("[REPLY] x", "filtered")).toEqual({ action: "forward", marker: "reply" });
+  });
+
+  test("legacy IMPORTANT still forwards (synonym for REPLY)", () => {
+    expect(classifyMessage("[IMPORTANT] x", "filtered")).toEqual({ action: "forward", marker: "reply" });
   });
 
   test("buffers STATUS in filtered mode", () => {
@@ -156,9 +168,9 @@ describe("StatusBuffer pause/resume", () => {
     const buf = new StatusBuffer((m) => flushed.push(m), { flushThreshold: 10, flushTimeoutMs: 60000 });
     buf.pause();
     buf.add(makeMsg("[STATUS] a"));
-    buf.flush("important message arrived");
+    buf.flush("reply message arrived");
     expect(flushed).toHaveLength(1);
-    expect(flushed[0].content).toContain("flushed: important message arrived");
+    expect(flushed[0].content).toContain("flushed: reply message arrived");
     buf.dispose();
   });
 
@@ -191,8 +203,8 @@ describe("StatusBuffer pause/resume", () => {
 });
 
 describe("BRIDGE_CONTRACT_REMINDER", () => {
-  test("contains marker instructions", () => {
-    expect(BRIDGE_CONTRACT_REMINDER).toContain("[IMPORTANT]");
+  test("contains marker instructions for [REPLY], [STATUS], [FYI]", () => {
+    expect(BRIDGE_CONTRACT_REMINDER).toContain("[REPLY]");
     expect(BRIDGE_CONTRACT_REMINDER).toContain("[STATUS]");
     expect(BRIDGE_CONTRACT_REMINDER).toContain("[FYI]");
   });

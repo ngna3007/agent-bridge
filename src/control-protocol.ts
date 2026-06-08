@@ -22,7 +22,7 @@ export type ControlClientMessage =
  *
  * - "push" (default): synchronously pushed via the MCP channel, so it
  *   appears in Claude's context the moment it arrives. Used for
- *   [IMPORTANT] events and any system_* lifecycle notice the daemon
+ *   [REPLY] events and any system_* lifecycle notice the daemon
  *   wants Claude to act on immediately.
  *
  * - "queue": held in the ClaudeAdapter's pull queue. Claude only sees

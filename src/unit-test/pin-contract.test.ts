@@ -79,7 +79,7 @@ describe("BRIDGE_CONTRACT_REMINDER content invariants", () => {
   });
 
   test("declares the marker contract Codex must follow", () => {
-    expect(BRIDGE_CONTRACT_REMINDER).toContain("[IMPORTANT]");
+    expect(BRIDGE_CONTRACT_REMINDER).toContain("[REPLY]");
     expect(BRIDGE_CONTRACT_REMINDER).toContain("[STATUS]");
     expect(BRIDGE_CONTRACT_REMINDER).toContain("[FYI]");
   });
@@ -118,7 +118,7 @@ describe("AGENTS.md content carries the contract (load-bearing for mode=off)", (
   const { AGENTS_MD_SECTION } = require("../collaboration-content");
 
   test("AGENTS_MD_SECTION teaches marker contract", () => {
-    expect(AGENTS_MD_SECTION).toContain("[IMPORTANT]");
+    expect(AGENTS_MD_SECTION).toContain("[REPLY]");
     expect(AGENTS_MD_SECTION).toContain("[STATUS]");
     expect(AGENTS_MD_SECTION).toContain("[FYI]");
     expect(AGENTS_MD_SECTION).toContain("first text");

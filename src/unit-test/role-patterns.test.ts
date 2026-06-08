@@ -31,7 +31,6 @@ describe("role-aware collaboration guidance", () => {
   });
 
   test("bridge contract reminder specifies marker must be at start", () => {
-    expect(BRIDGE_CONTRACT_REMINDER).toContain("at the very start");
     expect(BRIDGE_CONTRACT_REMINDER).toContain("MUST be the first text");
   });
 

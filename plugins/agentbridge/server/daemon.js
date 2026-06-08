@@ -1365,13 +1365,15 @@ class CodexAdapter extends EventEmitter {
 }
 
 // src/message-filter.ts
-var MARKER_REGEX = /^\s*\[(IMPORTANT|STATUS|FYI)\]\s*/i;
+var MARKER_REGEX = /^\s*\[(REPLY|IMPORTANT|STATUS|FYI)\]\s*/i;
 function parseMarker(content) {
   const match = content.match(MARKER_REGEX);
   if (!match)
     return { marker: "untagged", body: content };
+  const raw = match[1].toLowerCase();
+  const marker = raw === "important" ? "reply" : raw;
   return {
-    marker: match[1].toLowerCase(),
+    marker,
     body: content.slice(match[0].length)
   };
 }
@@ -1380,7 +1382,7 @@ function classifyMessage(content, mode) {
     return { action: "forward", marker: "untagged" };
   const { marker } = parseMarker(content);
   switch (marker) {
-    case "important":
+    case "reply":
       return { action: "forward", marker };
     case "status":
       return { action: "buffer", marker };
@@ -1390,16 +1392,19 @@ function classifyMessage(content, mode) {
       return { action: "queue", marker };
   }
 }
-var BRIDGE_CONTRACT_REMINDER = `[Bridge Contract] When sending agentMessage, put the marker at the very start of the message:
-- [IMPORTANT] for decisions, reviews, completions, blockers - pushed to Claude immediately
-- [STATUS] for progress updates - folded into a summary, not pushed live
-- [FYI] for background context - dropped, never sent to Claude
-- (no marker) - queued. Claude only sees it when they explicitly call get_messages
+var BRIDGE_CONTRACT_REMINDER = `[Bridge Contract] Markers tell the bridge whether to push your message to Claude immediately or let it sit in Claude's pull queue. Put the marker as the FIRST text in the message:
 
-Important: untagged Codex output no longer auto-forwards to Claude. If you want Claude to see your response NOW, prefix with [IMPORTANT]. Otherwise it sits in Claude's pull queue and they fetch it on their own schedule.
+- [REPLY] - you actually have something to say to Claude as a peer (a proposal, a disagreement, a completion report, a blocker, an answer to a direct question). Pushed to Claude immediately, interrupts whatever Claude is doing.
+- [STATUS] - progress update for the running task. Buffered + summarized; Claude sees the summary, not each one.
+- [FYI] - background context. Dropped silently.
+- (no marker) - queued. Claude only sees it when they call get_messages. Use this for routine output you don't need Claude to react to.
 
-The marker MUST be the first text in the message (e.g. "[IMPORTANT] Task done", not "Task done [IMPORTANT]").
-Keep agentMessage for high-value communication only.
+When to use [REPLY] (peer-to-peer rule of thumb):
+- USE [REPLY] when: Claude asked you a direct question, you finished a task Claude is waiting on, you found something Claude needs to decide about, you disagree with Claude's plan, you hit a blocker only Claude can resolve.
+- DO NOT use [REPLY] for: "ok", "received", "got it", routine progress, status pings, exploratory thinking, internal reasoning, file listings, anything you'd say to yourself. Those belong in [STATUS] or no marker.
+- Think "would a human teammate Slack me about this RIGHT NOW?" If no, don't use [REPLY].
+
+The marker MUST be the first text in the message (e.g. "[REPLY] Task done", not "Task done [REPLY]"). Keep agentMessage for high-value communication only.
 
 [Git Operations \u2014 FORBIDDEN]
 You MUST NOT execute any git write commands. This includes but is not limited to:
@@ -1417,7 +1422,7 @@ All git write operations must be delegated to Claude Code via agentMessage. Repo
 - Use explicit collaboration phrases: "My independent view is:", "I agree on:", "I disagree on:", "Current consensus:"`;
 var REPLY_REQUIRED_INSTRUCTION = `
 
-[\u26A0\uFE0F REPLY REQUIRED] Claude has explicitly requested a reply. You MUST send an agentMessage with [IMPORTANT] marker containing your response. This is a mandatory requirement \u2014 do not skip or use [STATUS]/[FYI] markers for this reply.`;
+[\u26A0\uFE0F REPLY REQUIRED] Claude has explicitly requested a reply. You MUST send an agentMessage with the [REPLY] marker containing your response. This is a mandatory requirement - do not skip or use [STATUS]/[FYI] markers for this reply.`;
 class StatusBuffer {
   onFlush;
   buffer = [];
@@ -2048,11 +2053,11 @@ codex.on("agentMessage", (msg) => {
   log(`Codex \u2192 Claude [${result.marker}/${result.action}] (${msg.content.length} chars)`);
   switch (result.action) {
     case "forward":
-      if (result.marker === "important" && statusBuffer.size > 0) {
-        statusBuffer.flush("important message arrived");
+      if (result.marker === "reply" && statusBuffer.size > 0) {
+        statusBuffer.flush("reply message arrived");
       }
       emitToClaude(msg);
-      if (result.marker === "important") {
+      if (result.marker === "reply") {
         startAttentionWindow();
       }
       break;

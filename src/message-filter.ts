@@ -1,6 +1,6 @@
 import type { BridgeMessage } from "./types";
 
-export type MarkerLevel = "important" | "status" | "fyi" | "untagged";
+export type MarkerLevel = "reply" | "status" | "fyi" | "untagged";
 export type FilterMode = "filtered" | "full";
 
 /**
@@ -22,13 +22,22 @@ export interface FilterResult {
   marker: MarkerLevel;
 }
 
-const MARKER_REGEX = /^\s*\[(IMPORTANT|STATUS|FYI)\]\s*/i;
+// [REPLY] is the new name for what used to be [IMPORTANT]. The label
+// change captures the peer-to-peer intent: Codex only marks a message
+// with [REPLY] when it has something to actually *reply about* to
+// Claude (a proposal, a disagreement, a completion, a blocker). The
+// regex accepts both REPLY and the legacy IMPORTANT spelling so older
+// AGENTS.md files keep working until the next `abg init`.
+const MARKER_REGEX = /^\s*\[(REPLY|IMPORTANT|STATUS|FYI)\]\s*/i;
 
 export function parseMarker(content: string): { marker: MarkerLevel; body: string } {
   const match = content.match(MARKER_REGEX);
   if (!match) return { marker: "untagged", body: content };
+  const raw = match[1].toLowerCase();
+  // Map both REPLY and the legacy IMPORTANT to the same internal marker.
+  const marker = (raw === "important" ? "reply" : raw) as MarkerLevel;
   return {
-    marker: match[1].toLowerCase() as MarkerLevel,
+    marker,
     body: content.slice(match[0].length),
   };
 }
@@ -37,7 +46,7 @@ export function classifyMessage(content: string, mode: FilterMode): FilterResult
   if (mode === "full") return { action: "forward", marker: "untagged" };
   const { marker } = parseMarker(content);
   switch (marker) {
-    case "important":
+    case "reply":
       return { action: "forward", marker };
     case "status":
       return { action: "buffer", marker };
@@ -45,23 +54,25 @@ export function classifyMessage(content: string, mode: FilterMode): FilterResult
       return { action: "drop", marker };
     case "untagged":
       // Untagged messages go to Claude's pull queue (not pushed). The
-      // assumption is Codex marks high-value output explicitly with
-      // [IMPORTANT]; everything else waits for Claude to subjectively
-      // call get_messages.
+      // assumption is Codex marks peer-to-peer output explicitly with
+      // [REPLY]; everything else waits for Claude to call get_messages.
       return { action: "queue", marker };
   }
 }
 
-const BRIDGE_CONTRACT_REMINDER = `[Bridge Contract] When sending agentMessage, put the marker at the very start of the message:
-- [IMPORTANT] for decisions, reviews, completions, blockers - pushed to Claude immediately
-- [STATUS] for progress updates - folded into a summary, not pushed live
-- [FYI] for background context - dropped, never sent to Claude
-- (no marker) - queued. Claude only sees it when they explicitly call get_messages
+const BRIDGE_CONTRACT_REMINDER = `[Bridge Contract] Markers tell the bridge whether to push your message to Claude immediately or let it sit in Claude's pull queue. Put the marker as the FIRST text in the message:
 
-Important: untagged Codex output no longer auto-forwards to Claude. If you want Claude to see your response NOW, prefix with [IMPORTANT]. Otherwise it sits in Claude's pull queue and they fetch it on their own schedule.
+- [REPLY] - you actually have something to say to Claude as a peer (a proposal, a disagreement, a completion report, a blocker, an answer to a direct question). Pushed to Claude immediately, interrupts whatever Claude is doing.
+- [STATUS] - progress update for the running task. Buffered + summarized; Claude sees the summary, not each one.
+- [FYI] - background context. Dropped silently.
+- (no marker) - queued. Claude only sees it when they call get_messages. Use this for routine output you don't need Claude to react to.
 
-The marker MUST be the first text in the message (e.g. "[IMPORTANT] Task done", not "Task done [IMPORTANT]").
-Keep agentMessage for high-value communication only.
+When to use [REPLY] (peer-to-peer rule of thumb):
+- USE [REPLY] when: Claude asked you a direct question, you finished a task Claude is waiting on, you found something Claude needs to decide about, you disagree with Claude's plan, you hit a blocker only Claude can resolve.
+- DO NOT use [REPLY] for: "ok", "received", "got it", routine progress, status pings, exploratory thinking, internal reasoning, file listings, anything you'd say to yourself. Those belong in [STATUS] or no marker.
+- Think "would a human teammate Slack me about this RIGHT NOW?" If no, don't use [REPLY].
+
+The marker MUST be the first text in the message (e.g. "[REPLY] Task done", not "Task done [REPLY]"). Keep agentMessage for high-value communication only.
 
 [Git Operations — FORBIDDEN]
 You MUST NOT execute any git write commands. This includes but is not limited to:
@@ -78,7 +89,7 @@ All git write operations must be delegated to Claude Code via agentMessage. Repo
 - Do not blindly follow Claude - challenge with evidence when you disagree
 - Use explicit collaboration phrases: "My independent view is:", "I agree on:", "I disagree on:", "Current consensus:"`;
 
-const REPLY_REQUIRED_INSTRUCTION = `\n\n[⚠️ REPLY REQUIRED] Claude has explicitly requested a reply. You MUST send an agentMessage with [IMPORTANT] marker containing your response. This is a mandatory requirement — do not skip or use [STATUS]/[FYI] markers for this reply.`;
+const REPLY_REQUIRED_INSTRUCTION = `\n\n[⚠️ REPLY REQUIRED] Claude has explicitly requested a reply. You MUST send an agentMessage with the [REPLY] marker containing your response. This is a mandatory requirement - do not skip or use [STATUS]/[FYI] markers for this reply.`;
 
 export { BRIDGE_CONTRACT_REMINDER, REPLY_REQUIRED_INSTRUCTION };
 

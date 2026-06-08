@@ -156,12 +156,12 @@ codex.on("agentMessage", (msg: BridgeMessage) => {
   log(`Codex → Claude [${result.marker}/${result.action}] (${msg.content.length} chars)`);
   switch (result.action) {
     case "forward":
-      if (result.marker === "important" && statusBuffer.size > 0) {
-        statusBuffer.flush("important message arrived");
+      if (result.marker === "reply" && statusBuffer.size > 0) {
+        statusBuffer.flush("reply message arrived");
       }
       emitToClaude(msg);
-      // IMPORTANT message — give Claude an attention window to respond
-      if (result.marker === "important") {
+      // [REPLY] message — give Claude an attention window to respond
+      if (result.marker === "reply") {
         startAttentionWindow();
       }
       break;
