@@ -72,6 +72,11 @@ export type WireStatusLineResult =
   };
 
 function defaultSettingsPath(): string {
+  // Tests + headless harnesses MUST be able to redirect us off the
+  // user's real ~/.claude/settings.json without weaving an explicit
+  // settingsPath through every call site. Honor an env override.
+  const override = process.env.AGENTBRIDGE_SETTINGS_PATH;
+  if (override && override.length > 0) return override;
   return join(homedir(), ".claude", "settings.json");
 }
 
@@ -105,12 +110,22 @@ function composeChainedCommand(existing: string, statusFilePath: string): string
 }
 
 /**
- * True when the command is already in the current gated format
- * (contains both our cat AND the env gate). We treat anything else
- * containing `cat <path>` as an upgrade candidate.
+ * True when the command already contains the AgentBridge env gate.
+ *
+ * The check is INTENTIONALLY path-agnostic: if our gate is present
+ * the command has already been wired by us at some point, and we
+ * refuse to wrap it again. Wrapping a previously-wrapped command
+ * leads to recursive nesting if the status file path drifts
+ * between runs (e.g. e2e tests use a fresh tmp path each time and
+ * would otherwise inflate the chain on every spawn).
+ *
+ * Trade-off: if the user genuinely relocates their status file via
+ * AGENTBRIDGE_STATE_DIR, the wire won't auto-rewrite to the new
+ * path. That is the correct conservative behavior - run with
+ * force:true to overwrite when relocation is intended.
  */
-function alreadyChained(command: string, statusFilePath: string): boolean {
-  return command.includes(`cat ${statusFilePath}`) && command.includes(GATE_MARKER);
+function alreadyChained(command: string, _statusFilePath: string): boolean {
+  return command.includes(GATE_MARKER);
 }
 
 /**

@@ -85,6 +85,37 @@ describe("wireStatusLine - already-correct detection (gated format only)", () =>
     const r = wireStatusLine({ settingsPath, statusFilePath: statusPath });
     expect(r.status).toBe("already-correct");
   });
+
+  test("refuses to wrap an existing gated chain even when the status path differs", () => {
+    // Guard against the recursive-nesting bug: if alreadyChained only
+    // looked for `cat <thisPath>`, re-runs with a moving status path
+    // (e.g. across e2e tests) would inflate the command on every run.
+    mkdirSync(join(tmp, ".claude"), { recursive: true });
+    const otherPath = join(tmp, "different-status.line");
+    const gatedChain = `{ bash "/home/x/caveman.sh"; [ "$AGENTBRIDGE_ACTIVE" = "1" ] && { printf ' '; cat ${otherPath}; }; } | tr -d '\\n'`;
+    writeFileSync(settingsPath, JSON.stringify({ statusLine: { command: gatedChain } }));
+    const r = wireStatusLine({ settingsPath, statusFilePath: statusPath });
+    expect(r.status).toBe("already-correct");
+    // File unchanged.
+    const written = JSON.parse(readFileSync(settingsPath, "utf-8"));
+    expect(written.statusLine.command).toBe(gatedChain);
+  });
+});
+
+describe("wireStatusLine - env override for settings path", () => {
+  test("AGENTBRIDGE_SETTINGS_PATH redirects writes off ~/.claude/settings.json", () => {
+    const altPath = join(tmp, "alt-settings.json");
+    const prev = process.env.AGENTBRIDGE_SETTINGS_PATH;
+    process.env.AGENTBRIDGE_SETTINGS_PATH = altPath;
+    try {
+      const r = wireStatusLine({ statusFilePath: statusPath });
+      expect(r.status).toBe("wired");
+      expect(existsSync(altPath)).toBe(true);
+    } finally {
+      if (prev === undefined) delete process.env.AGENTBRIDGE_SETTINGS_PATH;
+      else process.env.AGENTBRIDGE_SETTINGS_PATH = prev;
+    }
+  });
 });
 
 describe("wireStatusLine - migration from old ungated formats", () => {

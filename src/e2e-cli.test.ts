@@ -132,10 +132,16 @@ class CliE2EHarness {
       "utf-8",
     );
 
+    // Redirect settings.json off the real ~/.claude/settings.json so
+    // tests that exercise wireStatusLine don't nest chains onto the
+    // developer's actual config.
+    const isolatedSettingsPath = join(rootDir, "settings.json");
+
     const env: NodeJS.ProcessEnv = {
       ...process.env,
       PATH: `${binDir}:${process.env.PATH ?? ""}`,
       AGENTBRIDGE_STATE_DIR: stateDir,
+      AGENTBRIDGE_SETTINGS_PATH: isolatedSettingsPath,
       AGENTBRIDGE_CONTROL_PORT: String(controlPort),
       AGENTBRIDGE_DAEMON_ENTRY: fakeDaemonPath,
       AGENTBRIDGE_MODE: "pull",
