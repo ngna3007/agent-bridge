@@ -14712,9 +14712,12 @@ claude.setReplySender(async (msg, requireReply) => {
   return daemonClient.sendReply(msg, requireReply);
 });
 var DAEMON_LIFECYCLE_TAGS = {
-  system_ready: "[CODEX]",
-  system_waiting: "[WAITING]",
-  system_codex_start_failed: "[CODEX-FAIL]"
+  system_ready: "[CODEX READY]",
+  system_waiting: "[WAITING FOR CODEX]",
+  system_codex_start_failed: "[CODEX FAILED]",
+  system_turn_started: "[CODEX THINKING]",
+  system_turn_completed: "[CODEX READY]",
+  system_reply_missing: "[CODEX NO REPLY]"
 };
 daemonClient.on("codexMessage", (message) => {
   const tag = isDaemonLifecycle(message.id);
@@ -14977,17 +14980,17 @@ async function pollDisabledRecovery() {
   }
 }
 var LIFECYCLE_TAGS = {
-  system_tui_kickoff: "[CODEX]",
-  system_daemon_disconnected: "[OFFLINE]",
-  system_daemon_reconnected: "[CODEX]",
-  system_bridge_ready: "[BRIDGE]",
-  system_daemon_connect_failed: "[DAEMON-FAIL]",
-  system_bridge_evicted: "[EVICTED]",
-  system_bridge_probe_in_progress: "[PROBING]",
-  system_bridge_replaced: "[REPLACED]",
-  system_bridge_disabled: "[OFFLINE]",
-  system_bridge_auto_recovery_gave_up: "[RECOVERY-FAIL]",
-  system_bridge_recovered: "[CODEX]"
+  system_tui_kickoff: "[CODEX READY]",
+  system_daemon_disconnected: "[BRIDGE OFFLINE]",
+  system_daemon_reconnected: "[CODEX READY]",
+  system_bridge_ready: "[BRIDGE READY]",
+  system_daemon_connect_failed: "[BRIDGE FAILED]",
+  system_bridge_evicted: "[REPLACED BY NEWER SESSION]",
+  system_bridge_probe_in_progress: "[RECONNECTING]",
+  system_bridge_replaced: "[ANOTHER SESSION ACTIVE]",
+  system_bridge_disabled: "[BRIDGE STOPPED]",
+  system_bridge_auto_recovery_gave_up: "[RECONNECT FAILED]",
+  system_bridge_recovered: "[CODEX READY]"
 };
 function emitLifecycle(idPrefix) {
   const tag = LIFECYCLE_TAGS[idPrefix] ?? `[${idPrefix.replace(/^system_/, "").toUpperCase()}]`;
