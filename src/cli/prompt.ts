@@ -23,6 +23,13 @@ export interface PickerOption<V = string> {
 }
 
 export interface PickerInput<V = string> {
+  /**
+   * Optional raw prelude rendered above the top rule (no indent, no
+   * bold). Useful for a logo banner you want erased together with
+   * the rest of the prompt on exit. Counted in the ephemeral
+   * erase region so Esc / Enter wipes it too.
+   */
+  prelude?: string;
   /** Headline question. */
   title: string;
   /** Optional pre-formatted example block, rendered between title and options. */
@@ -109,6 +116,16 @@ export async function arrowPicker<V>(input: PickerInput<V>): Promise<V | null> {
     stdout.write(s);
     linesEmitted++;
   };
+
+  // Optional prelude (e.g. a logo banner). Each line is emitted raw
+  // and counted, so it gets wiped together with the rest of the
+  // prompt on Esc / Enter.
+  if (input.prelude) {
+    for (const line of input.prelude.split("\n")) {
+      writeLine(line + "\n");
+    }
+    writeLine("\n");
+  }
 
   // Header: top rule + title.
   writeLine(`${c.dim}${"─".repeat(ruleWidth)}${c.reset}\n`);

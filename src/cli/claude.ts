@@ -107,12 +107,6 @@ async function maybeShowIntro(stateDir: StateDirResolver): Promise<void> {
     return;
   }
 
-  // Logo lives above the picker so its full width renders without
-  // the picker's two-space indent or single-line title constraint.
-  // The picker's ephemeral cleanup only erases its own rendered
-  // region, so the logo persists in scrollback once shown.
-  process.stdout.write("\n" + LOGO + "\n");
-
   const body = [
     "Connects Claude Code and Codex so they can collaborate on the",
     "same task. Use the reply / get_messages tools to send messages",
@@ -128,6 +122,7 @@ async function maybeShowIntro(stateDir: StateDirResolver): Promise<void> {
   ].join("\n");
 
   const choice = await arrowPicker<"continue">({
+    prelude: LOGO,
     title: "Welcome to AgentBridge",
     example: body,
     options: [{ value: "continue", label: "Got it - continue" }],
