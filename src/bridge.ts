@@ -77,18 +77,40 @@ claude.setReplySender(async (msg: BridgeMessage, requireReply?: boolean) => {
   return daemonClient.sendReply(msg, requireReply);
 });
 
+/**
+ * ANSI color helpers for statusbar tags. Most terminal statusbars
+ * (tmux, screen, Claude Code's bottom bar) honor these. Anything
+ * that strips ANSI degrades to the plain text inside the codes.
+ *
+ * Severity colors:
+ *   - GREEN  = healthy / ready
+ *   - YELLOW = transient / working (don't act until it settles)
+ *   - RED    = error / disconnected (something needs attention)
+ *   - DIM    = quiesced / stopped on purpose
+ *
+ * We always pair the color code with a RESET so the colorization
+ * never leaks past our tag into whatever the user's other statusLine
+ * tools print (caveman, git branch, etc.).
+ */
+const C_RESET  = "\x1b[0m";
+const C_GREEN  = "\x1b[32m";
+const C_YELLOW = "\x1b[33m";
+const C_RED    = "\x1b[31m";
+const C_DIM    = "\x1b[2m";
+const wrap = (c: string, s: string): string => `${c}${s}${C_RESET}`;
+
 // Map daemon-side system_* notifications to plain-English statusbar
 // strings so they don't bloat Claude's context. The MCP channel only
 // carries Codex's real agentMessage replies; anything system-tagged
 // from the daemon is treated as a lifecycle event and routed to
 // status.line.
 const DAEMON_LIFECYCLE_TAGS: Record<string, string> = {
-  system_ready:              "[CODEX READY]",
-  system_waiting:            "[WAITING FOR CODEX]",
-  system_codex_start_failed: "[CODEX FAILED]",
-  system_turn_started:       "[CODEX THINKING]",
-  system_turn_completed:     "[CODEX READY]",
-  system_reply_missing:      "[CODEX NO REPLY]",
+  system_ready:              wrap(C_GREEN,  "[CODEX READY]"),
+  system_waiting:            wrap(C_YELLOW, "[WAITING FOR CODEX]"),
+  system_codex_start_failed: wrap(C_RED,    "[CODEX FAILED]"),
+  system_turn_started:       wrap(C_YELLOW, "[CODEX THINKING]"),
+  system_turn_completed:     wrap(C_GREEN,  "[CODEX READY]"),
+  system_reply_missing:      wrap(C_RED,    "[CODEX NO REPLY]"),
 };
 
 daemonClient.on("codexMessage", (message) => {
@@ -416,7 +438,8 @@ async function pollDisabledRecovery() {
 }
 
 /**
- * Map every lifecycle event id to a plain-English statusbar string.
+ * Map every lifecycle event id to a plain-English colored statusbar
+ * string.
  *
  * The MCP channel is reserved for Codex's actual agentMessage replies;
  * every bridge / daemon / TUI state change goes only to the status.line
@@ -428,17 +451,17 @@ async function pollDisabledRecovery() {
  * actionable, the tag tells the user what to type.
  */
 const LIFECYCLE_TAGS: Record<string, string> = {
-  system_tui_kickoff:                   "[CODEX READY]",
-  system_daemon_disconnected:           "[BRIDGE OFFLINE]",
-  system_daemon_reconnected:            "[CODEX READY]",
-  system_bridge_ready:                  "[BRIDGE READY]",
-  system_daemon_connect_failed:         "[BRIDGE FAILED]",
-  system_bridge_evicted:                "[REPLACED BY NEWER SESSION]",
-  system_bridge_probe_in_progress:      "[RECONNECTING]",
-  system_bridge_replaced:               "[ANOTHER SESSION ACTIVE]",
-  system_bridge_disabled:               "[BRIDGE STOPPED]",
-  system_bridge_auto_recovery_gave_up:  "[RECONNECT FAILED]",
-  system_bridge_recovered:              "[CODEX READY]",
+  system_tui_kickoff:                   wrap(C_GREEN,  "[CODEX READY]"),
+  system_daemon_disconnected:           wrap(C_RED,    "[BRIDGE OFFLINE]"),
+  system_daemon_reconnected:            wrap(C_GREEN,  "[CODEX READY]"),
+  system_bridge_ready:                  wrap(C_GREEN,  "[BRIDGE READY]"),
+  system_daemon_connect_failed:         wrap(C_RED,    "[BRIDGE FAILED]"),
+  system_bridge_evicted:                wrap(C_RED,    "[REPLACED BY NEWER SESSION]"),
+  system_bridge_probe_in_progress:      wrap(C_YELLOW, "[RECONNECTING]"),
+  system_bridge_replaced:               wrap(C_RED,    "[ANOTHER SESSION ACTIVE]"),
+  system_bridge_disabled:               wrap(C_DIM,    "[BRIDGE STOPPED]"),
+  system_bridge_auto_recovery_gave_up:  wrap(C_RED,    "[RECONNECT FAILED]"),
+  system_bridge_recovered:              wrap(C_GREEN,  "[CODEX READY]"),
 };
 
 /**
