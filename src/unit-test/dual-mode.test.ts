@@ -121,6 +121,27 @@ describe("Dual-mode transport: pull mode message queue", () => {
     expect(adapter.pendingMessages[0].content).toBe("pull msg");
   });
 
+  test("enqueueForPull holds a message without notifying (queue-only delivery)", async () => {
+    // Backs the new "untagged Codex output stays in Claude's pull
+    // queue" path. We must NOT send an MCP notification for these,
+    // even though we are in push mode.
+    const adapter = createAdapter("push");
+    adapter.resolveMode();
+
+    const notifications: any[] = [];
+    adapter.server = {
+      notification: async (payload: any) => {
+        notifications.push(payload);
+      },
+    };
+
+    adapter.enqueueForPull(makeBridgeMessage("queue-only msg"));
+
+    expect(notifications).toHaveLength(0);
+    expect(adapter.pendingMessages).toHaveLength(1);
+    expect(adapter.pendingMessages[0].content).toBe("queue-only msg");
+  });
+
   test("push mode message ids include a session-unique prefix", async () => {
     const adapter = createAdapter("push");
     adapter.resolveMode();

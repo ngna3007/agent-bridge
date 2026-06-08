@@ -19,8 +19,8 @@ Another AI agent (Codex, by OpenAI) is available in a parallel session on this m
 
 ### Communication mechanism
 - **Claude → Codex**: Use the AgentBridge MCP tools (\`reply\` / \`get_messages\`) — these are yours only.
-- **Codex → Claude**: Codex has no symmetric tool. The bridge transparently intercepts Codex's normal output and forwards it to you. Messages arrive as push notifications (or via \`get_messages\` in pull mode).
-- If Codex ever complains it can't find a "send-to-Claude" API, remind it that its side is transparent — it just writes a reply and you'll see it.
+- **Codex → Claude**: Codex has no symmetric tool. The bridge intercepts Codex's normal output. **Codex output is no longer auto-pushed to you by default** — only messages Codex marks with \`[IMPORTANT]\` arrive as push notifications. Everything else sits in a pull queue: call \`get_messages\` periodically (especially when you expect a reply) to drain it.
+- If Codex ever complains it can't find a "send-to-Claude" API, remind it that its side is transparent — it just writes a reply and you'll see it (immediately if tagged \`[IMPORTANT]\`, otherwise on your next \`get_messages\` call).
 
 ### When to collaborate vs. work solo
 - **Collaborate** when the task benefits from a second perspective, parallel execution, or capabilities you lack (e.g., sandboxed code execution, independent verification).
@@ -52,10 +52,10 @@ Another AI agent (Claude, by Anthropic) is available in a parallel session on th
 ### Communication mechanism (read this first)
 AgentBridge is a **transparent proxy** on your side. You do **not** have a tool to "send a message to Claude".
 
-- **Codex → Claude**: Just write your normal response. The bridge intercepts your \`agentMessage\` output and forwards it to Claude automatically. No tool call needed.
+- **Codex → Claude**: Just write your normal response. The bridge intercepts your \`agentMessage\` output. **By default the bridge does NOT auto-push your reply to Claude's context.** Untagged messages are queued; Claude only sees them when they explicitly call \`get_messages\`. To force a push, prefix your reply with \`[IMPORTANT]\` — see the marker contract below.
 - **Claude → Codex**: Claude uses its own MCP tools (\`reply\` / \`get_messages\`). Those messages arrive in your session as new user turns — you'll see them like any other user input.
 
-**Do not** search the AgentBridge source for a Codex-side "send" / "reply" / "sendToClaude" API — it does not exist, and looking for it wastes turns. If you catch yourself thinking "I need to find how to message Claude", stop and just write your reply as normal text.
+**Do not** search the AgentBridge source for a Codex-side "send" / "reply" / "sendToClaude" API — it does not exist, and looking for it wastes turns. If you catch yourself thinking "I need to find how to message Claude", stop and just write your reply as normal text (prefixing with \`[IMPORTANT]\` when Claude must see it this turn).
 
 ### When to collaborate vs. work solo
 - **Collaborate** when the task benefits from a second perspective, parallel execution, or capabilities the other agent has.
@@ -80,14 +80,16 @@ AgentBridge is a **transparent proxy** on your side. You do **not** have a tool 
 
 ### Message marker contract (REQUIRED)
 
-When sending an \`agentMessage\` to Claude, put one of these markers as the **first text** in the message:
+When sending an \`agentMessage\` to Claude, put one of these markers as the **first text** in the message. The marker tells the bridge whether to push to Claude now or hold the message in Claude's pull queue:
 
 | Marker | Use for | Bridge behavior |
 |---|---|---|
-| \`[IMPORTANT]\` | Decisions, completions, blockers, anything Claude must see now | Forwarded immediately |
-| \`[STATUS]\` | Progress updates | Buffered + summarized |
-| \`[FYI]\` | Background context | Dropped by default |
-| (untagged) | Defaults to forward | Forwarded |
+| \`[IMPORTANT]\` | Decisions, completions, blockers, anything Claude must see **now** | **Pushed** to Claude immediately |
+| \`[STATUS]\` | Progress updates | Folded into a periodic summary |
+| \`[FYI]\` | Background context | Dropped (Claude never sees it) |
+| (untagged) | Default reply | **Queued.** Claude only sees it when they call \`get_messages\` |
+
+**Key change:** untagged Codex output no longer auto-pushes to Claude. If you want Claude to react to your reply this turn, prefix with \`[IMPORTANT]\`. Otherwise the message waits in Claude's pull queue.
 
 Marker MUST be at the very start (e.g. \`"[IMPORTANT] Task done"\`, **not** \`"Task done [IMPORTANT]"\`). Keep \`agentMessage\` for high-value communication only — internal reasoning stays in your own context, not over the bridge.
 

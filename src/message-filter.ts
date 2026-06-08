@@ -3,8 +3,22 @@ import type { BridgeMessage } from "./types";
 export type MarkerLevel = "important" | "status" | "fyi" | "untagged";
 export type FilterMode = "filtered" | "full";
 
+/**
+ * What the daemon should do with an inbound Codex agentMessage.
+ *
+ * - "forward": send to Claude through the MCP channel immediately
+ *   (the message will land in Claude's context this turn).
+ * - "queue": send to Claude but as a pull-mode item; it sits in the
+ *   ClaudeAdapter's pending queue and only enters Claude's context
+ *   when Claude explicitly calls the `get_messages` tool. Used for
+ *   untagged Codex output so routine chatter does not auto-bloat
+ *   Claude's context.
+ * - "buffer": fold into the StatusBuffer summary (compressed batch
+ *   flush). Used for [STATUS] progress noise.
+ * - "drop": discard. Used for [FYI] background context.
+ */
 export interface FilterResult {
-  action: "forward" | "buffer" | "drop";
+  action: "forward" | "queue" | "buffer" | "drop";
   marker: MarkerLevel;
 }
 
@@ -30,14 +44,22 @@ export function classifyMessage(content: string, mode: FilterMode): FilterResult
     case "fyi":
       return { action: "drop", marker };
     case "untagged":
-      return { action: "forward", marker };
+      // Untagged messages go to Claude's pull queue (not pushed). The
+      // assumption is Codex marks high-value output explicitly with
+      // [IMPORTANT]; everything else waits for Claude to subjectively
+      // call get_messages.
+      return { action: "queue", marker };
   }
 }
 
 const BRIDGE_CONTRACT_REMINDER = `[Bridge Contract] When sending agentMessage, put the marker at the very start of the message:
-- [IMPORTANT] for decisions, reviews, completions, blockers
-- [STATUS] for progress updates
-- [FYI] for background context
+- [IMPORTANT] for decisions, reviews, completions, blockers - pushed to Claude immediately
+- [STATUS] for progress updates - folded into a summary, not pushed live
+- [FYI] for background context - dropped, never sent to Claude
+- (no marker) - queued. Claude only sees it when they explicitly call get_messages
+
+Important: untagged Codex output no longer auto-forwards to Claude. If you want Claude to see your response NOW, prefix with [IMPORTANT]. Otherwise it sits in Claude's pull queue and they fetch it on their own schedule.
+
 The marker MUST be the first text in the message (e.g. "[IMPORTANT] Task done", not "Task done [IMPORTANT]").
 Keep agentMessage for high-value communication only.
 

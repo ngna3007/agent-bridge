@@ -64,8 +64,11 @@ describe("classifyMessage", () => {
     expect(classifyMessage("[FYI] x", "filtered")).toEqual({ action: "drop", marker: "fyi" });
   });
 
-  test("forwards untagged in filtered mode", () => {
-    expect(classifyMessage("hello", "filtered")).toEqual({ action: "forward", marker: "untagged" });
+  test("queues untagged in filtered mode (Claude pulls via get_messages)", () => {
+    // Behavior change: untagged Codex output no longer auto-pushes to
+    // Claude's context. It lands in the ClaudeAdapter pull queue and
+    // is delivered only when Claude calls get_messages.
+    expect(classifyMessage("hello", "filtered")).toEqual({ action: "queue", marker: "untagged" });
   });
 
   test("forwards everything in full mode", () => {

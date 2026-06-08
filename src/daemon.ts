@@ -165,6 +165,11 @@ codex.on("agentMessage", (msg: BridgeMessage) => {
         startAttentionWindow();
       }
       break;
+    case "queue":
+      // Untagged Codex output: deliver to Claude's pull queue, not the
+      // MCP channel. Claude only sees it when get_messages is called.
+      emitToClaude(msg, "queue");
+      break;
     case "buffer":
       statusBuffer.add(msg);
       break;
@@ -630,13 +635,20 @@ function scheduleClaudeDisconnectNotification(clientId: number) {
   }, CLAUDE_DISCONNECT_GRACE_MS);
 }
 
-function emitToClaude(message: BridgeMessage) {
+function emitToClaude(message: BridgeMessage, deliveryHint?: "push" | "queue") {
   if (attachedClaude && attachedClaude.readyState === WebSocket.OPEN) {
-    if (trySendBridgeMessage(attachedClaude, message)) return;
+    if (trySendBridgeMessage(attachedClaude, message, deliveryHint)) return;
     // Send failed — fall through to buffer
     log("Send to Claude failed, buffering message for retry on reconnect");
   }
 
+  // Buffered messages preserve their delivery hint via an attached
+  // property; flushBufferedMessages reads it back when replaying. We
+  // store the hint inline on the BridgeMessage at runtime (kept off
+  // the type definition because it is a daemon-internal artifact).
+  if (deliveryHint) {
+    (message as BridgeMessage & { __deliveryHint?: "push" | "queue" }).__deliveryHint = deliveryHint;
+  }
   bufferedMessages.push(message);
   if (bufferedMessages.length > MAX_BUFFERED_MESSAGES) {
     const dropped = bufferedMessages.length - MAX_BUFFERED_MESSAGES;
@@ -645,9 +657,12 @@ function emitToClaude(message: BridgeMessage) {
   }
 }
 
-function trySendBridgeMessage(ws: ServerWebSocket<ControlSocketData>, message: BridgeMessage): boolean {
+function trySendBridgeMessage(ws: ServerWebSocket<ControlSocketData>, message: BridgeMessage, deliveryHint?: "push" | "queue"): boolean {
   try {
-    const result = ws.send(JSON.stringify({ type: "codex_to_claude", message } satisfies ControlServerMessage));
+    const payload: ControlServerMessage = deliveryHint
+      ? { type: "codex_to_claude", message, deliveryHint }
+      : { type: "codex_to_claude", message };
+    const result = ws.send(JSON.stringify(payload));
     if (typeof result === "number" && result <= 0) {
       log(`Bridge message send returned ${result} (0=dropped, -1=backpressure)`);
       return false;
@@ -662,7 +677,10 @@ function trySendBridgeMessage(ws: ServerWebSocket<ControlSocketData>, message: B
 function flushBufferedMessages(ws: ServerWebSocket<ControlSocketData>) {
   const messages = bufferedMessages.splice(0, bufferedMessages.length);
   for (const message of messages) {
-    if (!trySendBridgeMessage(ws, message)) {
+    // Recover the delivery hint we stashed on the message when it
+    // was buffered, so a queued message stays queued after replay.
+    const hint = (message as BridgeMessage & { __deliveryHint?: "push" | "queue" }).__deliveryHint;
+    if (!trySendBridgeMessage(ws, message, hint)) {
       // Re-buffer this and all remaining messages on failure
       const failedIndex = messages.indexOf(message);
       const remaining = messages.slice(failedIndex);

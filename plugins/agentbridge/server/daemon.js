@@ -1387,13 +1387,17 @@ function classifyMessage(content, mode) {
     case "fyi":
       return { action: "drop", marker };
     case "untagged":
-      return { action: "forward", marker };
+      return { action: "queue", marker };
   }
 }
 var BRIDGE_CONTRACT_REMINDER = `[Bridge Contract] When sending agentMessage, put the marker at the very start of the message:
-- [IMPORTANT] for decisions, reviews, completions, blockers
-- [STATUS] for progress updates
-- [FYI] for background context
+- [IMPORTANT] for decisions, reviews, completions, blockers - pushed to Claude immediately
+- [STATUS] for progress updates - folded into a summary, not pushed live
+- [FYI] for background context - dropped, never sent to Claude
+- (no marker) - queued. Claude only sees it when they explicitly call get_messages
+
+Important: untagged Codex output no longer auto-forwards to Claude. If you want Claude to see your response NOW, prefix with [IMPORTANT]. Otherwise it sits in Claude's pull queue and they fetch it on their own schedule.
+
 The marker MUST be the first text in the message (e.g. "[IMPORTANT] Task done", not "Task done [IMPORTANT]").
 Keep agentMessage for high-value communication only.
 
@@ -2052,6 +2056,9 @@ codex.on("agentMessage", (msg) => {
         startAttentionWindow();
       }
       break;
+    case "queue":
+      emitToClaude(msg, "queue");
+      break;
     case "buffer":
       statusBuffer.add(msg);
       break;
@@ -2399,11 +2406,14 @@ function scheduleClaudeDisconnectNotification(clientId) {
     log(`Claude disconnect persisted past grace window (client #${clientId})`);
   }, CLAUDE_DISCONNECT_GRACE_MS);
 }
-function emitToClaude(message) {
+function emitToClaude(message, deliveryHint) {
   if (attachedClaude && attachedClaude.readyState === WebSocket.OPEN) {
-    if (trySendBridgeMessage(attachedClaude, message))
+    if (trySendBridgeMessage(attachedClaude, message, deliveryHint))
       return;
     log("Send to Claude failed, buffering message for retry on reconnect");
+  }
+  if (deliveryHint) {
+    message.__deliveryHint = deliveryHint;
   }
   bufferedMessages.push(message);
   if (bufferedMessages.length > MAX_BUFFERED_MESSAGES) {
@@ -2412,9 +2422,10 @@ function emitToClaude(message) {
     log(`Message buffer overflow: dropped ${dropped} oldest message(s), ${MAX_BUFFERED_MESSAGES} remaining`);
   }
 }
-function trySendBridgeMessage(ws, message) {
+function trySendBridgeMessage(ws, message, deliveryHint) {
   try {
-    const result = ws.send(JSON.stringify({ type: "codex_to_claude", message }));
+    const payload = deliveryHint ? { type: "codex_to_claude", message, deliveryHint } : { type: "codex_to_claude", message };
+    const result = ws.send(JSON.stringify(payload));
     if (typeof result === "number" && result <= 0) {
       log(`Bridge message send returned ${result} (0=dropped, -1=backpressure)`);
       return false;
@@ -2428,7 +2439,8 @@ function trySendBridgeMessage(ws, message) {
 function flushBufferedMessages(ws) {
   const messages = bufferedMessages.splice(0, bufferedMessages.length);
   for (const message of messages) {
-    if (!trySendBridgeMessage(ws, message)) {
+    const hint = message.__deliveryHint;
+    if (!trySendBridgeMessage(ws, message, hint)) {
       const failedIndex = messages.indexOf(message);
       const remaining = messages.slice(failedIndex);
       bufferedMessages.unshift(...remaining);

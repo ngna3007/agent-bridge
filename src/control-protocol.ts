@@ -16,8 +16,24 @@ export type ControlClientMessage =
   | { type: "claude_to_codex"; requestId: string; message: BridgeMessage; requireReply?: boolean }
   | { type: "status" };
 
+/**
+ * How the bridge should surface a codex_to_claude message in Claude's
+ * session.
+ *
+ * - "push" (default): synchronously pushed via the MCP channel, so it
+ *   appears in Claude's context the moment it arrives. Used for
+ *   [IMPORTANT] events and any system_* lifecycle notice the daemon
+ *   wants Claude to act on immediately.
+ *
+ * - "queue": held in the ClaudeAdapter's pull queue. Claude only sees
+ *   it when it explicitly calls the get_messages tool. Used for
+ *   untagged Codex output so that not every Codex reply automatically
+ *   spends Claude's context tokens.
+ */
+export type ClaudeDeliveryHint = "push" | "queue";
+
 export type ControlServerMessage =
-  | { type: "codex_to_claude"; message: BridgeMessage }
+  | { type: "codex_to_claude"; message: BridgeMessage; deliveryHint?: ClaudeDeliveryHint }
   | { type: "claude_to_codex_result"; requestId: string; success: boolean; error?: string }
   | { type: "status"; status: DaemonStatus };
 

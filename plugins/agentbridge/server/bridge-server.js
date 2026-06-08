@@ -13936,6 +13936,9 @@ class ClaudeAdapter extends EventEmitter {
     this.pendingMessages.push(message);
     this.log(`Queued message for pull (${this.pendingMessages.length} pending, instance=${this.instanceId})`);
   }
+  enqueueForPull(message) {
+    this.queueForPull(message);
+  }
   drainMessages() {
     this.log(`get_messages called (instance=${this.instanceId}, pending=${this.pendingMessages.length}, dropped=${this.droppedMessageCount})`);
     if (this.pendingMessages.length === 0 && this.droppedMessageCount === 0) {
@@ -14215,7 +14218,7 @@ class DaemonClient extends EventEmitter2 {
       }
       switch (message.type) {
         case "codex_to_claude":
-          this.emit("codexMessage", message.message);
+          this.emit("codexMessage", message.message, message.deliveryHint);
           return;
         case "claude_to_codex_result": {
           const pending = this.pendingReplies.get(message.requestId);
@@ -14725,14 +14728,19 @@ var DAEMON_LIFECYCLE_TAGS = {
   system_turn_completed: wrap(C_GREEN, "[CODEX READY]"),
   system_reply_missing: wrap(C_RED, "[CODEX NO REPLY]")
 };
-daemonClient.on("codexMessage", (message) => {
+daemonClient.on("codexMessage", (message, deliveryHint) => {
   const tag = isDaemonLifecycle(message.id);
   if (tag) {
     log(`Daemon lifecycle event ${message.id} \u2192 status.line`);
     statusLine.write(tag);
     return;
   }
-  log(`Forwarding daemon \u2192 Claude (${message.content.length} chars)`);
+  if (deliveryHint === "queue") {
+    log(`Queueing daemon \u2192 Claude (${message.content.length} chars)`);
+    claude.enqueueForPull(message);
+    return;
+  }
+  log(`Pushing daemon \u2192 Claude (${message.content.length} chars)`);
   claude.pushNotification(message);
 });
 function isDaemonLifecycle(id) {

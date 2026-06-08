@@ -193,6 +193,15 @@ export class ClaudeAdapter extends EventEmitter {
     this.log(`Queued message for pull (${this.pendingMessages.length} pending, instance=${this.instanceId})`);
   }
 
+  /**
+   * Public entry point for delivery_hint="queue" messages: skip the
+   * MCP channel and park the message in the pull queue so Claude
+   * only sees it on the next get_messages call.
+   */
+  enqueueForPull(message: BridgeMessage) {
+    this.queueForPull(message);
+  }
+
   // ── get_messages ───────────────────────────────────────────
 
   private drainMessages(): { content: Array<{ type: "text"; text: string }> } {

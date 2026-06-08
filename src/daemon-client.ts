@@ -5,10 +5,22 @@ import {
   CLOSE_CODE_EVICTED_STALE,
   CLOSE_CODE_PROBE_IN_PROGRESS,
 } from "./control-protocol";
-import type { ControlClientMessage, ControlServerMessage, DaemonStatus } from "./control-protocol";
+import type {
+  ClaudeDeliveryHint,
+  ControlClientMessage,
+  ControlServerMessage,
+  DaemonStatus,
+} from "./control-protocol";
 
 interface DaemonClientEvents {
-  codexMessage: [BridgeMessage];
+  /**
+   * Codex → Claude message arrived. The second tuple slot is the
+   * daemon's delivery hint: "push" (or absent) means surface to
+   * Claude immediately via the MCP channel; "queue" means stash in
+   * the ClaudeAdapter's pull queue and let Claude reach for it via
+   * get_messages.
+   */
+  codexMessage: [BridgeMessage, ClaudeDeliveryHint | undefined];
   disconnect: [];
   rejected: [number];
   status: [DaemonStatus];
@@ -175,7 +187,7 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
 
       switch (message.type) {
         case "codex_to_claude":
-          this.emit("codexMessage", message.message);
+          this.emit("codexMessage", message.message, message.deliveryHint);
           return;
         case "claude_to_codex_result": {
           const pending = this.pendingReplies.get(message.requestId);

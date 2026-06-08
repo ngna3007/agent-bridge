@@ -113,14 +113,21 @@ const DAEMON_LIFECYCLE_TAGS: Record<string, string> = {
   system_reply_missing:      wrap(C_RED,    "[CODEX NO REPLY]"),
 };
 
-daemonClient.on("codexMessage", (message) => {
+daemonClient.on("codexMessage", (message, deliveryHint) => {
   const tag = isDaemonLifecycle(message.id);
   if (tag) {
     log(`Daemon lifecycle event ${message.id} → status.line`);
     statusLine.write(tag);
     return;
   }
-  log(`Forwarding daemon → Claude (${message.content.length} chars)`);
+  if (deliveryHint === "queue") {
+    // Untagged Codex output: hold in the adapter's pull queue.
+    // Claude only sees it on the next get_messages call.
+    log(`Queueing daemon → Claude (${message.content.length} chars)`);
+    claude.enqueueForPull(message);
+    return;
+  }
+  log(`Pushing daemon → Claude (${message.content.length} chars)`);
   void claude.pushNotification(message);
 });
 
