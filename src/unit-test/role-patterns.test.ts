@@ -3,13 +3,10 @@ import { ClaudeAdapter, CLAUDE_INSTRUCTIONS } from "../claude-adapter";
 import { BRIDGE_CONTRACT_REMINDER } from "../message-filter";
 
 describe("role-aware collaboration guidance", () => {
-  test("claude instructions include role keywords and thinking patterns", () => {
-    expect(CLAUDE_INSTRUCTIONS).toContain("Claude: Reviewer, Planner, Hypothesis Challenger");
-    expect(CLAUDE_INSTRUCTIONS).toContain("Codex: Implementer, Executor, Reproducer/Verifier");
-    expect(CLAUDE_INSTRUCTIONS).toContain("Independent Analysis & Convergence");
-    expect(CLAUDE_INSTRUCTIONS).toContain("Architect -> Builder -> Critic");
-    expect(CLAUDE_INSTRUCTIONS).toContain("Hypothesis -> Experiment -> Interpretation");
-    expect(CLAUDE_INSTRUCTIONS).toContain("My independent view is:");
+  test("claude instructions name the executor / advisor roles", () => {
+    // New role split: Claude executes, Codex advises / reviews.
+    expect(CLAUDE_INSTRUCTIONS).toContain("Claude (you): Executor");
+    expect(CLAUDE_INSTRUCTIONS).toContain("Codex: Advisor");
     expect(CLAUDE_INSTRUCTIONS).toContain("I agree on:");
     expect(CLAUDE_INSTRUCTIONS).toContain("I disagree on:");
     expect(CLAUDE_INSTRUCTIONS).toContain("Current consensus:");
@@ -21,13 +18,17 @@ describe("role-aware collaboration guidance", () => {
     expect(CLAUDE_INSTRUCTIONS).toContain("busy error");
   });
 
-  test("bridge contract reminder includes codex role guidance", () => {
-    expect(BRIDGE_CONTRACT_REMINDER).toContain("Your default role: Implementer, Executor, Verifier");
-    expect(BRIDGE_CONTRACT_REMINDER).toContain("Independent Analysis & Convergence");
-    expect(BRIDGE_CONTRACT_REMINDER).toContain("Architect -> Builder -> Critic");
-    expect(BRIDGE_CONTRACT_REMINDER).toContain("Hypothesis -> Experiment -> Interpretation");
-    expect(BRIDGE_CONTRACT_REMINDER).toContain("Do not blindly follow Claude");
+  test("bridge contract reminder includes codex advisor-role guidance", () => {
+    expect(BRIDGE_CONTRACT_REMINDER).toContain("Your role: Advisor / Reviewer");
+    expect(BRIDGE_CONTRACT_REMINDER).toContain("Claude is the Executor");
+    expect(BRIDGE_CONTRACT_REMINDER).toContain("Challenge with evidence");
     expect(BRIDGE_CONTRACT_REMINDER).toContain("My independent view is:");
+  });
+
+  test("bridge contract reminder includes cross-agent ultra-terse style", () => {
+    expect(BRIDGE_CONTRACT_REMINDER).toContain("ULTRA-TERSE");
+    expect(BRIDGE_CONTRACT_REMINDER).toContain("caveman-ultra");
+    expect(BRIDGE_CONTRACT_REMINDER).toContain("Arrows for causality");
   });
 
   test("bridge contract reminder specifies marker must be at start", () => {
