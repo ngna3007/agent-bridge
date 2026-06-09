@@ -4,9 +4,29 @@ import { fileURLToPath } from "node:url";
 import { StateDirResolver } from "./state-dir";
 
 // When bundled into a Claude Code plugin, the frontend runs from the plugin
-// cache directory and must launch the sibling daemon bundle from there.
-const DAEMON_ENTRY = process.env.AGENTBRIDGE_DAEMON_ENTRY ?? "./daemon.ts";
-const DAEMON_PATH = fileURLToPath(new URL(DAEMON_ENTRY, import.meta.url));
+// cache directory and the daemon bundle sits next to bridge-server.js, so
+// "./daemon.js" resolves correctly. When the CLI runs standalone (e.g.
+// `abg codex` from `dist/cli.js`), the daemon bundle lives one level up
+// under `plugins/agentbridge/server/daemon.js`; that's the next fallback.
+// AGENTBRIDGE_DAEMON_ENTRY overrides both (used by e2e tests).
+function resolveDaemonPath(): string {
+  if (process.env.AGENTBRIDGE_DAEMON_ENTRY) {
+    return fileURLToPath(new URL(process.env.AGENTBRIDGE_DAEMON_ENTRY, import.meta.url));
+  }
+  const candidates = [
+    "./daemon.js",                                  // plugin bundle layout
+    "../plugins/agentbridge/server/daemon.js",      // npm-install / local-link cli layout
+    "./daemon.ts",                                  // src/ layout (when running from source)
+  ];
+  for (const rel of candidates) {
+    const abs = fileURLToPath(new URL(rel, import.meta.url));
+    if (existsSync(abs)) return abs;
+  }
+  // Fall back to the original path so the error message names the file
+  // we tried to spawn rather than failing silently inside child_process.
+  return fileURLToPath(new URL("./daemon.ts", import.meta.url));
+}
+const DAEMON_PATH = resolveDaemonPath();
 
 export interface DaemonLifecycleOptions {
   stateDir: StateDirResolver;

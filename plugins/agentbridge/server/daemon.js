@@ -1590,8 +1590,23 @@ class TuiConnectionState {
 import { spawn as spawn2, execFileSync } from "child_process";
 import { existsSync as existsSync2, readFileSync, unlinkSync as unlinkSync2, writeFileSync, openSync, closeSync, constants } from "fs";
 import { fileURLToPath } from "url";
-var DAEMON_ENTRY = process.env.AGENTBRIDGE_DAEMON_ENTRY ?? "./daemon.ts";
-var DAEMON_PATH = fileURLToPath(new URL(DAEMON_ENTRY, import.meta.url));
+function resolveDaemonPath() {
+  if (process.env.AGENTBRIDGE_DAEMON_ENTRY) {
+    return fileURLToPath(new URL(process.env.AGENTBRIDGE_DAEMON_ENTRY, import.meta.url));
+  }
+  const candidates = [
+    "./daemon.js",
+    "../plugins/agentbridge/server/daemon.js",
+    "./daemon.ts"
+  ];
+  for (const rel of candidates) {
+    const abs = fileURLToPath(new URL(rel, import.meta.url));
+    if (existsSync2(abs))
+      return abs;
+  }
+  return fileURLToPath(new URL("./daemon.ts", import.meta.url));
+}
+var DAEMON_PATH = resolveDaemonPath();
 
 class DaemonLifecycle {
   stateDir;
