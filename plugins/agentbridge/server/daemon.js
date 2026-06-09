@@ -2054,7 +2054,7 @@ var tuiConnectionState = new TuiConnectionState({
     codex.injectMessage("\u2705 Claude Code is still online, bridge restored. Bidirectional communication can continue.");
   }
 });
-var statusBuffer = new StatusBuffer((summary) => emitToClaude(summary));
+var statusBuffer = new StatusBuffer((summary) => emitToClaude(summary, "queue"));
 codex.on("turnStarted", () => {
   log("Codex turn started");
   emitToClaude(systemMessage("system_turn_started", "\u23F3 Codex is working on the current task. Wait for completion before sending a reply."));

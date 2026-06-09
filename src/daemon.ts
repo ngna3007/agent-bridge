@@ -119,7 +119,11 @@ const tuiConnectionState = new TuiConnectionState({
   },
 });
 
-const statusBuffer = new StatusBuffer((summary) => emitToClaude(summary));
+// Route the periodic [STATUS] summary to Claude's pull queue
+// instead of pushing it on the MCP channel. Same reasoning as
+// untagged Codex output: routine progress should not auto-bloat
+// Claude's context. Claude can drain via get_messages if curious.
+const statusBuffer = new StatusBuffer((summary) => emitToClaude(summary, "queue"));
 
 codex.on("turnStarted", () => {
   log("Codex turn started");

@@ -1,7 +1,7 @@
 import { execSync, execFileSync } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
-import { ConfigService } from "../config-service";
+import { ConfigService, DEFAULT_CONFIG } from "../config-service";
 import { MARKETPLACE_NAME, PLUGIN_NAME } from "../cli";
 import { findPackageRoot, registerMarketplace } from "./pkg-root";
 import { upsertMarkedSection } from "../marker-section";
@@ -10,6 +10,7 @@ import {
   CLAUDE_MD_SECTION,
   AGENTS_MD_SECTION,
 } from "../collaboration-content";
+import { computeProjectId, computeProjectPorts } from "../project-id";
 
 const MIN_CLAUDE_VERSION = "2.1.80";
 
@@ -23,23 +24,36 @@ export async function runInit() {
   checkCodex();
   console.log("");
 
-  // Step 2: Generate project config
+  // Step 2: Generate project config with per-project derived ports.
+  // The .agentbridge/ directory acts as the project marker for the
+  // CLI's namespace logic (project-id.ts), and the codex ports in
+  // config.json must match the per-project derivation so the daemon
+  // and the CLI agree on which sockets to use.
   console.log("Generating project config...");
   const configService = new ConfigService();
-  const created = configService.initDefaults();
+  const projectRoot = process.cwd();
+  const projectId = computeProjectId(projectRoot);
+  const ports = computeProjectPorts(projectId);
 
-  if (created.length > 0) {
-    for (const file of created) {
-      console.log(`  Created: ${file}`);
-    }
+  if (!configService.hasConfig()) {
+    configService.save({
+      ...DEFAULT_CONFIG,
+      codex: {
+        appPort: ports.codexWs,
+        proxyPort: ports.codexProxy,
+      },
+    });
+    console.log(`  Created: ${configService.configFilePath}`);
+    console.log(`  Project id: ${projectId}`);
+    console.log(`  Per-project ports: codex ${ports.codexWs} · proxy ${ports.codexProxy} · control ${ports.control}`);
   } else {
     console.log("  Project config already exists, skipping.");
+    console.log(`  (Existing ports preserved; project id for namespacing: ${projectId})`);
   }
   console.log("");
 
   // Step 3: Write collaboration sections to CLAUDE.md and AGENTS.md
   console.log("Writing collaboration sections...");
-  const projectRoot = process.cwd();
   const collabResults = writeCollaborationSections(projectRoot);
   for (const result of collabResults) {
     console.log(`  ${result}`);

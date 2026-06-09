@@ -378,8 +378,13 @@ describe("E2E: CLI surface", () => {
       const config = JSON.parse(
         readFileSync(join(harness.projectDir, ".agentbridge", "config.json"), "utf-8"),
       ) as { codex: { appPort: number; proxyPort: number } };
-      expect(config.codex.appPort).toBe(4500);
-      expect(config.codex.proxyPort).toBe(4501);
+      // Ports are now derived per project, not fixed 4500/4501. Pin
+      // the structural invariants instead of the old hard-coded
+      // numbers: the pair is sequential and inside the per-project
+      // pool (14500-17499) that project-id.ts allocates from.
+      expect(config.codex.proxyPort).toBe(config.codex.appPort + 1);
+      expect(config.codex.appPort).toBeGreaterThanOrEqual(14500);
+      expect(config.codex.proxyPort).toBeLessThan(17500);
       expect(result.stdout).toContain("Setup complete!");
       expect(harness.readShimCalls("claude").some((entry) => entry.args[0] === "plugin")).toBe(true);
       expect(harness.readShimCalls("codex").some((entry) => entry.args[0] === "--version")).toBe(true);
