@@ -135,14 +135,14 @@ codex.on("agentMessage", (msg: BridgeMessage) => {
   if (msg.source !== "codex") return;
   const result = classifyMessage(msg.content, FILTER_MODE);
 
-  // Track whether Codex emitted anything during a require_reply turn,
-  // so we can fire system_reply_missing if it didn't. Tracking is the
-  // ONLY effect of replyRequired - we no longer force-forward every
-  // intermediate message. Codex is expected to use [REPLY] on its
-  // actual answer (per REPLY_REQUIRED_INSTRUCTION); routine progress
-  // ([STATUS], untagged) still buffers / queues normally so it
-  // doesn't auto-bloat Claude's context.
-  if (replyRequired) {
+  // Track whether Codex sent a [REPLY] during a require_reply turn,
+  // so system_reply_missing fires when it didn't. Only [REPLY] counts
+  // as "actually replied" - [STATUS] / [FYI] / untagged don't
+  // satisfy a required reply. Tracking is the ONLY effect of
+  // replyRequired now; we no longer force-forward every intermediate
+  // message. Routing of each message still goes through
+  // classifyMessage below.
+  if (replyRequired && result.marker === "reply") {
     replyReceivedDuringTurn = true;
   }
 

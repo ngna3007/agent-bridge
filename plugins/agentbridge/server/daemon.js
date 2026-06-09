@@ -2048,7 +2048,7 @@ codex.on("agentMessage", (msg) => {
   if (msg.source !== "codex")
     return;
   const result = classifyMessage(msg.content, FILTER_MODE);
-  if (replyRequired) {
+  if (replyRequired && result.marker === "reply") {
     replyReceivedDuringTurn = true;
   }
   if (inAttentionWindow && result.marker === "status") {
