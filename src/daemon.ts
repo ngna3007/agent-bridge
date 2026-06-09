@@ -135,15 +135,15 @@ codex.on("agentMessage", (msg: BridgeMessage) => {
   if (msg.source !== "codex") return;
   const result = classifyMessage(msg.content, FILTER_MODE);
 
-  // When replyRequired is active, force-forward ALL messages regardless of marker
+  // Track whether Codex emitted anything during a require_reply turn,
+  // so we can fire system_reply_missing if it didn't. Tracking is the
+  // ONLY effect of replyRequired - we no longer force-forward every
+  // intermediate message. Codex is expected to use [REPLY] on its
+  // actual answer (per REPLY_REQUIRED_INSTRUCTION); routine progress
+  // ([STATUS], untagged) still buffers / queues normally so it
+  // doesn't auto-bloat Claude's context.
   if (replyRequired) {
-    log(`Codex → Claude [${result.marker}/force-forward-reply-required] (${msg.content.length} chars)`);
     replyReceivedDuringTurn = true;
-    if (statusBuffer.size > 0) {
-      statusBuffer.flush("reply-required message arrived");
-    }
-    emitToClaude(msg);
-    return;
   }
 
   // During attention window, suppress STATUS to give Claude space to respond

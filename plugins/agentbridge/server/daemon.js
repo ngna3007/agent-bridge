@@ -2049,13 +2049,7 @@ codex.on("agentMessage", (msg) => {
     return;
   const result = classifyMessage(msg.content, FILTER_MODE);
   if (replyRequired) {
-    log(`Codex \u2192 Claude [${result.marker}/force-forward-reply-required] (${msg.content.length} chars)`);
     replyReceivedDuringTurn = true;
-    if (statusBuffer.size > 0) {
-      statusBuffer.flush("reply-required message arrived");
-    }
-    emitToClaude(msg);
-    return;
   }
   if (inAttentionWindow && result.marker === "status") {
     log(`Codex \u2192 Claude [${result.marker}/buffer-attention] (${msg.content.length} chars)`);
