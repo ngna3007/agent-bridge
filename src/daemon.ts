@@ -3,6 +3,7 @@
 import type { ServerWebSocket } from "bun";
 import { CodexAdapter } from "./codex-adapter";
 import { getRotatingLogger } from "./log-rotator";
+import { StatusLineWriter } from "./status-line-writer";
 import {
   BRIDGE_CONTRACT_REMINDER,
   REPLY_REQUIRED_INSTRUCTION,
@@ -34,6 +35,12 @@ const stateDir = new StateDirResolver();
 stateDir.ensure();
 const configService = new ConfigService();
 const config = configService.loadOrDefault();
+
+// Daemon-owned status.line writes. The bridge is the primary writer
+// (it owns most lifecycle tags via emitLifecycle), but on shutdown
+// the bridge usually died first - so without this the user would see
+// a stale [CODEX READY] / [CODEX THINKING] tag long after `abg kill`.
+const daemonStatusLine = new StatusLineWriter(stateDir);
 
 const CODEX_APP_PORT = parseInt(process.env.CODEX_WS_PORT ?? String(config.codex.appPort), 10);
 const CODEX_PROXY_PORT = parseInt(process.env.CODEX_PROXY_PORT ?? String(config.codex.proxyPort), 10);
@@ -823,6 +830,12 @@ function shutdown(reason: string) {
   if (shuttingDown) return;
   shuttingDown = true;
   log(`Shutting down daemon (${reason})...`);
+  // Write the final state to status.line BEFORE tearing down the
+  // control server. If the bridge dies with us (Claude Code quit),
+  // it cannot emit [BRIDGE OFFLINE] on its own, and the user would
+  // be left looking at a stale [CODEX READY] / [CODEX THINKING] tag
+  // until the next session.
+  daemonStatusLine.write("\x1b[2m[BRIDGE STOPPED]\x1b[0m");
   tuiConnectionState.dispose(`daemon shutdown (${reason})`);
   clearPendingClaudeDisconnect(`daemon shutdown (${reason})`);
   controlServer?.stop();

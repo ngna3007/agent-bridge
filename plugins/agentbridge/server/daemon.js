@@ -1364,6 +1364,40 @@ class CodexAdapter extends EventEmitter {
   }
 }
 
+// src/status-line-writer.ts
+import { writeFileSync, mkdirSync as mkdirSync2, existsSync as existsSync2 } from "fs";
+import { dirname, join as join2 } from "path";
+class StatusLineWriter {
+  path;
+  constructor(stateDir) {
+    const dir = (stateDir ?? new StateDirResolver).dir;
+    this.path = join2(dir, "status.line");
+  }
+  get filePath() {
+    return this.path;
+  }
+  write(tag) {
+    try {
+      this.ensureDir();
+      const oneLine = tag.replace(/[\r\n]+/g, " ").trim();
+      writeFileSync(this.path, `${oneLine}
+`, "utf-8");
+    } catch {}
+  }
+  clear() {
+    try {
+      this.ensureDir();
+      writeFileSync(this.path, "", "utf-8");
+    } catch {}
+  }
+  ensureDir() {
+    const dir = dirname(this.path);
+    if (!existsSync2(dir)) {
+      mkdirSync2(dir, { recursive: true });
+    }
+  }
+}
+
 // src/message-filter.ts
 var MARKER_REGEX = /^\s*\[(REPLY|IMPORTANT|STATUS|FYI)\]\s*/i;
 function parseMarker(content) {
@@ -1596,7 +1630,7 @@ class TuiConnectionState {
 
 // src/daemon-lifecycle.ts
 import { spawn as spawn2, execFileSync } from "child_process";
-import { existsSync as existsSync2, readFileSync, unlinkSync as unlinkSync2, writeFileSync, openSync, closeSync, constants } from "fs";
+import { existsSync as existsSync3, readFileSync, unlinkSync as unlinkSync2, writeFileSync as writeFileSync2, openSync, closeSync, constants } from "fs";
 import { fileURLToPath } from "url";
 function resolveDaemonPath() {
   if (process.env.AGENTBRIDGE_DAEMON_ENTRY) {
@@ -1609,7 +1643,7 @@ function resolveDaemonPath() {
   ];
   for (const rel of candidates) {
     const abs = fileURLToPath(new URL(rel, import.meta.url));
-    if (existsSync2(abs))
+    if (existsSync3(abs))
       return abs;
   }
   return fileURLToPath(new URL("./daemon.ts", import.meta.url));
@@ -1709,7 +1743,7 @@ class DaemonLifecycle {
   }
   writeStatus(status) {
     this.stateDir.ensure();
-    writeFileSync(this.stateDir.statusFile, JSON.stringify(status, null, 2) + `
+    writeFileSync2(this.stateDir.statusFile, JSON.stringify(status, null, 2) + `
 `, "utf-8");
   }
   readPid() {
@@ -1725,7 +1759,7 @@ class DaemonLifecycle {
   }
   writePid(pid) {
     this.stateDir.ensure();
-    writeFileSync(this.stateDir.pidFile, `${pid ?? process.pid}
+    writeFileSync2(this.stateDir.pidFile, `${pid ?? process.pid}
 `, "utf-8");
   }
   removePidFile() {
@@ -1740,7 +1774,7 @@ class DaemonLifecycle {
   }
   markKilled() {
     this.stateDir.ensure();
-    writeFileSync(this.stateDir.killedFile, `${Date.now()}
+    writeFileSync2(this.stateDir.killedFile, `${Date.now()}
 `, "utf-8");
   }
   clearKilled() {
@@ -1749,7 +1783,7 @@ class DaemonLifecycle {
     } catch {}
   }
   wasKilled() {
-    return existsSync2(this.stateDir.killedFile);
+    return existsSync3(this.stateDir.killedFile);
   }
   launch() {
     this.stateDir.ensure();
@@ -1778,7 +1812,7 @@ class DaemonLifecycle {
     this.stateDir.ensure();
     try {
       const fd = openSync(this.stateDir.lockFile, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY);
-      writeFileSync(fd, `${process.pid}
+      writeFileSync2(fd, `${process.pid}
 `);
       closeSync(fd);
       return true;
@@ -1871,8 +1905,8 @@ function isProcessAlive(pid) {
 }
 
 // src/config-service.ts
-import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync2, existsSync as existsSync3 } from "fs";
-import { join as join2 } from "path";
+import { readFileSync as readFileSync2, writeFileSync as writeFileSync3, mkdirSync as mkdirSync3, existsSync as existsSync4 } from "fs";
+import { join as join3 } from "path";
 var DEFAULT_CONFIG = {
   version: "1.0",
   codex: {
@@ -1924,11 +1958,11 @@ class ConfigService {
   configPath;
   constructor(projectRoot) {
     const root = projectRoot ?? process.cwd();
-    this.configDir = join2(root, CONFIG_DIR);
-    this.configPath = join2(this.configDir, CONFIG_FILE);
+    this.configDir = join3(root, CONFIG_DIR);
+    this.configPath = join3(this.configDir, CONFIG_FILE);
   }
   hasConfig() {
-    return existsSync3(this.configPath);
+    return existsSync4(this.configPath);
   }
   load() {
     try {
@@ -1943,13 +1977,13 @@ class ConfigService {
   }
   save(config) {
     this.ensureConfigDir();
-    writeFileSync2(this.configPath, JSON.stringify(config, null, 2) + `
+    writeFileSync3(this.configPath, JSON.stringify(config, null, 2) + `
 `, "utf-8");
   }
   initDefaults() {
     this.ensureConfigDir();
     const created = [];
-    if (!existsSync3(this.configPath)) {
+    if (!existsSync4(this.configPath)) {
       this.save(DEFAULT_CONFIG);
       created.push(this.configPath);
     }
@@ -1959,8 +1993,8 @@ class ConfigService {
     return this.configPath;
   }
   ensureConfigDir() {
-    if (!existsSync3(this.configDir)) {
-      mkdirSync2(this.configDir, { recursive: true });
+    if (!existsSync4(this.configDir)) {
+      mkdirSync3(this.configDir, { recursive: true });
     }
   }
 }
@@ -2016,6 +2050,7 @@ var stateDir = new StateDirResolver;
 stateDir.ensure();
 var configService = new ConfigService;
 var config = configService.loadOrDefault();
+var daemonStatusLine = new StatusLineWriter(stateDir);
 var CODEX_APP_PORT = parseInt(process.env.CODEX_WS_PORT ?? String(config.codex.appPort), 10);
 var CODEX_PROXY_PORT = parseInt(process.env.CODEX_PROXY_PORT ?? String(config.codex.proxyPort), 10);
 var CONTROL_PORT = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10);
@@ -2589,6 +2624,7 @@ function shutdown(reason) {
     return;
   shuttingDown = true;
   log(`Shutting down daemon (${reason})...`);
+  daemonStatusLine.write("\x1B[2m[BRIDGE STOPPED]\x1B[0m");
   tuiConnectionState.dispose(`daemon shutdown (${reason})`);
   clearPendingClaudeDisconnect(`daemon shutdown (${reason})`);
   controlServer?.stop();

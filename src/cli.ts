@@ -82,11 +82,19 @@ async function main() {
       break;
     case "kill":
       const { runKill } = await import("./cli/kill");
-      await runKill();
+      await runKill(restArgs);
       break;
     case "status":
       const { runStatus } = await import("./cli/status");
       await runStatus();
+      break;
+    case "projects":
+      const { runProjects } = await import("./cli/projects");
+      await runProjects();
+      break;
+    case "doctor":
+      const { runDoctor } = await import("./cli/doctor");
+      await runDoctor();
       break;
     case "--help":
     case "-h":
@@ -118,8 +126,11 @@ Commands:
   dev               Register local marketplace + install plugin (for local dev)
   claude [args...]  Start Claude Code with push channel enabled
   codex [args...]   Start Codex TUI connected to AgentBridge daemon
-  kill              Stop daemon + managed Codex TUI for the current project
+  kill [--all]      Stop daemon + managed Codex TUI for the current project
+                    (or every project when --all is passed)
   status            Report project info, daemon state, ports (read-only)
+  projects          List every project state dir + its daemon state
+  doctor            Diagnose stuck or surprising state, suggest fixes
 
 Options:
   --help, -h        Show this help message

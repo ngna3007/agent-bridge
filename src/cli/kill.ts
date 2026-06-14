@@ -2,32 +2,125 @@ import { execFileSync } from "node:child_process";
 import { readFileSync, unlinkSync } from "node:fs";
 import { StateDirResolver } from "../state-dir";
 import { DaemonLifecycle, isProcessAlive } from "../daemon-lifecycle";
+import {
+  enumerateStateDirs,
+  findOrphanBridgeServers,
+  gracefulKill,
+} from "../process-helpers";
 
-export async function runKill() {
+export interface KillOptions {
+  /** When true, sweep every project state dir under the platform root. */
+  all?: boolean;
+}
+
+export async function runKill(args: string[] = []) {
+  const opts: KillOptions = {
+    all: args.includes("--all"),
+  };
+
+  if (opts.all) {
+    return runKillAll();
+  }
+
   console.log("AgentBridge Kill — stopping daemon and managed Codex TUI\n");
 
   const stateDir = new StateDirResolver();
   const controlPort = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10);
+  const log = (msg: string) => console.log(`  ${msg}`);
 
-  const lifecycle = new DaemonLifecycle({
-    stateDir,
-    controlPort,
-    log: (msg) => console.log(`  ${msg}`),
-  });
+  const lifecycle = new DaemonLifecycle({ stateDir, controlPort, log });
 
   // Mark the daemon as intentionally stopped before terminating the process.
   // This closes the reconnect race where the frontend sees the disconnect
   // before the sentinel is written and relaunches the daemon.
   lifecycle.markKilled();
-  const tuiKilled = await killManagedCodexTui(stateDir, (msg) => console.log(`  ${msg}`));
+  const tuiKilled = await killManagedCodexTui(stateDir, log);
   const killed = await lifecycle.kill();
+  const reaped = await reapOrphans(stateDir, controlPort, log);
 
-  if (killed || tuiKilled) {
+  if (killed || tuiKilled || reaped > 0) {
     console.log("\nAgentBridge stopped.");
     console.log("Please restart Claude Code (`agentbridge claude`), switch to a new conversation, or run `/resume` to fully disconnect.");
   } else {
     console.log("\nNo running AgentBridge daemon or managed Codex TUI found.");
     console.log("Stale state files cleaned up (if any).");
+  }
+}
+
+/**
+ * Sweep every project state dir under the platform root, stopping
+ * whatever's running. Used when the user has multiple projects and
+ * just wants "kill everything AgentBridge-related".
+ */
+async function runKillAll() {
+  console.log("AgentBridge Kill (--all) — sweeping every project state dir\n");
+  // For --all we ignore any AGENTBRIDGE_STATE_DIR override and use
+  // the platform default root, then enumerate per-project subdirs
+  // under it. This is the only way to find sibling projects we
+  // weren't launched in.
+  const prevStateDir = process.env.AGENTBRIDGE_STATE_DIR;
+  delete process.env.AGENTBRIDGE_STATE_DIR;
+  const stateRoot = new StateDirResolver().dir;
+  if (prevStateDir !== undefined) process.env.AGENTBRIDGE_STATE_DIR = prevStateDir;
+
+  const dirs = enumerateStateDirs(stateRoot);
+  if (dirs.length === 0) {
+    console.log("No AgentBridge state directories found under " + stateRoot);
+    return;
+  }
+
+  let totalKilled = 0;
+  for (const dir of dirs) {
+    console.log(`\n[${dir}]`);
+    const sd = new StateDirResolver(dir);
+    // Best-effort: control port for the root may not match; we read
+    // the daemon-status file if present to pick the right port.
+    const controlPort = readControlPortFromStatus(dir) ?? 4502;
+    const log = (msg: string) => console.log(`  ${msg}`);
+
+    const lifecycle = new DaemonLifecycle({ stateDir: sd, controlPort, log });
+    lifecycle.markKilled();
+    const tuiKilled = await killManagedCodexTui(sd, log);
+    const killed = await lifecycle.kill();
+    const reaped = await reapOrphans(sd, controlPort, log);
+    if (killed || tuiKilled || reaped > 0) totalKilled++;
+  }
+
+  console.log(`\nDone. ${totalKilled} project state dir(s) had something to stop.`);
+}
+
+/**
+ * Send SIGTERM to bridge-server.js processes whose env points at
+ * this state dir. These are typically orphans from a Claude Code
+ * session that died without notifying the daemon, and they keep
+ * trying to start a daemon - which blocks `abg codex` next time.
+ *
+ * Intentionally NOT port-based: a port-binding lookup is too
+ * aggressive and risks killing unrelated processes that happen to
+ * sit on a colliding port. Env matching is precise.
+ */
+async function reapOrphans(
+  stateDir: StateDirResolver,
+  _controlPort: number,
+  log: (msg: string) => void,
+): Promise<number> {
+  let reaped = 0;
+  const bridges = findOrphanBridgeServers(stateDir.dir);
+  for (const pid of bridges) {
+    if (pid === process.pid) continue;
+    log(`Reaping orphan bridge-server pid ${pid}`);
+    if (await gracefulKill(pid)) reaped++;
+  }
+  return reaped;
+}
+
+function readControlPortFromStatus(stateDir: string): number | null {
+  try {
+    const raw = readFileSync(`${stateDir}/status.json`, "utf-8");
+    const parsed = JSON.parse(raw) as { controlPort?: number };
+    return parsed.controlPort ?? null;
+  } catch {
+    return null;
   }
 }
 
