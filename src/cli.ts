@@ -11,8 +11,7 @@
  *   agentbridge kill        — Force kill all AgentBridge processes
  */
 
-import { resolveProject, applyProjectEnv } from "./project-id";
-import { StateDirResolver } from "./state-dir";
+import { resolveRuntimeNamespace } from "./runtime-namespace";
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -32,30 +31,26 @@ export const PLUGIN_NAME = "agentbridge";
  */
 function maybeApplyProjectNamespace(cmd: string | undefined): void {
   if (!cmd) return;
-  // init/dev/--help/--version/status run in "no project yet" mode;
-  // honoring an ancestor marker would create surprising port
-  // assignments during onboarding. Apply the namespace only for the
-  // runtime commands that actually launch or stop the daemon.
-  // (`status` resolves the project itself for read-only display, so
-  // it does not need its env mutated here.)
+  // init / dev / --help / --version run in "no project yet" mode -
+  // their decisions don't depend on a daemon, so we leave env alone.
+  // status / doctor / projects are read-only diagnostics; they call
+  // resolveRuntimeNamespace themselves with mutateEnv:false to read
+  // the right state dir without affecting downstream code.
+  // claude / codex / kill all spawn or talk to the daemon, so they
+  // need the per-project env vars applied here.
   const namespaced = new Set(["claude", "codex", "kill"]);
   if (!namespaced.has(cmd)) return;
 
-  const project = resolveProject();
-  if (!project) return; // single-instance fallback - historical behavior
-
-  // Use the platform-default state dir as the base (the resolver
-  // takes the env var into account, but with no env yet it returns
-  // the platform default). applyProjectEnv then nests under it.
-  const baseStateDir = new StateDirResolver().dir;
-  applyProjectEnv(project, baseStateDir);
+  const ns = resolveRuntimeNamespace({ mutateEnv: true });
+  if (!ns.project) return; // single-instance fallback - historical behavior
 
   // One-line startup banner so the user can see at a glance which
   // project this terminal is talking to. Stays out of automation
-  // (NO_COLOR / non-TTY skipped).
+  // (non-TTY skipped).
   if (process.stdout.isTTY) {
+    const p = ns.project;
     process.stderr.write(
-      `[abg] project ${project.projectId} · ports ${project.ports.codexWs}/${project.ports.codexProxy}/${project.ports.control} · ${project.rootPath}\n`,
+      `[abg] project ${p.projectId} · ports ${p.ports.codexWs}/${p.ports.codexProxy}/${p.ports.control} · ${p.rootPath}\n`,
     );
   }
 }

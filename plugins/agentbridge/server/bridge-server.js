@@ -14739,6 +14739,51 @@ function disabledReplyError(reason) {
   }
 }
 
+// src/lifecycle-tags.ts
+var C_RESET = "\x1B[0m";
+var C_GREEN = "\x1B[32m";
+var C_YELLOW = "\x1B[33m";
+var C_RED = "\x1B[31m";
+var C_DIM = "\x1B[2m";
+var wrap = (c, s) => `${c}${s}${C_RESET}`;
+var BRIDGE_STOPPED_TAG = wrap(C_DIM, "[BRIDGE STOPPED]");
+var LIFECYCLE_TAGS = {
+  system_tui_kickoff: wrap(C_GREEN, "[CODEX READY]"),
+  system_daemon_disconnected: wrap(C_RED, "[BRIDGE OFFLINE]"),
+  system_daemon_reconnected: wrap(C_GREEN, "[CODEX READY]"),
+  system_bridge_ready: wrap(C_GREEN, "[BRIDGE READY]"),
+  system_daemon_connect_failed: wrap(C_RED, "[BRIDGE FAILED]"),
+  system_bridge_evicted: wrap(C_RED, "[REPLACED BY NEWER SESSION]"),
+  system_bridge_probe_in_progress: wrap(C_YELLOW, "[RECONNECTING]"),
+  system_bridge_replaced: wrap(C_RED, "[ANOTHER SESSION ACTIVE]"),
+  system_bridge_disabled: BRIDGE_STOPPED_TAG,
+  system_bridge_auto_recovery_gave_up: wrap(C_RED, "[RECONNECT FAILED]"),
+  system_bridge_recovered: wrap(C_GREEN, "[CODEX READY]"),
+  system_ready: wrap(C_GREEN, "[CODEX READY]"),
+  system_waiting: wrap(C_YELLOW, "[WAITING FOR CODEX]"),
+  system_codex_start_failed: wrap(C_RED, "[CODEX FAILED]"),
+  system_turn_started: wrap(C_YELLOW, "[CODEX THINKING]"),
+  system_turn_completed: wrap(C_GREEN, "[CODEX READY]"),
+  system_reply_missing: wrap(C_RED, "[CODEX NO REPLY]"),
+  system_tui_disconnected: wrap(C_YELLOW, "[CODEX UI OFFLINE]"),
+  system_tui_reconnected: wrap(C_GREEN, "[CODEX READY]")
+};
+function tagForLifecycle(id) {
+  if (id in LIFECYCLE_TAGS)
+    return LIFECYCLE_TAGS[id];
+  return `[${id.replace(/^system_/, "").toUpperCase()}]`;
+}
+var DAEMON_LIFECYCLE_IDS = new Set([
+  "system_ready",
+  "system_waiting",
+  "system_codex_start_failed",
+  "system_turn_started",
+  "system_turn_completed",
+  "system_reply_missing",
+  "system_tui_disconnected",
+  "system_tui_reconnected"
+]);
+
 // src/bridge.ts
 if (process.env.AGENTBRIDGE_ACTIVE !== "1") {
   process.exit(0);
@@ -14779,22 +14824,6 @@ claude.setReplySender(async (msg, requireReply) => {
   }
   return daemonClient.sendReply(msg, requireReply);
 });
-var C_RESET = "\x1B[0m";
-var C_GREEN = "\x1B[32m";
-var C_YELLOW = "\x1B[33m";
-var C_RED = "\x1B[31m";
-var C_DIM = "\x1B[2m";
-var wrap = (c, s) => `${c}${s}${C_RESET}`;
-var DAEMON_LIFECYCLE_TAGS = {
-  system_ready: wrap(C_GREEN, "[CODEX READY]"),
-  system_waiting: wrap(C_YELLOW, "[WAITING FOR CODEX]"),
-  system_codex_start_failed: wrap(C_RED, "[CODEX FAILED]"),
-  system_turn_started: wrap(C_YELLOW, "[CODEX THINKING]"),
-  system_turn_completed: wrap(C_GREEN, "[CODEX READY]"),
-  system_reply_missing: wrap(C_RED, "[CODEX NO REPLY]"),
-  system_tui_disconnected: wrap(C_YELLOW, "[CODEX UI OFFLINE]"),
-  system_tui_reconnected: wrap(C_GREEN, "[CODEX READY]")
-};
 daemonClient.on("codexMessage", (message, deliveryHint) => {
   const tag = isDaemonLifecycle(message.id);
   if (tag) {
@@ -14815,13 +14844,9 @@ function isDaemonLifecycle(id) {
   if (!match)
     return null;
   const prefix = match[1];
-  if (prefix in DAEMON_LIFECYCLE_TAGS) {
-    return DAEMON_LIFECYCLE_TAGS[prefix];
-  }
-  if (prefix.startsWith("system_")) {
-    return `[${prefix.replace(/^system_/, "").toUpperCase()}]`;
-  }
-  return null;
+  if (!prefix.startsWith("system_"))
+    return null;
+  return tagForLifecycle(prefix);
 }
 daemonClient.on("status", (status) => {
   log(`Daemon status: ready=${status.bridgeReady} tui=${status.tuiConnected} thread=${status.threadId ?? "none"} queued=${status.queuedMessageCount}`);
@@ -15060,22 +15085,8 @@ async function pollDisabledRecovery() {
     disabledRecoveryInFlight = false;
   }
 }
-var LIFECYCLE_TAGS = {
-  system_tui_kickoff: wrap(C_GREEN, "[CODEX READY]"),
-  system_daemon_disconnected: wrap(C_RED, "[BRIDGE OFFLINE]"),
-  system_daemon_reconnected: wrap(C_GREEN, "[CODEX READY]"),
-  system_bridge_ready: wrap(C_GREEN, "[BRIDGE READY]"),
-  system_daemon_connect_failed: wrap(C_RED, "[BRIDGE FAILED]"),
-  system_bridge_evicted: wrap(C_RED, "[REPLACED BY NEWER SESSION]"),
-  system_bridge_probe_in_progress: wrap(C_YELLOW, "[RECONNECTING]"),
-  system_bridge_replaced: wrap(C_RED, "[ANOTHER SESSION ACTIVE]"),
-  system_bridge_disabled: wrap(C_DIM, "[BRIDGE STOPPED]"),
-  system_bridge_auto_recovery_gave_up: wrap(C_RED, "[RECONNECT FAILED]"),
-  system_bridge_recovered: wrap(C_GREEN, "[CODEX READY]")
-};
 function emitLifecycle(idPrefix) {
-  const tag = LIFECYCLE_TAGS[idPrefix] ?? `[${idPrefix.replace(/^system_/, "").toUpperCase()}]`;
-  statusLine.write(tag);
+  statusLine.write(tagForLifecycle(idPrefix));
 }
 function shutdown(reason) {
   if (shuttingDown)

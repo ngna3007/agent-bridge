@@ -1398,6 +1398,46 @@ class StatusLineWriter {
   }
 }
 
+// src/lifecycle-tags.ts
+var C_RESET = "\x1B[0m";
+var C_GREEN = "\x1B[32m";
+var C_YELLOW = "\x1B[33m";
+var C_RED = "\x1B[31m";
+var C_DIM = "\x1B[2m";
+var wrap = (c, s) => `${c}${s}${C_RESET}`;
+var BRIDGE_STOPPED_TAG = wrap(C_DIM, "[BRIDGE STOPPED]");
+var LIFECYCLE_TAGS = {
+  system_tui_kickoff: wrap(C_GREEN, "[CODEX READY]"),
+  system_daemon_disconnected: wrap(C_RED, "[BRIDGE OFFLINE]"),
+  system_daemon_reconnected: wrap(C_GREEN, "[CODEX READY]"),
+  system_bridge_ready: wrap(C_GREEN, "[BRIDGE READY]"),
+  system_daemon_connect_failed: wrap(C_RED, "[BRIDGE FAILED]"),
+  system_bridge_evicted: wrap(C_RED, "[REPLACED BY NEWER SESSION]"),
+  system_bridge_probe_in_progress: wrap(C_YELLOW, "[RECONNECTING]"),
+  system_bridge_replaced: wrap(C_RED, "[ANOTHER SESSION ACTIVE]"),
+  system_bridge_disabled: BRIDGE_STOPPED_TAG,
+  system_bridge_auto_recovery_gave_up: wrap(C_RED, "[RECONNECT FAILED]"),
+  system_bridge_recovered: wrap(C_GREEN, "[CODEX READY]"),
+  system_ready: wrap(C_GREEN, "[CODEX READY]"),
+  system_waiting: wrap(C_YELLOW, "[WAITING FOR CODEX]"),
+  system_codex_start_failed: wrap(C_RED, "[CODEX FAILED]"),
+  system_turn_started: wrap(C_YELLOW, "[CODEX THINKING]"),
+  system_turn_completed: wrap(C_GREEN, "[CODEX READY]"),
+  system_reply_missing: wrap(C_RED, "[CODEX NO REPLY]"),
+  system_tui_disconnected: wrap(C_YELLOW, "[CODEX UI OFFLINE]"),
+  system_tui_reconnected: wrap(C_GREEN, "[CODEX READY]")
+};
+var DAEMON_LIFECYCLE_IDS = new Set([
+  "system_ready",
+  "system_waiting",
+  "system_codex_start_failed",
+  "system_turn_started",
+  "system_turn_completed",
+  "system_reply_missing",
+  "system_tui_disconnected",
+  "system_tui_reconnected"
+]);
+
 // src/message-filter.ts
 var MARKER_REGEX = /^\s*\[(REPLY|IMPORTANT|STATUS|FYI)\]\s*/i;
 function parseMarker(content) {
@@ -2624,7 +2664,7 @@ function shutdown(reason) {
     return;
   shuttingDown = true;
   log(`Shutting down daemon (${reason})...`);
-  daemonStatusLine.write("\x1B[2m[BRIDGE STOPPED]\x1B[0m");
+  daemonStatusLine.write(BRIDGE_STOPPED_TAG);
   tuiConnectionState.dispose(`daemon shutdown (${reason})`);
   clearPendingClaudeDisconnect(`daemon shutdown (${reason})`);
   controlServer?.stop();

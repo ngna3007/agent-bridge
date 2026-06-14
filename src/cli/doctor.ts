@@ -18,14 +18,13 @@
 
 import { readFileSync, existsSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { StateDirResolver } from "../state-dir";
 import { ConfigService } from "../config-service";
-import { resolveProject } from "../project-id";
 import {
   findPidsByListenPort,
   findOrphanBridgeServers,
   isPidAlive,
 } from "../process-helpers";
+import { resolveRuntimeNamespace } from "../runtime-namespace";
 
 interface Finding {
   severity: "info" | "warn" | "error";
@@ -36,25 +35,37 @@ interface Finding {
 export async function runDoctor() {
   const findings: Finding[] = [];
 
+  // Read-only: resolveRuntimeNamespace gives us the same state dir
+  // the runtime would actually use, so the doctor's checks match the
+  // bridge's view instead of always landing on the platform default.
+  const ns = resolveRuntimeNamespace({ mutateEnv: false });
+  const project = ns.project;
+  const stateDir = ns.stateDir;
+  const dir = stateDir.dir;
+
   // ---- Project + namespace ----
-  const project = resolveProject();
   if (project) {
     findings.push({
       severity: "info",
       message: `Project ${project.projectId} at ${project.rootPath}`,
     });
-    // Cross-check config.json ports vs derived.
+    // Cross-check config.json ports vs derived (BOTH appPort and
+    // proxyPort - a half-drift used to pass silently).
     try {
       const cs = new ConfigService(project.rootPath);
       const cfg = cs.load();
       if (cfg) {
-        if (cfg.codex.appPort !== project.ports.codexWs) {
+        const appMismatch = cfg.codex.appPort !== project.ports.codexWs;
+        const proxyMismatch = cfg.codex.proxyPort !== project.ports.codexProxy;
+        if (appMismatch || proxyMismatch) {
+          const expected = `appPort=${project.ports.codexWs}, proxyPort=${project.ports.codexProxy}`;
+          const got = `appPort=${cfg.codex.appPort}, proxyPort=${cfg.codex.proxyPort}`;
           findings.push({
             severity: "warn",
             message:
-              `config.json codex.appPort=${cfg.codex.appPort} differs from project-derived ${project.ports.codexWs}`,
+              `config.json codex ports drift from project-derived (expected ${expected}, got ${got})`,
             fix:
-              `Edit ${cs.configFilePath} and set codex.appPort=${project.ports.codexWs} / codex.proxyPort=${project.ports.codexProxy}, or rerun \`abg init\` after deleting .agentbridge/config.json.`,
+              `Edit ${cs.configFilePath} to match the derived values, or rerun \`abg init\` after deleting .agentbridge/config.json.`,
           });
         }
       }
@@ -69,8 +80,6 @@ export async function runDoctor() {
   }
 
   // ---- State dir + daemon pid ----
-  const stateDir = new StateDirResolver();
-  const dir = stateDir.dir;
   findings.push({
     severity: "info",
     message: `State dir: ${dir}`,

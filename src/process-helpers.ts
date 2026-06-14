@@ -18,11 +18,17 @@ import { join } from "node:path";
 
 /**
  * Return the pids of processes whose environment contains
- * `<envKey>=<envValue>` exactly. Empty array on any error.
+ * `<envKey>=<envValue>` as an EXACT entry. Empty array on any error.
+ *
+ * The match is on a full NUL-delimited env entry, NOT a substring of
+ * the raw env blob - the previous substring implementation could
+ * match e.g. `OLD_AGENTBRIDGE_STATE_DIR=/x` when we asked for
+ * `AGENTBRIDGE_STATE_DIR=/x`.
  *
  * Linux path: walks /proc/<pid>/environ (NUL-separated env). Fast
  * (no fork) and works without ps. macOS path: `ps -Eo pid,command`,
- * which prepends the env to the command line.
+ * which prepends the env to the command line as space-separated
+ * tokens.
  */
 export function findPidsByEnv(envKey: string, envValue: string): number[] {
   const pids: number[] = [];
@@ -35,9 +41,10 @@ export function findPidsByEnv(envKey: string, envValue: string): number[] {
         const pid = parseInt(name, 10);
         try {
           const env = readFileSync(`/proc/${pid}/environ`, "utf-8");
-          // /proc/<pid>/environ is NUL-separated. A literal includes
-          // check still works because the needle never contains NUL.
-          if (env.includes(needle)) pids.push(pid);
+          // /proc/<pid>/environ is a NUL-delimited list of
+          // KEY=VALUE entries; split on \0 and compare each entry
+          // exactly so a suffixed env key cannot false-match.
+          if (env.split("\0").includes(needle)) pids.push(pid);
         } catch {
           // pid disappeared, or no permission - skip
         }
@@ -49,18 +56,41 @@ export function findPidsByEnv(envKey: string, envValue: string): number[] {
   }
 
   try {
-    // macOS / fallback. -E includes env on each process.
+    // macOS / fallback. -E prepends env tokens space-separated. Match
+    // on whole tokens by anchoring the needle between whitespace.
     const output = execFileSync("ps", ["-Eo", "pid=,command="], { encoding: "utf-8" });
     for (const line of output.split("\n")) {
       const m = line.match(/^\s*(\d+)\s+(.+)$/);
       if (!m) continue;
-      if (!m[2].includes(needle)) continue;
+      const tokens = m[2].split(/\s+/);
+      if (!tokens.includes(needle)) continue;
       pids.push(parseInt(m[1], 10));
     }
   } catch {
     /* ps absent or refused - return what we have (possibly empty) */
   }
   return pids;
+}
+
+/**
+ * Read the command line of `pid` as a single string. Returns null
+ * when not available. Linux uses /proc/<pid>/cmdline; macOS falls
+ * back to `ps -p`.
+ */
+export function getCommandLine(pid: number): string | null {
+  if (existsSync(`/proc/${pid}/cmdline`)) {
+    try {
+      // cmdline is NUL-separated; collapse to space for matching.
+      return readFileSync(`/proc/${pid}/cmdline`, "utf-8").replace(/\0+/g, " ").trim();
+    } catch {
+      return null;
+    }
+  }
+  try {
+    return execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf-8" }).trim();
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -131,17 +161,31 @@ export function getParentPid(pid: number): number | null {
 /**
  * Return pids of running bridge-server.js processes whose
  * AGENTBRIDGE_STATE_DIR env points at `stateDir` AND whose parent
- * process is no longer alive. The parent-dead test is what makes
- * this an "orphan": a still-attached bridge-server has its Claude
- * Code parent alive, and killing it would stomp on a legitimate
- * session.
+ * process is no longer alive AND whose command line names
+ * bridge-server. The three filters together are what makes this
+ * specifically the orphaned MCP frontend:
+ *
+ * - Env match alone is not enough: the daemon itself is launched
+ *   with the same AGENTBRIDGE_STATE_DIR (daemon-lifecycle.ts
+ *   spawns it that way), so without the command-line filter a
+ *   detached daemon that lost its parent would be misclassified
+ *   as a bridge-server orphan and get killed. Codex's child
+ *   processes can inherit the same env too.
+ * - Parent-alive check excludes a healthy attached bridge.
+ * - Command-line filter excludes the daemon and codex children.
  */
 export function findOrphanBridgeServers(stateDir: string): number[] {
   const candidates = findPidsByEnv("AGENTBRIDGE_STATE_DIR", stateDir);
   const orphans: number[] = [];
   for (const pid of candidates) {
+    // Must look like a bridge-server process - reject the daemon
+    // and codex child processes that share the env.
+    const cmd = getCommandLine(pid) ?? "";
+    if (!cmd.includes("bridge-server")) continue;
+    if (cmd.includes("daemon.js")) continue; // belt-and-suspenders
+    if (cmd.includes("codex")) continue;
+
     const ppid = getParentPid(pid);
-    // No parent info available -> conservative: leave it alone.
     if (ppid === null) continue;
     // pid 1 (init) inherits orphans on Linux. That IS the orphan
     // signature - the original parent died and init took over.

@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { StateDirResolver } from "../state-dir";
-import { resolveProject } from "../project-id";
+import { resolveRuntimeNamespace } from "../runtime-namespace";
+import { isPidAlive } from "../process-helpers";
 
 interface DaemonStatusFile {
   proxyUrl?: string;
@@ -17,8 +17,12 @@ interface DaemonStatusFile {
  * my session attach?".
  */
 export async function runStatus() {
-  const project = resolveProject();
-  const stateDir = new StateDirResolver();
+  // Read-only: we never mutate env here. resolveRuntimeNamespace
+  // returns the same stateDir the runtime would use, including the
+  // per-project subdir when .agentbridge/ is set up.
+  const ns = resolveRuntimeNamespace({ mutateEnv: false });
+  const project = ns.project;
+  const stateDir = ns.stateDir;
 
   console.log("AgentBridge status\n");
 
@@ -50,7 +54,7 @@ export async function runStatus() {
 
   const pidStr = readIfExists(pidPath);
   const pid = pidStr ? parseInt(pidStr, 10) : null;
-  if (pid && isProcessAlive(pid)) {
+  if (pid && isPidAlive(pid)) {
     console.log(`  status      running (pid ${pid})`);
   } else if (pid) {
     console.log(`  status      stale pid ${pid} (process is gone; run \`abg kill\` to clean up)`);
@@ -107,12 +111,3 @@ function readIfExists(path: string): string | null {
   }
 }
 
-function isProcessAlive(pid: number): boolean {
-  try {
-    // Signal 0: no-op except permission check. Throws ESRCH if dead.
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
