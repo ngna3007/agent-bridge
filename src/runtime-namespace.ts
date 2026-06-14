@@ -65,10 +65,16 @@ export function resolveRuntimeNamespace(opts: RuntimeNamespaceOptions = {}): Run
   // Compute the platform-default root WITHOUT inheriting any
   // pre-existing AGENTBRIDGE_STATE_DIR, then re-instantiate the
   // resolver to take env-driven nesting into account afterwards.
+  // try/finally so a future StateDirResolver change that throws
+  // can't leak the temporary `delete` into the caller's env.
   const prevStateDir = process.env.AGENTBRIDGE_STATE_DIR;
   delete process.env.AGENTBRIDGE_STATE_DIR;
-  const baseStateDir = new StateDirResolver().dir;
-  if (prevStateDir !== undefined) process.env.AGENTBRIDGE_STATE_DIR = prevStateDir;
+  let baseStateDir: string;
+  try {
+    baseStateDir = new StateDirResolver().dir;
+  } finally {
+    if (prevStateDir !== undefined) process.env.AGENTBRIDGE_STATE_DIR = prevStateDir;
+  }
 
   if (opts.mutateEnv && project) {
     // Write the project-derived defaults into env so downstream

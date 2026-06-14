@@ -156,7 +156,7 @@ export async function runDoctor() {
     candidates.add(projectPorts.codexProxy);
     candidates.add(projectPorts.control);
   }
-  candidates.add(parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10));
+  candidates.add(ns.controlPort);
   for (const port of candidates) {
     const pids = findPidsByListenPort(port);
     if (pids.length === 0) continue;
