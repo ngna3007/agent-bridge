@@ -32,10 +32,12 @@ export const PLUGIN_NAME = "agentbridge";
  */
 function maybeApplyProjectNamespace(cmd: string | undefined): void {
   if (!cmd) return;
-  // init/dev/--help/--version run in "no project yet" mode; honoring
-  // an ancestor marker would create surprising port assignments
-  // during onboarding. Apply the namespace only for the runtime
-  // commands that actually launch or stop the daemon.
+  // init/dev/--help/--version/status run in "no project yet" mode;
+  // honoring an ancestor marker would create surprising port
+  // assignments during onboarding. Apply the namespace only for the
+  // runtime commands that actually launch or stop the daemon.
+  // (`status` resolves the project itself for read-only display, so
+  // it does not need its env mutated here.)
   const namespaced = new Set(["claude", "codex", "kill"]);
   if (!namespaced.has(cmd)) return;
 
@@ -47,6 +49,15 @@ function maybeApplyProjectNamespace(cmd: string | undefined): void {
   // the platform default). applyProjectEnv then nests under it.
   const baseStateDir = new StateDirResolver().dir;
   applyProjectEnv(project, baseStateDir);
+
+  // One-line startup banner so the user can see at a glance which
+  // project this terminal is talking to. Stays out of automation
+  // (NO_COLOR / non-TTY skipped).
+  if (process.stdout.isTTY) {
+    process.stderr.write(
+      `[abg] project ${project.projectId} · ports ${project.ports.codexWs}/${project.ports.codexProxy}/${project.ports.control} · ${project.rootPath}\n`,
+    );
+  }
 }
 
 async function main() {
@@ -73,6 +84,10 @@ async function main() {
       const { runKill } = await import("./cli/kill");
       await runKill();
       break;
+    case "status":
+      const { runStatus } = await import("./cli/status");
+      await runStatus();
+      break;
     case "--help":
     case "-h":
     case undefined:
@@ -98,23 +113,32 @@ Usage:
   abg <command> [args...]
 
 Commands:
-  init              Install plugin, check dependencies, generate project config
+  init              First-time per-project setup: install plugin, check deps,
+                    generate .agentbridge/config.json with per-project ports
   dev               Register local marketplace + install plugin (for local dev)
   claude [args...]  Start Claude Code with push channel enabled
   codex [args...]   Start Codex TUI connected to AgentBridge daemon
-  kill              Force kill all AgentBridge processes
+  kill              Stop daemon + managed Codex TUI for the current project
+  status            Report project info, daemon state, ports (read-only)
 
 Options:
   --help, -h        Show this help message
   --version, -v     Show version
 
+Multi-project:
+  Run \`abg init\` inside each project root. Each project gets its own
+  port triple (derived from the project path) and its own daemon slot.
+  Without an .agentbridge/ marker in cwd or its ancestors, abg falls
+  back to the historical single-instance mode (ports 4500/4501/4502).
+
 Examples:
-  abg init                     # First-time setup
-  abg claude                   # Start Claude Code
-  abg claude --resume          # Start Claude Code and resume session
+  abg init                     # First-time setup, in this project root
+  abg claude                   # Start Claude Code in this project
+  abg claude --resume          # ... and resume the last session
   abg codex                    # Start Codex TUI
-  abg codex --model o3         # Start Codex with specific model
-  abg kill                     # Emergency: kill all processes
+  abg codex --model o3         # ... with a specific model
+  abg status                   # See which project + daemon is active here
+  abg kill                     # Stop the daemon for this project
 `.trim());
 }
 

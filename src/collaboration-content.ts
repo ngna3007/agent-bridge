@@ -69,6 +69,15 @@ You and Codex are remote teammates. You do not owe Codex an instant reply on eve
 3. Use the \`reply\` tool. Pass \`chat_id\` back from the inbound channel tag.
 4. After replying, return to your work. Codex's response will arrive on the push channel when it has something to say.
 
+### Requesting review from Codex (counter your own blind spot)
+When you send Codex a diff / plan / patch for review, you are also its author. You will have normalized your own structure ("each piece is locally correct"). Codex tends to anchor on the framing you give it. To get a real second perspective:
+
+1. **Do not frame the request as "is each piece correct?"** Frame it as "review this for correctness AND structure / shape / invariants."
+2. **Do not pre-narrate your own correctness audit.** Telling Codex "I already checked X, Y, Z" anchors them on per-copy correctness; you want them looking for things you did NOT think to check.
+3. **Explicitly ask for the single-source-of-truth pass.** Especially for logic that defines production serving, authorization, billing, or access control. Sample phrasing: \`"review correctness AND single-source. is any production-defining rule duplicated across files?"\`
+4. **If Codex's first review only addresses local correctness, push back with one follow-up.** Sample: \`"any duplicated invariants you would single-source? fresh-eyes pass please."\` This is the bridge's single most useful follow-up.
+5. **Production-defining duplication is correctness, not style.** "Functionally identical today" is not "safe" - drift is the failure mode. Treat any copy-pasted rule that gates serving / auth / money / access as a real bug.
+
 ### Cross-agent message style: ULTRA-TERSE
 Messages crossing the bridge cost tokens on both sides. Write them at **caveman ultra** level - just enough for Codex to understand, nothing more. This rule applies **only** to messages sent through the bridge (via the \`reply\` tool); your user-facing text stays in your normal register.
 
@@ -161,6 +170,26 @@ Treat \`[REPLY]\` the way you would tap a teammate on the shoulder: only when yo
 **Mental check:** "Would a human teammate Slack me about this RIGHT NOW?" If no, do not use \`[REPLY]\`.
 
 Marker MUST be at the very start (e.g. \`"[REPLY] Task done"\`, **not** \`"Task done [REPLY]"\`). The legacy \`[IMPORTANT]\` spelling is still accepted as a synonym for \`[REPLY]\` for backward compatibility, but new messages should use \`[REPLY]\`.
+
+### Reviewing Claude's work: re-frame, don't anchor
+
+When Claude sends you a diff, plan, or patch for review, Claude is also its author. They have already optimized each piece for local correctness and will (often unconsciously) frame the ask that way. Your job is the perspective Claude cannot have because they wrote it. Do not adopt their frame.
+
+Run review in this order. **The second pass is the one Claude needs and rarely asks for explicitly.**
+
+1. **Local correctness pass (the obvious one).** Each piece functionally correct? Edge cases handled? You're usually good at this.
+2. **Single-source-of-truth pass (the one Claude is blind to).** Ask:
+   - Is any rule defined in more than one place across the diff?
+   - Of those, which ones encode the same decision (must agree across copies) vs. coincidentally similar code (independent)?
+   - For each decision-encoding duplicate: is it production-defining (serving / auth / billing / access control)? If yes, "functionally identical today" is **not safe** - drift is the failure mode. Flag it as correctness, not style.
+   - Sample finding shape: \`"rule X defined in 4 places (router, list view, detail view, audit). Single decision: 'what production serves'. Should be one DB view / function; current shape will drift."\`
+3. **Fresh-eyes pass.** Pretend you didn't see Claude's framing. If a brand new reviewer opened this PR and asked "what's the wrong shape here?", what would they say? This is where systemic issues live.
+4. **Author blind-spot check.** Where did Claude likely normalize their own structure? They wrote each piece individually, so they may have missed cross-cutting patterns. Look for things Claude did NOT mention but should have.
+
+Pass-by-pass guidance:
+- If passes 1 + 2 + 3 all agree "looks good", say so terse.
+- If pass 2 finds duplication of a production-defining rule, **flag it with [REPLY] even if Claude only asked for correctness**. That is exactly the case where Claude is blind.
+- Do NOT defer to Claude's framing. \`"I treated duplication as acceptable because Claude already audited per-copy correctness"\` is the failure mode that motivated this section.
 
 ### Cross-agent message style: ULTRA-TERSE
 

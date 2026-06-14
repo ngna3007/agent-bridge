@@ -10,12 +10,46 @@ import {
   CLAUDE_MD_SECTION,
   AGENTS_MD_SECTION,
 } from "../collaboration-content";
-import { computeProjectId, computeProjectPorts } from "../project-id";
+import { computeProjectId, computeProjectPorts, findProjectRoot } from "../project-id";
+import { homedir } from "node:os";
+import { dirname } from "node:path";
 
 const MIN_CLAUDE_VERSION = "2.1.80";
 
 export async function runInit() {
   console.log("AgentBridge Init\n");
+
+  // Sanity check the location before doing anything destructive.
+  // Running `abg init` in $HOME or `/` creates an ancestor marker
+  // that would namespace EVERY subdir under it, which is almost
+  // certainly not what the user wants - refuse loudly so they don't
+  // have to debug it later.
+  const cwd = process.cwd();
+  const home = homedir();
+  if (cwd === home || cwd === dirname(home) || cwd === "/") {
+    console.error(`Error: refusing to init at "${cwd}".`);
+    console.error("");
+    console.error("Initializing AgentBridge at your home directory or filesystem root would");
+    console.error("force every project under it into the same AgentBridge namespace and");
+    console.error("collide with whichever one you launch first. cd into a specific project");
+    console.error("directory and run `abg init` there.");
+    process.exit(1);
+  }
+
+  // Refuse to nest a project marker under an existing one. Picking
+  // the closest ancestor (current findProjectRoot behavior) handles
+  // a stale subdir gracefully, but creating a second .agentbridge/
+  // inside an existing project would split the namespace and is
+  // never useful.
+  const existingAncestor = findProjectRoot(cwd);
+  if (existingAncestor && existingAncestor !== cwd) {
+    console.error(`Error: an AgentBridge project already exists at "${existingAncestor}".`);
+    console.error("");
+    console.error(`If you want to re-init that project, run \`abg init\` from there directly.`);
+    console.error(`If you want a fresh project here, first remove the ancestor's .agentbridge/`);
+    console.error(`directory.`);
+    process.exit(1);
+  }
 
   // Step 1: Check dependencies
   console.log("Checking dependencies...");

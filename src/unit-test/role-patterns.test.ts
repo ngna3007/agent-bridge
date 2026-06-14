@@ -31,6 +31,27 @@ describe("role-aware collaboration guidance", () => {
     expect(BRIDGE_CONTRACT_REMINDER).toContain("Arrows for causality");
   });
 
+  test("bridge contract reminder includes the review framing passes", () => {
+    // Pin the prose lifted from the ENG-1990 Phase 3 post-mortem -
+    // two AI reviewers anchored on per-copy correctness and missed a
+    // production-defining rule that lived in 4 places.
+    expect(BRIDGE_CONTRACT_REMINDER).toContain("Review framing");
+    expect(BRIDGE_CONTRACT_REMINDER).toContain("Single source of truth");
+    expect(BRIDGE_CONTRACT_REMINDER).toContain("Fresh-eyes pass");
+    expect(BRIDGE_CONTRACT_REMINDER).toContain("Author blind-spot");
+    expect(BRIDGE_CONTRACT_REMINDER).toContain("production-defining");
+    expect(BRIDGE_CONTRACT_REMINDER).toContain("drift is the failure mode");
+  });
+
+  test("CLAUDE_INSTRUCTIONS teaches Claude to counter the author blind spot when requesting review", () => {
+    expect(CLAUDE_INSTRUCTIONS).toContain("Requesting review from Codex");
+    expect(CLAUDE_INSTRUCTIONS).toContain("author blind spot");
+    expect(CLAUDE_INSTRUCTIONS).toContain("single-source-of-truth pass");
+    // The push-back follow-up that's most likely to flip the frame
+    // when Codex anchored on local correctness.
+    expect(CLAUDE_INSTRUCTIONS).toContain("fresh-eyes pass");
+  });
+
   test("bridge contract reminder specifies marker must be at start", () => {
     expect(BRIDGE_CONTRACT_REMINDER).toContain("MUST be the first text");
   });
