@@ -14,6 +14,8 @@
  *     pinned AGENTS.md should suffice.
  *   - Mismatched ports between .agentbridge/config.json and the
  *     project-id derivation.
+ *   - A role file that has drifted from the section it renders into,
+ *     or that stopped explaining the routing markers.
  */
 
 import { readFileSync, existsSync, statSync } from "node:fs";
@@ -25,11 +27,102 @@ import {
   isPidAlive,
 } from "../process-helpers";
 import { resolveRuntimeNamespace } from "../runtime-namespace";
+import {
+  ROLE_AGENTS,
+  RoleFileError,
+  missingRoutingMarkers,
+  readRoleText,
+  roleFilePath,
+  syncRoleSections,
+} from "../roles";
 
 interface Finding {
   severity: "info" | "warn" | "error";
   message: string;
   fix?: string;
+}
+
+/**
+ * Report on the role files and the sections they render into.
+ *
+ * Dry-run only — the doctor never repairs. Drift is worth naming
+ * because it means a currently-running agent is on stale instructions:
+ * the launcher re-renders at startup, so an edit made mid-session does
+ * not reach the agent until it restarts.
+ */
+function checkRoles(projectRoot: string): Finding[] {
+  const findings: Finding[] = [];
+
+  for (const agent of ROLE_AGENTS) {
+    const rolePath = roleFilePath(projectRoot, agent);
+    const relRole = rolePath.startsWith(projectRoot)
+      ? rolePath.slice(projectRoot.length + 1)
+      : rolePath;
+
+    if (!existsSync(rolePath)) {
+      findings.push({
+        severity: "info",
+        message: `${relRole} missing - ${agent} runs on the built-in default role`,
+        fix: `Fine if that is what you want. \`abg roles edit ${agent}\` writes the default to a file you can then change.`,
+      });
+      continue;
+    }
+
+    let outcomes;
+    try {
+      outcomes = syncRoleSections(projectRoot, { dryRun: true, agents: [agent] });
+    } catch (err) {
+      findings.push({
+        severity: "error",
+        message: err instanceof RoleFileError ? err.message.split("\n")[0] : String(err),
+        fix: `Write the role text you want in ${relRole}, or delete the file to fall back to the built-in default.`,
+      });
+      continue;
+    }
+
+    for (const outcome of outcomes) {
+      const relFile = outcome.file.startsWith(projectRoot)
+        ? outcome.file.slice(projectRoot.length + 1)
+        : outcome.file;
+      if (outcome.status === "skipped") {
+        findings.push({
+          severity: "error",
+          message: `${relFile}: cannot render role section - ${outcome.detail}`,
+          fix: `Repair the AgentBridge markers in ${relFile}, then rerun.`,
+        });
+      } else if (outcome.status === "unchanged") {
+        findings.push({
+          severity: "info",
+          message: `${relFile} role section matches ${relRole}`,
+        });
+      } else {
+        findings.push({
+          severity: "warn",
+          message: `${relFile} role section is out of date with ${relRole} (would be ${outcome.status})`,
+          fix: `Restart the agent (\`abg ${agent}\`) - it re-renders the section on launch. A running ${agent} session is still on the old text.`,
+        });
+      }
+    }
+
+    // A customized role that no longer explains the markers is legal
+    // but usually accidental - the symptom shows up much later as
+    // "the bridge stopped delivering".
+    try {
+      const role = readRoleText(projectRoot, agent);
+      const missing = role.fromDefault ? [] : missingRoutingMarkers(role.text, agent);
+      if (missing.length > 0) {
+        findings.push({
+          severity: "warn",
+          message: `${relRole} never mentions ${missing.join(" ")}`,
+          fix: `${agent} may stop tagging its messages, which sends them all to the pull queue. Re-add the marker rules, or \`abg roles reset ${agent}\` to start from the default again.`,
+        });
+      }
+    } catch {
+      /* already reported above */
+    }
+  }
+
+  return findings;
 }
 
 export async function runDoctor() {
@@ -72,6 +165,8 @@ export async function runDoctor() {
     } catch {
       /* ignore */
     }
+
+    findings.push(...checkRoles(project.rootPath));
   } else {
     findings.push({
       severity: "info",

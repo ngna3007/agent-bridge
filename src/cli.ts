@@ -98,6 +98,14 @@ async function main() {
       const { runDoctor } = await import("./cli/doctor");
       await runDoctor();
       break;
+    case "roles":
+      const { runRoles, printRolesHelp } = await import("./cli/roles-cmd");
+      if (restArgs[0] === "--help" || restArgs[0] === "-h") {
+        printRolesHelp();
+      } else {
+        await runRoles(restArgs);
+      }
+      break;
     case "--help":
     case "-h":
     case undefined:
@@ -130,6 +138,8 @@ Commands:
   codex [args...]   Start Codex TUI connected to AgentBridge daemon
   kill [--all]      Stop daemon + managed Codex TUI for the current project
                     (or every project when --all is passed)
+  roles [sub]       Show or edit what each agent is told it is
+                    (list | edit <agent> | apply | reset <agent> | path <agent>)
   status            Report project info, daemon state, ports (read-only)
   projects          List every project state dir + its daemon state
   doctor            Diagnose stuck or surprising state, suggest fixes
@@ -146,12 +156,21 @@ Multi-project:
   falls back to the shared single-instance mode (ports 4500/4501/4502).
   Set AGENTBRIDGE_AUTO_SETUP=0 to suppress the offer entirely.
 
+Agent roles:
+  Setup seeds .agentbridge/roles/claude.md and .agentbridge/roles/codex.md
+  with the built-in defaults and never overwrites them again. The file body
+  is the role text — plain prose, no format. Edit one and restart that
+  agent; \`abg claude\` / \`abg codex\` re-render the matching section of
+  CLAUDE.md / AGENTS.md on launch. \`abg roles\` shows the current state.
+
 Examples:
   abg init                     # First-time setup, in this project root
   abg claude                   # Start Claude Code in this project
   abg claude --resume          # ... and resume the last session
   abg codex                    # Start Codex TUI
   abg codex --model o3         # ... with a specific model
+  abg roles                    # See what each agent is told it is
+  abg roles edit codex         # Rewrite Codex's role in \$EDITOR
   abg status                   # See which project + daemon is active here
   abg kill                     # Stop the daemon for this project
 `.trim());

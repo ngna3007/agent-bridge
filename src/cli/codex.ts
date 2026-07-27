@@ -15,6 +15,7 @@ import { DaemonLifecycle } from "../daemon-lifecycle";
 import { StderrRingBuffer } from "../stderr-ring-buffer";
 import { getRotatingLogger } from "../log-rotator";
 import { checkOwnedFlagConflicts } from "./claude";
+import { syncRolesForLaunch } from "./role-sync";
 
 /**
  * Write a timestamped entry to the codex wrapper log.
@@ -146,6 +147,11 @@ export async function runCodex(args: string[]) {
       process.exit(1);
     }
   }
+
+  // Re-render AGENTS.md's marked section from .agentbridge/roles/codex.md.
+  // Before the daemon starts: an unusable role file should abort the
+  // launch without leaving a daemon behind.
+  syncRolesForLaunch("codex");
 
   const stateDir = new StateDirResolver();
   const configService = new ConfigService();
