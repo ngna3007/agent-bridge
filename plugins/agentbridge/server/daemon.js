@@ -1452,9 +1452,9 @@ function parseMarker(content) {
   };
 }
 function classifyMessage(content, mode) {
-  if (mode === "full")
-    return { action: "forward", marker: "untagged" };
   const { marker } = parseMarker(content);
+  if (mode === "full")
+    return { action: "forward", marker };
   switch (marker) {
     case "reply":
       return { action: "forward", marker };
@@ -2149,7 +2149,7 @@ codex.on("agentMessage", (msg) => {
   if (replyRequired && result.marker === "reply") {
     replyReceivedDuringTurn = true;
   }
-  if (inAttentionWindow && result.marker === "status") {
+  if (FILTER_MODE !== "full" && inAttentionWindow && result.marker === "status") {
     log(`Codex \u2192 Claude [${result.marker}/buffer-attention] (${msg.content.length} chars)`);
     statusBuffer.add(msg);
     return;
