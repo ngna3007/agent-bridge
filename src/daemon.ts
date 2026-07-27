@@ -158,8 +158,11 @@ codex.on("agentMessage", (msg: BridgeMessage) => {
     replyReceivedDuringTurn = true;
   }
 
-  // During attention window, suppress STATUS to give Claude space to respond
-  if (inAttentionWindow && result.marker === "status") {
+  // During attention window, suppress STATUS to give Claude space to respond.
+  // Skipped in full mode: full mode's contract is "forward everything", and
+  // classifyMessage now reports the real marker there, so without this guard
+  // a [STATUS] message would start getting buffered instead of forwarded.
+  if (FILTER_MODE !== "full" && inAttentionWindow && result.marker === "status") {
     log(`Codex → Claude [${result.marker}/buffer-attention] (${msg.content.length} chars)`);
     statusBuffer.add(msg);
     return;

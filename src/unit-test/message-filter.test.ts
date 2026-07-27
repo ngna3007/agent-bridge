@@ -5,6 +5,7 @@ import {
   classifyMessage,
   parseMarker,
 } from "../message-filter";
+import type { FilterMode } from "../message-filter";
 import type { BridgeMessage } from "../types";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -84,8 +85,92 @@ describe("classifyMessage", () => {
   });
 
   test("forwards everything in full mode", () => {
-    expect(classifyMessage("[FYI] x", "full")).toEqual({ action: "forward", marker: "untagged" });
-    expect(classifyMessage("[STATUS] x", "full")).toEqual({ action: "forward", marker: "untagged" });
+    for (const content of ["[REPLY] x", "[IMPORTANT] x", "[STATUS] x", "[FYI] x", "plain"]) {
+      expect(classifyMessage(content, "full").action).toBe("forward");
+    }
+  });
+});
+
+describe("classifyMessage — full mode preserves marker identity (regression)", () => {
+  // Regression: full mode used to return a hard-coded `marker: "untagged"`,
+  // discarding what parseMarker had found. Full mode is a *routing* switch
+  // ("forward everything"), but the marker is also read for *semantics*:
+  // daemon.ts gates require_reply satisfaction on `result.marker === "reply"`.
+  // Erasing the marker meant a correctly-tagged [REPLY] never set
+  // replyReceivedDuringTurn, so every require_reply turn in full mode ended
+  // with a spurious system_reply_missing warning to Claude.
+
+  test("reports the parsed marker, not untagged", () => {
+    expect(classifyMessage("[REPLY] x", "full")).toEqual({ action: "forward", marker: "reply" });
+    expect(classifyMessage("[STATUS] x", "full")).toEqual({ action: "forward", marker: "status" });
+    expect(classifyMessage("[FYI] x", "full")).toEqual({ action: "forward", marker: "fyi" });
+    expect(classifyMessage("plain", "full")).toEqual({ action: "forward", marker: "untagged" });
+  });
+
+  test("legacy [IMPORTANT] resolves to reply in full mode too", () => {
+    expect(classifyMessage("[IMPORTANT] x", "full")).toEqual({ action: "forward", marker: "reply" });
+  });
+
+  test("marker matches parseMarker in both modes", () => {
+    // The mode must never change *what a message is*, only where it goes.
+    for (const content of ["[REPLY] x", "[STATUS] x", "[FYI] x", "plain"]) {
+      const expected = parseMarker(content).marker;
+      expect(classifyMessage(content, "full").marker).toBe(expected);
+      expect(classifyMessage(content, "filtered").marker).toBe(expected);
+    }
+  });
+});
+
+describe("daemon reply-tracking decision rules (mirrors src/daemon.ts)", () => {
+  // daemon.ts binds ports at import time, so it cannot be imported into a
+  // unit test. These predicates are transcribed from the agentMessage
+  // handler; they exist to pin the daemon-visible consequence of the
+  // classifyMessage contract above. Same precedent as pin-contract.test.ts.
+
+  /** src/daemon.ts: `if (replyRequired && result.marker === "reply")` */
+  function replySatisfiedBy(contents: string[], mode: FilterMode): boolean {
+    return contents.some((c) => classifyMessage(c, mode).marker === "reply");
+  }
+
+  /** src/daemon.ts: `if (FILTER_MODE !== "full" && inAttentionWindow && result.marker === "status")` */
+  function suppressedByAttentionWindow(
+    content: string,
+    mode: FilterMode,
+    inAttentionWindow: boolean,
+  ): boolean {
+    return mode !== "full" && inAttentionWindow && classifyMessage(content, mode).marker === "status";
+  }
+
+  test("a [REPLY] satisfies require_reply in full mode", () => {
+    // This is the bug: it returned false before the fix, so the daemon
+    // emitted system_reply_missing even though Codex did reply.
+    expect(replySatisfiedBy(["[REPLY] done, LGTM"], "full")).toBe(true);
+  });
+
+  test("a [REPLY] satisfies require_reply in filtered mode", () => {
+    expect(replySatisfiedBy(["[REPLY] done, LGTM"], "filtered")).toBe(true);
+  });
+
+  test("non-reply traffic does not satisfy require_reply in either mode", () => {
+    const noise = ["[STATUS] running tests", "[FYI] fyi", "thinking out loud"];
+    expect(replySatisfiedBy(noise, "full")).toBe(false);
+    expect(replySatisfiedBy(noise, "filtered")).toBe(false);
+  });
+
+  test("a [REPLY] among noise still satisfies require_reply in full mode", () => {
+    expect(replySatisfiedBy(["[STATUS] a", "[REPLY] b", "[FYI] c"], "full")).toBe(true);
+  });
+
+  test("full mode never suppresses STATUS during the attention window", () => {
+    // Guard on the fix: preserving the marker must not leak filtered-mode
+    // buffering into full mode, whose contract is to forward everything.
+    expect(suppressedByAttentionWindow("[STATUS] x", "full", true)).toBe(false);
+  });
+
+  test("filtered mode still suppresses STATUS during the attention window", () => {
+    expect(suppressedByAttentionWindow("[STATUS] x", "filtered", true)).toBe(true);
+    expect(suppressedByAttentionWindow("[STATUS] x", "filtered", false)).toBe(false);
+    expect(suppressedByAttentionWindow("[REPLY] x", "filtered", true)).toBe(false);
   });
 });
 
