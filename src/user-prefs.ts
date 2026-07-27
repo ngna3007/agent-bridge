@@ -25,6 +25,18 @@ export interface UserPrefs {
    * `abg claude` invocation.
    */
   introAcknowledged?: boolean;
+
+  /**
+   * Absolute directories where the user answered "no" to the
+   * first-run setup offer. We ask once per directory and then stay
+   * quiet: a launcher that re-prompts on every run is worse than one
+   * that never prompts at all.
+   *
+   * Declining is not permanent — `abg init` still sets the project up
+   * explicitly, and doing so removes the directory from this list
+   * implicitly (the marker now exists, so the offer never fires).
+   */
+  setupDeclinedPaths?: string[];
 }
 
 const PREFS_FILE = "user-prefs.json";
@@ -78,6 +90,18 @@ export class UserPrefsService {
     return this.load().introAcknowledged === true;
   }
 
+  /** True when the user already declined the setup offer for `dir`. */
+  hasDeclinedSetup(dir: string): boolean {
+    return (this.load().setupDeclinedPaths ?? []).includes(dir);
+  }
+
+  /** Record a declined setup offer for `dir`. Idempotent. */
+  recordSetupDeclined(dir: string): void {
+    const current = this.load().setupDeclinedPaths ?? [];
+    if (current.includes(dir)) return;
+    this.update({ setupDeclinedPaths: [...current, dir] });
+  }
+
   /** Read the raw object (preserves unknown keys for merge). */
   private loadRaw(): Record<string, unknown> {
     try {
@@ -92,6 +116,13 @@ export class UserPrefsService {
   private normalize(raw: Record<string, unknown>): UserPrefs {
     const out: UserPrefs = {};
     if (raw.introAcknowledged === true) out.introAcknowledged = true;
+    if (Array.isArray(raw.setupDeclinedPaths)) {
+      // Drop non-strings rather than rejecting the whole file: a
+      // corrupt entry should cost one re-prompt, not every pref.
+      out.setupDeclinedPaths = raw.setupDeclinedPaths.filter(
+        (p): p is string => typeof p === "string",
+      );
+    }
     return out;
   }
 

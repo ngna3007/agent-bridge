@@ -95,17 +95,16 @@ Then install the CLI tool:
 # 4. Install the CLI globally
 npm install -g @rowanng/agentbridge
 
-# 5. Generate project config (optional)
-abg init
-
-# 6. Start Claude Code with AgentBridge channel enabled
+# 5. Start Claude Code with AgentBridge channel enabled
 abg claude
 
-# 7. Start Codex TUI connected to the bridge (in another terminal)
+# 6. Start Codex TUI connected to the bridge (in another terminal)
 abg codex
 ```
 
 > **Tip:** `abg` is a short alias for `agentbridge`. Both commands are identical — use whichever you prefer.
+
+The first `abg claude` (or `abg codex`) in a directory that is not yet an AgentBridge project offers to set one up — answer yes and you never need to run `abg init` by hand. See [First-run setup](#first-run-setup).
 
 That's it. The daemon starts automatically when needed and reconnects if restarted.
 
@@ -154,9 +153,9 @@ After modifying AgentBridge source code, re-run `abg dev` to sync changes to the
 
 | Command | Description |
 |---------|-------------|
-| `abg init` | Per-project setup: install plugin, check dependencies (bun/claude/codex), generate `.agentbridge/config.json` with this project's port triple |
-| `abg claude [args...]` | Start Claude Code with push channel enabled. Clears any killed sentinel from a previous `kill`. Pass-through args are forwarded to `claude` |
-| `abg codex [args...]` | Start Codex TUI connected to the AgentBridge daemon. Manages TUI process lifecycle (pid tracking, cleanup). Pass-through args forwarded to `codex` |
+| `abg init` | Per-project setup: install plugin, check dependencies (bun/claude/codex), generate `.agentbridge/config.json` with this project's port triple. Optional — `claude` / `codex` offer to do it on first run |
+| `abg claude [args...]` | Start Claude Code with push channel enabled. Offers [first-run setup](#first-run-setup) in an unconfigured directory. Clears any killed sentinel from a previous `kill`. Pass-through args are forwarded to `claude` |
+| `abg codex [args...]` | Start Codex TUI connected to the AgentBridge daemon. Offers [first-run setup](#first-run-setup) in an unconfigured directory. Manages TUI process lifecycle (pid tracking, cleanup). Pass-through args forwarded to `codex` |
 | `abg kill [--all]` | Gracefully stop the daemon + managed Codex TUI **for the current project**, clean up state files, write the killed sentinel. `--all` does it for every project on the machine |
 | `abg status` | Read-only: which project the cwd resolves to, its daemon state, and its ports |
 | `abg projects` | List every project state dir on this machine and each daemon's state |
@@ -189,7 +188,7 @@ Passing these flags manually will result in a hard error with guidance to use th
 
 Multiple projects run side by side on one machine. Each gets its own daemon, its own ports, and its own state directory.
 
-Run `abg init` in each project root. That creates the `.agentbridge/` marker directory, which is what everything else keys off:
+Each project root needs a `.agentbridge/` marker directory — created either by answering yes to the [first-run prompt](#first-run-setup) or by running `abg init` there. The marker is what everything else keys off:
 
 | Step | How |
 |---|---|
@@ -207,6 +206,37 @@ Run `abg init` in each project root. That creates the `.agentbridge/` marker dir
 With no `.agentbridge/` marker in the cwd or any ancestor, `abg` falls back to **single-instance mode** on the historical fixed ports `4500/4501/4502` and the un-nested state dir.
 
 `abg status` shows the resolution for the current directory; `abg projects` lists every project on the machine.
+
+### First-run setup
+
+Single-instance mode works, which is the problem: without a marker there is nothing to tell you a better mode exists, and the second project you launch quietly takes the daemon slot from the first. So `abg claude` and `abg codex` ask, once, in any directory that is not yet a project:
+
+```
+Set up AgentBridge for this project?
+
+  This directory is not set up as an AgentBridge project yet.
+  ...
+> Yes, set it up        same as `abg init`
+  No, use shared mode   won't ask again here
+```
+
+- **Yes** runs exactly the same setup as `abg init`, then prints what you can customize (below), and the rest of that session already uses the new project's ports.
+- **No** is remembered per directory, so you are asked once and never again there.
+- The target is the **git root**, not the cwd — `abg claude` from `src/` sets up the repo, not `src/`.
+
+The prompt never appears when any of these hold: the directory (or an ancestor) is already a project, the shell is not interactive, the target would be `$HOME` or `/`, or `AGENTBRIDGE_AUTO_SETUP=0` is set. In every one of those cases the historical single-instance fallback is used and nothing is written.
+
+### What you can customize
+
+The same list is printed at the end of setup:
+
+| Where | What |
+|---|---|
+| `.agentbridge/config.json` | `codex.appPort` / `codex.proxyPort`, `turnCoordination.attentionWindowSeconds`, `idleShutdownSeconds` |
+| `CLAUDE.md` · `AGENTS.md` | Text between the `<!-- AgentBridge:start/end -->` markers is regenerated by `abg init`; anything outside is yours and is never touched |
+| Environment | [Every variable in the table below](#environment-variables) — most usefully `AGENTBRIDGE_FILTER_MODE=full` and `AGENTBRIDGE_MODE=pull` |
+
+Per-agent roles (Claude = executor, Codex = reviewer) are fixed in this release. `abg doctor` checks all of the above for drift.
 
 ### Project config
 
@@ -376,6 +406,7 @@ All of these override whatever the project namespace resolved. Setting a port va
 | `AGENTBRIDGE_LOG_MAX_BYTES` | `50_000_000` | Per-file size cap for `agentbridge.log` before rotation kicks in. Values below 1 KiB fall back to the default. |
 | `AGENTBRIDGE_LOG_MAX_FILES` | `3` | How many rotated `agentbridge.log.N` generations to retain. |
 | `AGENTBRIDGE_PIN_CONTRACT` | `off` | When `once` (the legacy mid-state) or `always`, the daemon re-appends the BRIDGE_CONTRACT_REMINDER to every Claude→Codex turn. Default `off` because `abg init` writes the same content into `AGENTS.md` so it lives in Codex's system prompt and survives `/compact`. |
+| `AGENTBRIDGE_AUTO_SETUP` | unset (enabled) | Set to `0`, `false`, or `no` to suppress the [first-run setup prompt](#first-run-setup). The prompt is already skipped in any non-interactive shell. |
 
 ### State Directory
 
