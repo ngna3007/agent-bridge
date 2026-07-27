@@ -131,7 +131,17 @@ describe("AGENTS.md content carries the contract (load-bearing for mode=off)", (
   });
 
   test("AGENTS_MD_SECTION declares Codex default role", () => {
-    expect(AGENTS_MD_SECTION).toContain("Implementer");
+    expect(AGENTS_MD_SECTION).toContain("Advisor, Reviewer, Verifier");
+  });
+
+  test("AGENTS_MD_SECTION default role does not contradict the roles section", () => {
+    // Regression: the "Default role (Codex)" block used to read "Implementer,
+    // Executor, Verifier" while the roles section above it said Codex is the
+    // Advisor/Reviewer who does NOT ship the change. Both shipped in every
+    // `abg init`, so Codex received two mutually exclusive self-descriptions.
+    expect(AGENTS_MD_SECTION).toContain("You do NOT ship the change");
+    expect(AGENTS_MD_SECTION).not.toContain("Implementer");
+    expect(AGENTS_MD_SECTION).not.toContain("Architect → Builder → Critic");
   });
 
   test("AGENTS_MD_SECTION documents the fallback env var", () => {

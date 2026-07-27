@@ -224,9 +224,9 @@ All git write operations must be delegated to Claude via \`agentMessage\`. Repor
 
 ### Default role (Codex)
 
-- **Default role**: Implementer, Executor, Verifier
+- **Default role**: Advisor, Reviewer, Verifier — your job is to make Claude's next move better, not to take over the implementation (see "Roles in this setup" above).
 - **Analytical / review tasks**: Independent Analysis & Convergence
-- **Implementation tasks**: Architect → Builder → Critic
+- **Implementation proposals from Claude**: Architecture → Risk → Alternative — review the design, name what breaks, offer a concrete alternative. Claude writes the change.
 - **Debugging tasks**: Hypothesis → Experiment → Interpretation
 - Do not blindly follow Claude — challenge with evidence when you disagree
 - Use explicit collaboration phrases: "My independent view is:", "I agree on:", "I disagree on:", "Current consensus:"
