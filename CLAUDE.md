@@ -18,9 +18,10 @@ Runtime is **Bun** — do not change the local Bun version.
 | Build plugin bundle | `bun run build:plugin` → `plugins/agentbridge/server/{bridge-server,daemon}.js` |
 | Verify plugin sync | `bun run verify:plugin-sync` |
 | Validate plugin manifest | `bun run validate:plugin` (requires `claude` CLI) |
-| Local dev link | `bun link` then `agentbridge dev` (registers local marketplace + installs plugin) |
-| Start session | `agentbridge claude` (one terminal) + `agentbridge codex` (another) |
-| Stop everything | `agentbridge kill` |
+| Local dev link | `bun link` then `abg dev` (registers local marketplace + installs plugin) |
+| Start session | `abg claude` (one terminal) + `abg codex` (another) |
+| Stop everything | `abg kill` (current project) / `abg kill --all` (every project) |
+| Inspect state | `abg status` (this project), `abg projects` (all), `abg doctor` (diagnose) |
 
 **Before committing**: run `bun run typecheck && bun test src`.
 
@@ -32,13 +33,15 @@ AgentBridge is a **two-process** local bridge between Claude Code and Codex.
 
 ```
 Claude Code ── MCP stdio ──▶ bridge.ts (foreground)
-                                 │ control WS :4502
+                                 │ control WS
                                  ▼
                              daemon.ts (persistent background)
-                                 │ ws proxy :4501
+                                 │ ws proxy
                                  ▼
-                             Codex app-server :4500
+                             Codex app-server
 ```
+
+Ports are per-project (see the namespace invariant below), falling back to `4502` / `4501` / `4500` outside a project.
 
 - **`src/bridge.ts`** — foreground MCP server registered as a Claude Code plugin channel. Exits when Claude Code closes.
 - **`src/daemon.ts`** — long-lived background process; owns the Codex app-server proxy and the single source of truth for bridge state. Survives Claude Code restarts; `bridge.ts` reconnects with exponential backoff.
@@ -49,7 +52,8 @@ Claude Code ── MCP stdio ──▶ bridge.ts (foreground)
 - **`src/daemon-lifecycle.ts`** — shared `ensureRunning` / `kill` / startup-lock logic; both the CLI and `bridge.ts` call into this.
 - **`src/daemon-client.ts`** — typed WS client used by `bridge.ts` to talk to the daemon control port.
 - **`src/config-service.ts`** + **`src/state-dir.ts`** — read/write `.agentbridge/config.json` and resolve the platform state dir (`daemon.pid`, `status.json`, `agentbridge.log`, `killed` sentinel, `startup.lock`).
-- **`src/cli.ts` + `src/cli/*.ts`** — `abg` / `agentbridge` command router (`init`, `claude`, `codex`, `kill`, `dev`).
+- **`src/cli.ts` + `src/cli/*.ts`** — `abg` / `agentbridge` command router (`init`, `claude`, `codex`, `kill`, `status`, `projects`, `doctor`, `dev`).
+- **`src/project-id.ts` + `src/runtime-namespace.ts`** — project discovery, id hashing, port-triple derivation, and namespace application. Everything multi-project keys off these two.
 - **`src/marker-section.ts` + `src/collaboration-content.ts`** — idempotent marker-based injection of the `<!-- AgentBridge:start/end -->` block into `CLAUDE.md` / `AGENTS.md` / `GEMINI.md` / `.cursorrules` / `.windsurfrules` / `.kiro/` / `.cursor/` etc. during `abg init`.
 - **`src/bridge-disabled-state.ts` + `src/tui-connection-state.ts`** — disabled-reason and TUI-connect state machines used by the kickoff + reconnect UX.
 
@@ -57,8 +61,10 @@ Claude Code ── MCP stdio ──▶ bridge.ts (foreground)
 
 - Every `BridgeMessage` carries a `source: "claude" | "codex"` — the bridge **never forwards a message back to its origin** (loop prevention).
 - Delivery mode is env-controlled by `AGENTBRIDGE_MODE` (`push` for channel notifications, `pull` for `get_messages`). Default is `push`.
-- Ports are fixed: `CODEX_WS_PORT=4500`, `CODEX_PROXY_PORT=4501`, `AGENTBRIDGE_CONTROL_PORT=4502`. One AgentBridge instance per machine (multi-project support is post-v1).
-- All state lives in the platform state dir (`AGENTBRIDGE_STATE_DIR`, default `~/Library/Application Support/AgentBridge/` on macOS, `$XDG_STATE_HOME/agentbridge/` on Linux). The daemon uses `startup.lock` + `killed` sentinel to coordinate startup and explicit-kill-don't-restart semantics.
+- Filter mode is env-controlled by `AGENTBRIDGE_FILTER_MODE` (`filtered` routes by marker, `full` forwards everything). This is orthogonal to `AGENTBRIDGE_MODE`: filter mode decides *routing*, delivery mode decides *transport*. `classifyMessage` always reports the real parsed marker, including in `full` mode — callers key off marker identity, not mode.
+- **Ports and state are per-project.** `src/project-id.ts` walks up from the cwd to the first ancestor holding a `.agentbridge/` marker, hashes the absolute path (`sha256`, first 8 hex) into a `projectId`, and derives `slot = projectId mod 1000` → ports `14500 + slot × 3` = `(CODEX_WS_PORT, CODEX_PROXY_PORT, AGENTBRIDGE_CONTROL_PORT)` in `14500–17499`. `src/runtime-namespace.ts` applies that namespace. With no marker, it falls back to single-instance mode on `4500/4501/4502`.
+- `maybeApplyProjectNamespace` mutates the environment only for `claude`, `codex`, and `kill`. `status`, `projects`, and `doctor` resolve read-only (`mutateEnv: false`). `init`, `dev`, `--help`, and `--version` skip resolution entirely so they cannot inherit ports from a stale ancestor marker.
+- All state lives in the platform state dir (`AGENTBRIDGE_STATE_DIR`, default `~/Library/Application Support/AgentBridge/` on macOS, `$XDG_STATE_HOME/agentbridge/` on Linux), nested one level deeper under `<base>/<projectId>/` when a project is resolved. An explicit `AGENTBRIDGE_STATE_DIR` is used verbatim and is not nested. The daemon uses `startup.lock` + `killed` sentinel to coordinate startup and explicit-kill-don't-restart semantics.
 
 ### Tests
 
@@ -70,24 +76,24 @@ Claude Code ── MCP stdio ──▶ bridge.ts (foreground)
 
 ## Git Workflow
 
-- **永远不要直接推送到 master 分支！** 所有改动必须通过 feature/fix 分支 + PR 合并。
-- 分支命名：`feat/xxx`（功能）、`fix/xxx`（修复）、`docs/xxx`（文档）。
-- PR 必须交叉 review：Claude 写的由 Codex review，Codex 写的由 Claude review。
-- 合并使用 squash merge。
-- 提交信息与 release note **双语**（中文 + English）。
+- **Never push directly to `master`.** Every change lands through a feature/fix branch + PR.
+- Branch naming: `feat/xxx` (feature), `fix/xxx` (fix), `docs/xxx` (docs).
+- PRs get cross-review: Claude's work is reviewed by Codex, Codex's work by Claude.
+- Merge with squash merge.
+- Commit messages and release notes are **English only**.
 
-## Codex 协作
+## Working with Codex
 
-- Codex sandbox 禁止写 `.git` —— 所有 git 操作（commit/push/PR）由 Claude 代劳。
-- Codex 在主目录 `/Users/raysonmeng/agent_bridge` 工作，Claude 使用 worktree（`/Users/raysonmeng/agent_bridge_wt_<PR号>`）。
-- 不要在 Codex active turn 期间发 `reply` —— busy guard 会拒绝。看到 `⏳ Codex is working` 时等 `✅ Codex finished` 再回复。
-- Codex TUI 的 resume 有已知 bug（GitHub #14470、#12382），建议开新会话。
-- 连接 Codex TUI 用 `agentbridge codex`（通过 `bun link` 安装）。
-- **测试 PR 时必须切到该 PR 对应的分支/worktree** — 不要在别的分支上测。
+- The Codex sandbox cannot write to `.git` — Claude performs all git operations (commit/push/PR).
+- Codex works in the main directory; Claude uses a worktree (`<repo>_wt_<PR number>`).
+- Do not send `reply` during an active Codex turn — the busy guard rejects it. When you see `⏳ Codex is working`, wait for `✅ Codex finished` before replying.
+- Codex TUI resume has known bugs (GitHub #14470, #12382) — prefer starting a fresh session.
+- Connect the Codex TUI with `abg codex` (installed via `bun link`).
+- **When testing a PR, check out that PR's branch/worktree** — never test it from a different branch.
 
-## 进度跟踪
+## Progress Tracking
 
-- `V1_PROGRESS.md`（本地文件，不提交到 git）记录 v1 任务进度；每完成一个功能更新 Status 和 Progress Timeline。
+- `V1_PROGRESS.md` (local file, not committed) tracks v1 task progress. Update Status and Progress Timeline as each feature completes.
 
 <!-- AgentBridge:start -->
 ## AgentBridge — Multi-Agent Collaboration

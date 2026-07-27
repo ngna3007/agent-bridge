@@ -1,8 +1,8 @@
-# Codex TUI 静默闪退(第三种路径)——unintentional reconnect 后 stale session 触发 "Not initialized"
+# Codex TUI silent crash (third path) — stale session after an unintentional reconnect triggers "Not initialized"
 
 > Date: 2026-04-24
 > Status: analysis complete, phase 2 fix pending
-> Author: Claude(现场诊断) / 请 Codex review 结论和修法
+> Author: Claude (live diagnosis) / asking Codex to review the conclusion and the fix
 > Related commit: `f8698b8` on branch `fix/codex-exit-diagnostics`
 > Related logs:
 > - `~/Library/Application Support/AgentBridge/codex-wrapper.log`
@@ -10,15 +10,15 @@
 
 ## TL;DR
 
-我们上轮通过 `f8698b8` 加的 wrapper + adapter 日志,**第一次现场复现就抓到一个之前没覆盖的根因**。
+The wrapper + adapter logging added last round in `f8698b8` **caught a previously uncovered root cause on its very first live reproduction**.
 
-**不是** FatalExitRequest(Codex 之前 PTY 实验里的场景 A/B),
-**不是** ThreadClosed → ExitMode::Immediate(场景 C),
-**是**:**我们自己的 `handleAppServerClose` 在非主动 upstream 重连时没恢复 `initialize` 状态,TUI 继续用 stale session,后续请求触发 app-server 返回 `"Not initialized"`,TUI 从 `main()` 返 `Err`,exit(1)**。
+It is **not** FatalExitRequest (scenarios A/B from Codex's earlier PTY experiments).
+It is **not** ThreadClosed → ExitMode::Immediate (scenario C).
+It **is**: **our own `handleAppServerClose` does not restore `initialize` state on a non-intentional upstream reconnect. The TUI keeps using the stale session, a later request makes the app-server return `"Not initialized"`, the TUI returns `Err` from `main()`, and exits 1.**
 
-## 现场证据
+## Evidence from the field
 
-### 1. codex-wrapper.log —— TUI 侧退出
+### 1. codex-wrapper.log — the TUI-side exit
 
 ```
 [2026-04-24T11:00:26.116Z] spawn: codex --enable tui_app_server --remote ws://127.0.0.1:4501 --yolo
@@ -34,13 +34,13 @@ Stack backtrace:
 --- end stderr ---
 ```
 
-关键数据:
-- runtime **36 分钟**
-- exit code **1**,无 signal
-- classification `nonzero_exit:1`(不是 `fatal_exit`,因为 stderr 前缀不是 `ERROR: remote app server` 而是 `Error: turn/steer failed`)
-- stack backtrace 全 `__mh_execute_header` 是 release 构建 strip 后符号未解析的正常现象(即便 `RUST_BACKTRACE=full` 也无能为力)
+Key data:
+- runtime **36 minutes**
+- exit code **1**, no signal
+- classification `nonzero_exit:1` (not `fatal_exit`, because the stderr prefix is `Error: turn/steer failed`, not `ERROR: remote app server`)
+- the all-`__mh_execute_header` stack backtrace is normal for a stripped release build with unresolved symbols (`RUST_BACKTRACE=full` does not help)
 
-### 2. agentbridge.log —— 上游重连时序
+### 2. agentbridge.log — the upstream reconnect timeline
 
 ```
 11:00:26.177  Detected initialize — reconnecting app-server for fresh session
@@ -48,102 +48,102 @@ Stack backtrace:
 11:00:26.179  TUI → app-server: initialize
 11:00:26.179  TUI → app-server: initialized
 
-... 33 分钟正常使用 ...
+... 33 minutes of normal use ...
 
-11:33:34.444  App-server connection closed (intentional=false, tuiConnected=true, turnInProgress=true)  ← ⚠️ upstream 自己掉,还在 turn 中
-11:33:35.446  Reconnected to app-server                                                                  ← 1 秒后重连成功
+11:33:34.444  App-server connection closed (intentional=false, tuiConnected=true, turnInProgress=true)  ← ⚠️ upstream dropped on its own, mid-turn
+11:33:35.446  Reconnected to app-server                                                                  ← reconnected 1 second later
 11:33:35.447  App-server reconnect successful
 
-...           TUI 对此毫不知情,继续在 stale session 上工作 3 分钟 ...
+...           the TUI knows nothing about this and keeps working on the stale session for 3 minutes ...
 
-11:36:31.806  TUI → app-server: turn/steer                                                               ← 用户按 ESC 取消 turn
-11:36:31.811  TUI disconnected (appServerOpen=true, turnInProgress=false, ...)                           ← 5ms 内 TUI 死
+11:36:31.806  TUI → app-server: turn/steer                                                               ← user presses ESC to cancel the turn
+11:36:31.811  TUI disconnected (appServerOpen=true, turnInProgress=false, ...)                           ← TUI dies within 5ms
 ```
 
-关键字段:
-- `intentional=false` → 这不是我们主动触发的 reconnect,是 upstream 自己掉
-- `turnInProgress=true` → 掉的时候还在处理一个 turn
-- `appServerOpen=true`(TUI 死的时候) → 证明死的原因不是"上游又掉了",而是 TUI 主动退出
-- 时间差 3 分钟 → 排除"立即死"路径
+Key fields:
+- `intentional=false` → we did not trigger this reconnect; upstream dropped on its own
+- `turnInProgress=true` → it dropped while a turn was still being processed
+- `appServerOpen=true` (when the TUI died) → proves the cause was not "upstream dropped again" but the TUI exiting on its own
+- 3-minute gap → rules out the "dies immediately" path
 
-## 为什么 Codex 之前的 PTY 实验没测到
+## Why Codex's earlier PTY experiments never hit this
 
-Codex 的三个场景:
-- A: `server close 1000` → 立即 FatalExit(stderr: `ERROR: remote app server ... disconnected: connection closed`)
-- B: `server close 1011` → 同 A,reason 不同
-- C: `thread/closed` notification → 立即 ExitMode::Immediate,空 stderr
+Codex's three scenarios:
+- A: `server close 1000` → immediate FatalExit (stderr: `ERROR: remote app server ... disconnected: connection closed`)
+- B: `server close 1011` → same as A, different reason
+- C: `thread/closed` notification → immediate ExitMode::Immediate, empty stderr
 
-**没测**:"server close → 我们立即 reconnect → TUI 继续用 session 若干分钟 → TUI 发请求 → app-server 返回错误 → TUI 退出"
+**Not tested:** "server close → we reconnect immediately → TUI keeps using the session for several minutes → TUI sends a request → app-server returns an error → TUI exits."
 
-这条链路依赖 **TUI 认为 session 还活着但实际 app-server 已经是全新 uninitialized 的**,需要时间差才能复现。PTY 实验一板一眼断 + 关,没打出来。
+That chain depends on **the TUI believing the session is alive while the app-server is actually a brand-new uninitialized one**, so it needs a time gap to reproduce. The PTY experiments cut and closed in one shot, so they never produced it.
 
-## 根因 —— 在我们自己的代码里
+## Root cause — in our own code
 
 `src/codex-adapter.ts`:
 
 ```
-handleAppServerClose()          ← upstream 非主动掉时触发
+handleAppServerClose()          ← fires when upstream drops non-intentionally
   ├─ this.appServerWs = null
   ├─ clearResponseTrackingState()
-  └─ scheduleReconnect()        ← 指数退避重连
+  └─ scheduleReconnect()        ← exponential-backoff reconnect
        └─ connectToAppServer(true)
-            └─ onopen: this.appServerWs = appWs  ← 直接设新 socket,没 replay initialize
+            └─ onopen: this.appServerWs = appWs  ← installs the new socket directly, no initialize replay
 ```
 
-对比主动触发的 reconnect(TUI 发 `initialize` 触发):
+Compare with the intentional reconnect (triggered by the TUI sending `initialize`):
 
 ```
 reconnectAppServerForNewSession(tuiWs)
-  ├─ buffer TUI 消息
-  ├─ 关旧 appServerWs
+  ├─ buffer TUI messages
+  ├─ close the old appServerWs
   ├─ connectToAppServer(false)
-  └─ replay buffered messages   ← 这里重发 initialize + initialized
+  └─ replay buffered messages   ← this re-sends initialize + initialized
 ```
 
-**区别是**:主动重连有 replay 机制,非主动重连没有。
-新 app-server session 是 uninitialized 的,任何需要 initialized state 的请求都会返回 `{error: "Not initialized"}`,TUI 视为 fatal,exit(1)。
+**The difference:** the intentional reconnect has a replay mechanism; the non-intentional one does not.
+The new app-server session is uninitialized, so any request requiring initialized state returns `{error: "Not initialized"}`, which the TUI treats as fatal and exits 1.
 
-## 为什么 `outageQueue`(phase 1 的修复)救不了
+## Why `outageQueue` (the phase 1 fix) cannot save this
 
-`outageQueue` 只 buffer **outage 期间 TUI 发的消息**。这个 case 的事件序列:
+`outageQueue` only buffers **messages the TUI sends during an outage**. The event sequence here:
 
 1. 11:33:34 upstream close
-2. 11:33:35 我们重连(1 秒,快于 5 秒 timeout)
-3. 这 1 秒内 TUI **没发任何消息** → queue 是空的
-4. 等到 TUI 在 3 分钟后发 `turn/steer` 时,`appServerWs` 已经 OPEN,直接走 forward 分支
-5. forward 到新 session → 新 session 说 "Not initialized" → TUI 死
+2. 11:33:35 we reconnect (1 second, faster than the 5-second timeout)
+3. during that 1 second the TUI **sends nothing** → the queue is empty
+4. by the time the TUI sends `turn/steer` 3 minutes later, `appServerWs` is already OPEN, so it takes the forward branch
+5. forwarded to the new session → new session says "Not initialized" → TUI dies
 
-**outageQueue 防的是"TUI 发的消息丢"的问题,不防"session 状态丢"的问题。这是两个不同的 failure mode。**
+**`outageQueue` protects against "TUI messages get lost". It does not protect against "session state gets lost". Two different failure modes.**
 
-## Phase 2 修法:缓存 + replay initialize(用户选了 A)
+## Phase 2 fix: cache + replay initialize (the user picked option A)
 
-### A.1 捕获阶段
+### A.1 Capture stage
 
-在 `onTuiMessage` 里,**在 id-rewriting 之前**,识别并缓存:
-- `initialize` 请求的原始 JSON(含 params)
-- `initialized` notification 的原始 JSON
-- 当前 `thread/start` 或 `thread/resume` 的 threadId(我们已经有 `this.threadId` 字段了)
+In `onTuiMessage`, **before id-rewriting**, recognize and cache:
+- the raw JSON of the `initialize` request (including params)
+- the raw JSON of the `initialized` notification
+- the current `thread/start` or `thread/resume` threadId (we already have the `this.threadId` field)
 
-存在新字段上,例如:
+Stored on new fields, e.g.:
 ```typescript
 private lastInitializeRaw: string | null = null;
 private lastInitializedRaw: string | null = null;
-// this.threadId 已存在
+// this.threadId already exists
 ```
 
-### A.2 replay 阶段
+### A.2 Replay stage
 
-`scheduleReconnect` 成功 onopen 后(非主动重连路径),自动:
+After `scheduleReconnect` succeeds and `onopen` fires (the non-intentional reconnect path), automatically:
 
-1. 若 `lastInitializeRaw` 存在,发给新 app-server
-   - 用新的 proxy id,注意 rewrite
-   - 等 response 确认才继续(需要 awaitable send helper,或基于 id 挂钩)
-2. 若 `lastInitializedRaw` 存在,发过去(notification 无需等 response)
-3. 若 `this.threadId` 存在,发 `thread/resume {threadId}`
-4. 全部成功 → 照常服务 TUI,TUI 无感
-5. 任何一步失败 → 降级成方案 B(close TUI 1011,让 codex-rs FatalExit,用户重启)
+1. If `lastInitializeRaw` exists, send it to the new app-server
+   - use a fresh proxy id — remember to rewrite
+   - wait for the response before continuing (needs an awaitable send helper, or an id-keyed hook)
+2. If `lastInitializedRaw` exists, send it (a notification, no response to await)
+3. If `this.threadId` exists, send `thread/resume {threadId}`
+4. All succeed → keep serving the TUI as usual; the TUI notices nothing
+5. Any step fails → fall back to option B (close the TUI with 1011, let codex-rs FatalExit, user restarts)
 
-伪码:
+Pseudocode:
 ```typescript
 private async restoreSessionAfterUnintentionalReconnect() {
   if (!this.lastInitializeRaw) return true; // nothing to replay
@@ -169,44 +169,44 @@ private async restoreSessionAfterUnintentionalReconnect() {
 }
 ```
 
-挂在 `connectToAppServer` 的 `onopen` 里,仅在 `isReconnect === true` 时触发(跳过首次连接)。
+Hooked into `connectToAppServer`'s `onopen`, firing only when `isReconnect === true` (skipping the first connection).
 
-### A.3 边界情况
+### A.3 Edge cases
 
-- **TUI 还没发过 initialize** → 没缓存 → reconnect 后直接走老路(可能后续也没事,可能 TUI 还会主动重新 initialize)
-- **app-server 明确拒绝 replay 后的 initialize**(schema 不兼容、seq 校验等) → 降级关 TUI 1011
-- **replay 期间 TUI 又发了新消息** → 复用 `pendingTuiMessages` + `reconnectingForNewSession` 已有机制,buffer 后 flush
-- **`this.threadId` 为 null** 但 initialize 已发(TUI 还没进 thread) → 只 replay initialize + initialized,不发 thread/resume
-- **`clearResponseTrackingState` 和 cache 的互斥**:replay 的消息不应当受 clearResponseTrackingState 影响 —— cache 字段要独立存活
+- **TUI has not sent `initialize` yet** → nothing cached → the reconnect takes the old path (probably fine; the TUI may still initialize on its own later)
+- **app-server explicitly rejects the replayed `initialize`** (schema mismatch, seq validation, etc.) → fall back to closing the TUI with 1011
+- **TUI sends new messages during replay** → reuse the existing `pendingTuiMessages` + `reconnectingForNewSession` machinery: buffer, then flush
+- **`this.threadId` is null but `initialize` was sent** (TUI has not entered a thread) → replay `initialize` + `initialized` only, no `thread/resume`
+- **Interaction between `clearResponseTrackingState` and the cache**: replayed messages must not be affected by `clearResponseTrackingState` — the cache fields have to survive independently
 
-### A.4 风险点(需要 Codex 从 codex-rs 源码确认)
+### A.4 Risks (need Codex to confirm from the codex-rs source)
 
-**请 Codex 下次 session 重点查**:
+**Please have Codex check these next session:**
 
-1. **`initialize` handler 对重复调用的行为**
-   - 若 idempotent,replay 安全
-   - 若返回 error(如 "already initialized"),replay 要先 close-then-open
-2. **`thread/resume` 能否在 fresh session 上直接用**
-   - 还是必须先重新 `initialize` 再 `thread/resume`
-   - 还是需要额外的 `thread/attach` 或 `session/attach` 语义
-3. **`initialize` 的 params 里有没有 session-unique 字段**
-   - 比如 client nonce、challenge token、timestamp 校验
-   - 如果有,直接 replay 会被 app-server 拒
-4. **TUI 启动时有没有除了 initialize 以外的"session bootstrap"请求**
-   - 比如 `account/read`、`skills/list` 等(我们日志里看到过)
-   - 这些是幂等的还是 session-dependent,影响要不要也一起 replay
+1. **How the `initialize` handler behaves on a repeat call**
+   - if idempotent, replay is safe
+   - if it errors (e.g. "already initialized"), replay must close-then-open first
+2. **Whether `thread/resume` works directly on a fresh session**
+   - or whether it requires a fresh `initialize` first
+   - or whether it needs additional `thread/attach` / `session/attach` semantics
+3. **Whether `initialize`'s params contain session-unique fields**
+   - e.g. client nonce, challenge token, timestamp validation
+   - if so, a straight replay will be rejected by the app-server
+4. **Whether the TUI issues other "session bootstrap" requests besides `initialize` at startup**
+   - e.g. `account/read`, `skills/list` (we have seen these in the logs)
+   - whether those are idempotent or session-dependent decides whether they need replaying too
 
-**如果 codex-rs 源码显示 initialize 不可重放**,那方案 A 不可行,回退到方案 B(直接关 TUI 1011,让用户感知到断连)。
+**If the codex-rs source shows `initialize` is not replayable**, option A is off the table and we fall back to option B (close the TUI with 1011 so the user sees the disconnect).
 
-### A.5 测试策略
+### A.5 Test strategy
 
-- 单测:构造一个 mock app-server,先正常 handshake,然后主动 close,再接受新连接,验证 adapter 自动发了 initialize + (optional) thread/resume
-- 集成测:模拟上游 1s 短断,观察 `codex-wrapper.log` 里没有"闪退"记录,TUI 继续可用
-- E2E:用户实际跑一次 `abg codex`,人为杀掉 daemon 里的 app-server 连接(需要暴露一个测试端口或 SIGUSR1),看 TUI 是否无感续用
+- Unit: build a mock app-server, complete a normal handshake, close it deliberately, accept a new connection, and assert the adapter automatically sent `initialize` + (optionally) `thread/resume`
+- Integration: simulate a 1-second upstream outage and confirm `codex-wrapper.log` records no crash and the TUI stays usable
+- E2E: actually run `abg codex`, manually kill the daemon's app-server connection (needs a test port or SIGUSR1), and check the TUI keeps working transparently
 
-## 分类 regex 建议同步扩
+## The classification regex should be extended to match
 
-当前 `src/cli/codex.ts` 的启发式分类:
+The current heuristic classification in `src/cli/codex.ts`:
 ```typescript
 if (/ERROR: remote app server/.test(tail)) classification = "fatal_exit";
 else if (signal) classification = `signal:${signal}`;
@@ -214,24 +214,24 @@ else if (typeof code === "number" && code !== 0) classification = `nonzero_exit:
 else if (code === 0 && tail.trim().length === 0) classification = "exit_0_empty_stderr";
 ```
 
-**新增规则**(Claude 这轮 phase 2 会一起加上):
+**New rules** (Claude will add these alongside phase 2):
 ```typescript
 else if (/Error: .* failed: Not initialized/.test(tail)) classification = "not_initialized_after_reconnect";
 else if (/Error: .* failed:/.test(tail)) classification = "rpc_error_exit";
 ```
 
-这样以后再出类似闪退,wrapper log 的 classification 字段直接就能告诉人是不是这个 bug 或类似 bug。
+That way, the next time a similar crash happens, the wrapper log's classification field says directly whether it is this bug or something like it.
 
-## 当前状态
+## Current status
 
-- `f8698b8` 已 push 到 `fix/codex-exit-diagnostics`(远程)
-- phase 1(诊断基建)工作如预期 —— 这次闪退**全程 on record**,可复盘
-- phase 2(replay initialize)Claude 这轮继续做,Codex 下次上线请先 review 本文档再动工
-- 用户未开 PR,等本 bug 也修完一并开
+- `f8698b8` is pushed to `fix/codex-exit-diagnostics` (remote)
+- Phase 1 (diagnostic infrastructure) worked as intended — this crash was **fully on record** and reviewable
+- Phase 2 (replay initialize) is Claude's work this round; Codex should review this document before starting
+- The user has not opened a PR yet — waiting until this bug is fixed too
 
-## 给 Codex 的明确问题清单
+## Explicit question list for Codex
 
-1. 同意"真正根因是非主动 reconnect 没 replay initialize"这个判断吗?有没有更简单的解释我们漏了?
-2. 对 A.4 的 4 个风险点,codex-rs 源码侧答案是什么?
-3. 如果 A 不可行,降级到 B(立即关 TUI 强制重启)你觉得用户能接受吗?还是要做 C(replay 后若失败再降级 B)?
-4. A 方案的 `sendAndAwait` helper 要不要抽成公共工具,后续别的 replay 场景也能用?
+1. Do you agree that the real root cause is "the non-intentional reconnect does not replay `initialize`"? Is there a simpler explanation we missed?
+2. For the four risks in A.4, what do the codex-rs sources say?
+3. If A is not viable, is falling back to B (close the TUI immediately, force a restart) acceptable to users? Or should we do C (replay first, fall back to B only on failure)?
+4. Should A's `sendAndAwait` helper be extracted as a shared utility so other replay scenarios can use it?

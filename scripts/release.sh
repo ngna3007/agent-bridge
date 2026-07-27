@@ -210,11 +210,10 @@ FIXES=$(echo "$CHANGELOG" | grep -iE "^[a-f0-9]+ fix" || true)
 OTHERS=$(echo "$CHANGELOG" | grep -ivE "^[a-f0-9]+ (feat|fix|chore)" || true)
 
 append_section() {
-  local heading_en="$1"
-  local heading_zh="$2"
-  local content="$3"
+  local heading="$1"
+  local content="$2"
   if [[ -n "$content" ]]; then
-    NOTES+=$'\n'"### $heading_en / $heading_zh"$'\n'
+    NOTES+=$'\n'"### $heading"$'\n'
     while IFS= read -r line; do
       [[ -z "$line" ]] && continue
       NOTES+="- ${line#* }"$'\n'
@@ -222,16 +221,16 @@ append_section() {
   fi
 }
 
-NOTES="## What's Changed / 变更内容"$'\n'
-append_section "Bug Fixes" "问题修复" "$FIXES"
-append_section "Features" "新功能" "$FEATS"
-append_section "Other" "其他" "$OTHERS"
+NOTES="## What's Changed"$'\n'
+append_section "Bug Fixes" "$FIXES"
+append_section "Features" "$FEATS"
+append_section "Other" "$OTHERS"
 
-NOTES+=$'\n'"### Installation / 安装"$'\n'
+NOTES+=$'\n'"### Installation"$'\n'
 NOTES+='```bash'$'\n'
 NOTES+="npm install -g @raysonmeng/agentbridge"$'\n'
 NOTES+='```'$'\n'
-NOTES+=$'\n'"**Full Changelog / 完整变更记录:** https://github.com/$REPO/compare/$COMPARE_BASE...v$NEW_VERSION"
+NOTES+=$'\n'"**Full Changelog:** https://github.com/$REPO/compare/$COMPARE_BASE...v$NEW_VERSION"
 
 RELEASE_URL=$(gh release create "v$NEW_VERSION" \
   --repo "$REPO" \

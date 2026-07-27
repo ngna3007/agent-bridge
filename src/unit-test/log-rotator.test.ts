@@ -52,7 +52,7 @@ describe("RotatingLogger — basic writes", () => {
   test("counts utf8 bytes, not characters", () => {
     const p = join(tmp, "x.log");
     const r = new RotatingLogger(p, { maxBytes: 1024, maxFiles: 3 });
-    r.write("日本\n"); // 6 utf8 bytes for "日本" + 1 for "\n" = 7
+    r.write("€€\n"); // 6 utf8 bytes for "€€" (3 each) + 1 for "\n" = 7
     expect(r.getBytesWritten()).toBe(7);
     expect(statSync(p).size).toBe(7);
   });

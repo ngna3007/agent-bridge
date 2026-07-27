@@ -2,69 +2,70 @@
 
 ## fix: single-session admission + approval lifecycle reliability
 
-### Test 1: 单会话保护 — 新连接被拒绝
+### Test 1: single-session protection — new connection is rejected
 
-**目的：** 验证第二个 Claude Code 会话连接时被拒绝，第一个会话不受影响。
+**Goal:** verify that a second Claude Code session is rejected on connect, and that the first session is unaffected.
 
-1. 终端 A：`agentbridge claude` 启动第一个 Claude Code 会话
-2. 终端 B：`agentbridge codex` 启动 Codex TUI
-3. 确认终端 A 收到 `✅ AgentBridge bridge is ready` 和 Codex 连接通知
-4. **终端 C：`agentbridge claude` 启动第二个 Claude Code 会话**
-5. 验证：
-   - 终端 C（新会话）应收到 `⚠️ AgentBridge daemon rejected this session — another Claude Code session is already connected.`
-   - 终端 A（旧会话）**不受任何影响**，继续正常工作
-   - 终端 A 能正常和 Codex 通信
-6. 关闭终端 C
-7. 终端 A 仍然正常工作
+1. Terminal A: `agentbridge claude` — start the first Claude Code session
+2. Terminal B: `agentbridge codex` — start the Codex TUI
+3. Confirm terminal A receives `✅ AgentBridge bridge is ready` and the Codex connection notice
+4. **Terminal C: `agentbridge claude` — start a second Claude Code session**
+5. Verify:
+   - Terminal C (the new session) receives `⚠️ AgentBridge daemon rejected this session — another Claude Code session is already connected.`
+   - Terminal A (the existing session) is **completely unaffected** and keeps working
+   - Terminal A can still talk to Codex normally
+6. Close terminal C
+7. Terminal A still works
 
-**通过标准：** 旧会话完全不受影响，新会话被拒绝并收到明确错误消息。
+**Pass criteria:** the existing session is untouched; the new session is rejected with a clear error message.
 
-### Test 2: 旧会话断开后新会话可连入
+### Test 2: a new session can connect after the old one disconnects
 
-**目的：** 验证第一个 Claude 正常关闭后，新的 Claude 可以成功连入。
+**Goal:** verify a new Claude session connects successfully once the first one shuts down cleanly.
 
-1. 终端 A：`agentbridge claude` 启动第一个 Claude Code 会话
-2. 确认连接正常
-3. 关闭终端 A 的 Claude Code（Ctrl+C 或 /exit）
-4. 终端 B：`agentbridge claude` 启动新的 Claude Code 会话
-5. 验证：终端 B 成功连入，收到 `✅ AgentBridge bridge is ready`
+1. Terminal A: `agentbridge claude` — start the first Claude Code session
+2. Confirm the connection is healthy
+3. Close Claude Code in terminal A (Ctrl+C or `/exit`)
+4. Terminal B: `agentbridge claude` — start a new Claude Code session
+5. Verify: terminal B connects successfully and receives `✅ AgentBridge bridge is ready`
 
-**通过标准：** 旧会话释放 slot 后，新会话正常连入。
+**Pass criteria:** once the old session releases the slot, the new session connects normally.
 
-### Test 3: TUI 断连后审批请求重放
+### Test 3: approval request replay after TUI disconnect
 
-**目的：** 验证 TUI 断连重连后，pending 的审批请求被正确重放。
+**Goal:** verify a pending approval request is correctly replayed after the TUI disconnects and reconnects.
 
 1. `agentbridge claude` + `agentbridge codex`
-2. 在 Claude 中给 Codex 发一个需要审批的任务（比如修改文件）
-3. 当 Codex 弹出审批请求（permission prompt）时，**不要点审批**
-4. `Ctrl+C` 杀掉 Codex TUI
-5. 重新运行 `agentbridge codex`
-6. 验证：审批请求应该被**重新弹出**，点击审批后 Codex 继续执行
+2. From Claude, send Codex a task that requires approval (e.g. modifying a file)
+3. When Codex raises the approval request (permission prompt), **do not approve it**
+4. `Ctrl+C` to kill the Codex TUI
+5. Run `agentbridge codex` again
+6. Verify: the approval request is **raised again**; approving it lets Codex continue
 
-**通过标准：** 审批请求在 TUI 重连后正确重放，用户审批后 Codex 正常继续。
+**Pass criteria:** the approval request replays correctly after TUI reconnect, and Codex resumes once the user approves.
 
-### Test 4: app-server 断连后审批状态清理
+### Test 4: approval state cleanup after app-server disconnect
 
-**目的：** 验证 app-server 断连后，旧的审批状态被正确清理，不会 flush 到新连接。
+**Goal:** verify that stale approval state is discarded on app-server disconnect and never flushed into a new connection.
 
-此场景较难手动复现（需要精确时序），主要靠单元测试覆盖。可观察：
-1. 正常使用过程中，`/tmp/agentbridge.log` 中**不应出现** `Flushed buffered approval response after app-server reconnect` 的日志
-2. 如果出现 `App-server connection closed` 日志，紧跟其后应有 approval 状态清理记录
+This scenario is hard to reproduce by hand (it needs precise timing) and is covered mainly by unit tests. Observable signals:
 
-**通过标准：** 单元测试 `"app-server close discards approval state across reconnects"` 通过。
+1. During normal use, `/tmp/agentbridge.log` must **not** contain `Flushed buffered approval response after app-server reconnect`
+2. If an `App-server connection closed` entry appears, an approval-state cleanup record should follow immediately
 
-### Test 5: `agentbridge kill` → 恢复
+**Pass criteria:** the unit test `"app-server close discards approval state across reconnects"` passes.
 
-**目的：** 验证 killed 状态下的错误消息和恢复机制。
+### Test 5: `agentbridge kill` → recovery
+
+**Goal:** verify the error message in the killed state and the recovery path.
 
 1. `agentbridge claude` + `agentbridge codex`
 2. `agentbridge kill`
-3. 尝试在 Claude 中给 Codex 发消息
-4. 验证：应收到 `AgentBridge is disabled by agentbridge kill` 错误
-5. 重新运行 `agentbridge claude`，验证可以正常恢复
+3. Try to send Codex a message from Claude
+4. Verify: you receive the `AgentBridge is disabled by agentbridge kill` error
+5. Run `agentbridge claude` again and verify normal recovery
 
-**通过标准：** kill 后错误消息正确，重启后恢复正常。
+**Pass criteria:** the error message after kill is correct, and restarting recovers normal operation.
 
 ### Related
 
