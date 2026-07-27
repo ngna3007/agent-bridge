@@ -3,8 +3,6 @@
 [![CI](https://github.com/ngna3007/agent-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/ngna3007/agent-bridge/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-[中文文档](README.zh-CN.md)
-
 Local bridge for bidirectional communication between Claude Code and Codex inside the same working session.
 
 AgentBridge uses a two-process architecture:
@@ -36,20 +34,22 @@ When Claude Code closes, the foreground MCP process exits while the background d
 │ Session      │ ◀──────────────────────────  │ foreground client  │
 └──────────────┘                             └─────────┬──────────┘
                                                        │
-                                                       │ control WS (:4502)
+                                                       │ control WS
                                                        ▼
                                              ┌────────────────────┐
                                              │ daemon.ts          │
                                              │ bridge daemon      │
                                              └─────────┬──────────┘
                                                        │
-                                     ws://127.0.0.1:4501 proxy
+                                              ws://127.0.0.1 proxy
                                                        │
                                                        ▼
                                              ┌────────────────────┐
                                              │ Codex app-server   │
                                              └────────────────────┘
 ```
+
+All three ports are derived per project — see [Multi-project](#multi-project). Outside a project they fall back to `4502` (control), `4501` (proxy), and `4500` (app-server).
 
 ### Data flow
 
@@ -132,47 +132,52 @@ bun install
 bun link
 
 # 2. Set up local plugin + project config
-agentbridge dev     # Register local marketplace + install plugin
-agentbridge init    # Check dependencies, generate .agentbridge/config.json
+abg dev     # Register local marketplace + install plugin
+abg init    # Check dependencies, generate .agentbridge/config.json
 
 # 3. Start Claude Code with AgentBridge plugin loaded
-agentbridge claude
+abg claude
 
 # 4. Start Codex TUI connected to the bridge (in another terminal)
-agentbridge codex
+abg codex
 ```
 
-> **Note:** `agentbridge claude` injects `--dangerously-load-development-channels plugin:agentbridge@agentbridge` automatically. This loads a local development channel into Claude Code (currently a Research Preview workflow). Only enable channels and MCP servers you trust.
+> **Note:** `abg claude` injects `--dangerously-load-development-channels plugin:agentbridge@agentbridge` automatically. This loads a local development channel into Claude Code (currently a Research Preview workflow). Only enable channels and MCP servers you trust.
 
 #### Updating after code changes
 
-After modifying AgentBridge source code, re-run `agentbridge dev` to sync changes to the plugin cache, then restart Claude Code or run `/reload-plugins` in an active session.
+After modifying AgentBridge source code, re-run `abg dev` to sync changes to the plugin cache, then restart Claude Code or run `/reload-plugins` in an active session.
 
 ## CLI Reference
 
-> All commands work with both `agentbridge` and the short alias `abg`.
+> Every command works under both names: `abg` (short) and `agentbridge` (long). The docs below use `abg`.
 
 | Command | Description |
 |---------|-------------|
-| `abg init` | Install plugin, check dependencies (bun/claude/codex), generate `.agentbridge/config.json` |
+| `abg init` | Per-project setup: install plugin, check dependencies (bun/claude/codex), generate `.agentbridge/config.json` with this project's port triple |
 | `abg claude [args...]` | Start Claude Code with push channel enabled. Clears any killed sentinel from a previous `kill`. Pass-through args are forwarded to `claude` |
-| `abg codex [args...]` | Start Codex TUI connected to AgentBridge daemon. Manages TUI process lifecycle (pid tracking, cleanup). Pass-through args forwarded to `codex` |
-| `abg kill` | Gracefully stop both daemon and managed Codex TUI, clean up state files, write killed sentinel |
+| `abg codex [args...]` | Start Codex TUI connected to the AgentBridge daemon. Manages TUI process lifecycle (pid tracking, cleanup). Pass-through args forwarded to `codex` |
+| `abg kill [--all]` | Gracefully stop the daemon + managed Codex TUI **for the current project**, clean up state files, write the killed sentinel. `--all` does it for every project on the machine |
+| `abg status` | Read-only: which project the cwd resolves to, its daemon state, and its ports |
+| `abg projects` | List every project state dir on this machine and each daemon's state |
+| `abg doctor` | Diagnose stuck or surprising state and suggest fixes |
 | `abg dev` | (Dev only) Register local marketplace + force-sync plugin to cache |
 | `abg --help` | Show help |
 | `abg --version` | Show version |
+
+`init`, `dev`, `--help`, and `--version` deliberately do **not** pick up a project namespace — they must not inherit ports from a stale ancestor `.agentbridge/`. `status`, `projects`, and `doctor` resolve the namespace read-only. Only `claude`, `codex`, and `kill` apply it to the environment.
 
 ### Owned flags
 
 Some flags are automatically injected and cannot be manually specified:
 
-- `agentbridge claude` owns: `--channels`, `--dangerously-load-development-channels`
-- `agentbridge codex` owns: `--remote`, `--enable tui_app_server`
+- `abg claude` owns: `--channels`, `--dangerously-load-development-channels`
+- `abg codex` owns: `--remote`, `--enable tui_app_server`
 
 Passing these flags manually will result in a hard error with guidance to use the native command directly.
 
-> **Note on flag positioning for `agentbridge codex`:** For the bare TUI form
-> (`agentbridge codex …`), bridge flags are injected at the front. For TUI
+> **Note on flag positioning for `abg codex`:** For the bare TUI form
+> (`abg codex …`), bridge flags are injected at the front. For TUI
 > subcommands that carry per-subcommand args (`resume`, `fork`), they are
 > injected *after* the subcommand name (so clap parses them as options of the
 > actually-invoked command, not the root). Non-TUI subcommands like `exec`,
@@ -180,9 +185,32 @@ Passing these flags manually will result in a hard error with guidance to use th
 > unchanged — no bridge flags injected. See `src/cli/codex.ts buildCodexArgs`
 > for the full positioning logic.
 
-## Project Config
+## Multi-project
 
-Running `agentbridge init` creates a `.agentbridge/` directory in your project root:
+Multiple projects run side by side on one machine. Each gets its own daemon, its own ports, and its own state directory.
+
+Run `abg init` in each project root. That creates the `.agentbridge/` marker directory, which is what everything else keys off:
+
+| Step | How |
+|---|---|
+| Find the project | Walk up from the cwd to the first ancestor containing `.agentbridge/` |
+| Derive its id | `sha256(absolute root path)`, first 8 hex chars |
+| Derive its ports | slot = `projectId` as hex mod 1000; ports = `14500 + slot × 3` → `(codexWs, codexProxy, control)`, i.e. somewhere in `14500–17499` |
+| Derive its state dir | `<platform-default>/<projectId>/` |
+
+`abg claude`, `abg codex`, and `abg kill` print a one-line banner to stderr on a TTY so you can see which project the terminal is bound to:
+
+```
+[abg] project a1b2c3d4 · ports 14712/14713/14714 · /home/you/work/my-project
+```
+
+With no `.agentbridge/` marker in the cwd or any ancestor, `abg` falls back to **single-instance mode** on the historical fixed ports `4500/4501/4502` and the un-nested state dir.
+
+`abg status` shows the resolution for the current directory; `abg projects` lists every project on the machine.
+
+### Project config
+
+`abg init` writes one file into `.agentbridge/`:
 
 | File | Purpose |
 |------|---------|
@@ -198,7 +226,6 @@ agent_bridge/
 │   ├── ISSUE_TEMPLATE/           # Bug report and feature request templates
 │   ├── pull_request_template.md
 │   └── workflows/ci.yml          # GitHub Actions CI
-├── assets/                        # Static assets (images, etc.)
 ├── docs/
 │   ├── phase3-spec.md            # Phase 3 design spec (CLI + Plugin)
 │   ├── v1-roadmap.md             # v1 feature roadmap
@@ -215,25 +242,45 @@ agent_bridge/
 │   ├── daemon-client.ts           # WebSocket client for daemon control port
 │   ├── daemon-lifecycle.ts        # Shared daemon lifecycle (ensureRunning, kill, startup lock)
 │   ├── control-protocol.ts        # Foreground/background control protocol types
+│   ├── app-server-protocol.ts     # Codex app-server JSON-RPC message shapes
 │   ├── claude-adapter.ts          # MCP server adapter for Claude Code channels
 │   ├── codex-adapter.ts           # Codex app-server WebSocket proxy and message interception
+│   ├── project-id.ts              # Project discovery, id hash, per-project port allocation
+│   ├── runtime-namespace.ts       # Resolves project + state dir + control port per command
 │   ├── config-service.ts          # Project config (.agentbridge/) read/write
 │   ├── state-dir.ts               # Platform-aware state directory resolver
-│   ├── message-filter.ts          # Smart message filtering (markers, summary buffer)
+│   ├── message-filter.ts          # Marker classification, routing, status buffer
+│   ├── marker-section.ts          # Idempotent <!-- AgentBridge:start/end --> section upsert
+│   ├── collaboration-content.ts   # CLAUDE.md / AGENTS.md collaboration sections (hardcoded)
+│   ├── settings-wire.ts           # Chains the statusbar command into ~/.claude/settings.json
+│   ├── status-line-writer.ts      # Writes the colored lifecycle tag to status.line
+│   ├── lifecycle-tags.ts          # Tag constants and colors
+│   ├── log-rotator.ts             # Size-capped rotating logger shared by all log sites
+│   ├── liveness-probe.ts          # Ping/pong probe for challenge-on-contest admission
+│   ├── bridge-disabled-state.ts   # killed / rejected / evicted state machine
+│   ├── tui-connection-state.ts    # TUI connect/disconnect grace-period state machine
+│   ├── stderr-ring-buffer.ts      # Bounded stderr tail kept for crash classification
+│   ├── process-helpers.ts         # Spawn, pid tracking, orphan reaping
+│   ├── user-prefs.ts              # First-run acknowledgement and other persisted prefs
+│   ├── env-utils.ts               # Env parsing helpers
 │   ├── types.ts                   # Shared types
 │   ├── cli.ts                     # CLI entry point and command router
 │   └── cli/
-│       ├── init.ts                # agentbridge init
-│       ├── claude.ts              # agentbridge claude
-│       ├── codex.ts               # agentbridge codex
-│       ├── kill.ts                # agentbridge kill
-│       └── dev.ts                 # agentbridge dev
+│       ├── init.ts                # abg init
+│       ├── claude.ts              # abg claude
+│       ├── codex.ts               # abg codex
+│       ├── kill.ts                # abg kill
+│       ├── status.ts              # abg status
+│       ├── projects.ts            # abg projects
+│       ├── doctor.ts              # abg doctor
+│       ├── dev.ts                 # abg dev
+│       ├── prompt.ts              # Interactive prompts (onboarding wizard, agent picker)
+│       └── pkg-root.ts            # Locates the installed package root
 ├── CLAUDE.md                      # Project rules for AI agents
 ├── CODE_OF_CONDUCT.md
 ├── CONTRIBUTING.md
 ├── LICENSE
 ├── README.md
-├── README.zh-CN.md
 ├── SECURITY.md
 ├── package.json
 └── tsconfig.json
@@ -274,7 +321,7 @@ The daemon writes a short colored tag to `<state-dir>/status.line` on every life
 | Evicted by a newer session | `[REPLACED BY NEWER SESSION]` | red |
 | Another session active | `[ANOTHER SESSION ACTIVE]` | red |
 | Recovery exhausted | `[RECONNECT FAILED]` | red |
-| `agentbridge kill` was run | `[BRIDGE STOPPED]` | dim |
+| `abg kill` was run | `[BRIDGE STOPPED]` | dim |
 
 These tags replace the in-band system notifications that the upstream bridge pushed into Claude's MCP channel. The MCP channel is now reserved exclusively for Codex's real `agentMessage` replies, keeping routine lifecycle events out of Claude's context.
 
@@ -307,11 +354,19 @@ AgentBridge does not install or configure either tool for you; the intro just po
 
 ### Environment Variables
 
+All of these override whatever the project namespace resolved. Setting a port variable by hand opts that process out of per-project allocation.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CODEX_WS_PORT` | `4500` | Codex app-server WebSocket port |
-| `CODEX_PROXY_PORT` | `4501` | Bridge proxy port for the Codex TUI |
-| `AGENTBRIDGE_CONTROL_PORT` | `4502` | Control port between bridge.ts and daemon.ts |
+| `CODEX_WS_PORT` | project-derived, else `4500` | Codex app-server WebSocket port |
+| `CODEX_PROXY_PORT` | project-derived, else `4501` | Bridge proxy port for the Codex TUI |
+| `AGENTBRIDGE_CONTROL_PORT` | project-derived, else `4502` | Control port between bridge.ts and daemon.ts |
+| `AGENTBRIDGE_PROJECT_ID` | auto-set | The 8-hex project id, exported by the CLI so downstream processes agree on the namespace. Read, not usually set by hand |
+| `AGENTBRIDGE_FILTER_MODE` | `filtered` | `filtered` routes by marker (`[REPLY]` forward, `[STATUS]` buffer, `[FYI]` drop, untagged queue). `full` forwards every Codex message to Claude |
+| `AGENTBRIDGE_ATTENTION_WINDOW_MS` | `15000` | After a `[REPLY]`, how long `[STATUS]` traffic stays suppressed to give Claude room to respond |
+| `AGENTBRIDGE_IDLE_SHUTDOWN_MS` | `30000` | How long the daemon lingers with no attached client before exiting |
+| `AGENTBRIDGE_MAX_BUFFERED_MESSAGES` | `100` | Cap on messages buffered while no Claude client is attached |
+| `TUI_DISCONNECT_GRACE_MS` | `2500` | Grace period before a TUI disconnect is reported to Claude as real |
 | `AGENTBRIDGE_LIVENESS_PROBE_TIMEOUT_MS` | `3000` | Maximum wait for incumbent Claude pong before evicting on contention (issue #68) |
 | `AGENTBRIDGE_STATE_DIR` | Platform default | State directory for pid, status, logs (macOS: `~/Library/Application Support/agentbridge/`, Linux: `$XDG_STATE_HOME/agentbridge/`) |
 | `AGENTBRIDGE_MODE` | `push` | Message delivery mode (`push` for channels, `pull` for API key mode) |
@@ -324,14 +379,16 @@ AgentBridge does not install or configure either tool for you; the intro just po
 
 ### State Directory
 
-The daemon stores runtime state in a platform-aware directory:
+The daemon stores runtime state in a platform-aware base directory:
 
-| Platform | Default Path |
+| Platform | Default Base Path |
 |----------|-------------|
 | macOS | `~/Library/Application Support/agentbridge/` |
 | Linux | `$XDG_STATE_HOME/agentbridge/` (fallback: `~/.local/state/agentbridge/`) |
 
-Contents: `daemon.pid`, `status.json`, `agentbridge.log`, `killed` (sentinel), `startup.lock`
+Inside a project (a `.agentbridge/` marker was found), state nests one level deeper under the project id — `<base>/<projectId>/` — so projects never share a pid file, log, or kill sentinel. Without a marker, state lives directly in the base directory. An explicit `AGENTBRIDGE_STATE_DIR` is used verbatim and is **not** nested.
+
+Contents of the resolved directory: `daemon.pid`, `status.json`, `agentbridge.log`, `killed` (sentinel), `startup.lock`
 
 ### Disabled Bridge States
 
@@ -339,18 +396,19 @@ The bridge can enter several dormant states when it cannot accept new MCP replie
 
 | State | Cause | Recovery |
 |-------|-------|----------|
-| `killed` | `agentbridge kill` was run, sentinel file present. | Restart Claude Code (`agentbridge claude`), switch to a new conversation, or run `/resume`. |
-| `rejected` | Daemon rejected the connection: another Claude session is already attached. | Close the other session, or run `agentbridge kill` to reset, then `agentbridge claude` again. |
-| `evicted` | A newer session evicted this one after the incumbent failed a liveness probe (issue #68). | Close this session and start a fresh one with `agentbridge claude`. |
+| `killed` | `abg kill` was run, sentinel file present. | Restart Claude Code (`abg claude`), switch to a new conversation, or run `/resume`. |
+| `rejected` | Daemon rejected the connection: another Claude session is already attached. | Close the other session, or run `abg kill` to reset, then `abg claude` again. |
+| `evicted` | A newer session evicted this one after the incumbent failed a liveness probe (issue #68). | Close this session and start a fresh one with `abg claude`. |
 | `probe_in_progress` | A liveness probe is currently checking the incumbent — contention window. Transient (auto-recovers within `DISABLED_RECOVERY_INTERVAL_MS` × cap, ~30 s). | None needed; the recovery poller reconnects automatically when the slot clears. |
-| `auto_recovery_exhausted` | The auto-recovery poller for `probe_in_progress` ran its full retry budget (6 attempts, ~30 s) without succeeding. Terminal. | Retry manually with `agentbridge claude`. |
+| `auto_recovery_exhausted` | The auto-recovery poller for `probe_in_progress` ran its full retry budget (6 attempts, ~30 s) without succeeding. Terminal. | Retry manually with `abg claude`. |
 
 ## Current Limitations
 
 - Only forwards `agentMessage` items, not intermediate `commandExecution`, `fileChange`, or similar events
-- Single Codex thread, no multi-session support yet
-- Single Claude foreground connection; a new Claude session replaces the previous one
-- Fixed ports mean only one AgentBridge instance per machine (multi-project support planned for post-v1)
+- One Codex thread per project; no multiple concurrent threads within a single project
+- One Claude foreground connection per project; a new Claude session evicts the previous one after a liveness probe
+- Port slots are `projectId mod 1000`, so two projects can collide once you have enough of them on one machine — nothing detects or reassigns the collision today
+- Agent roles and the collaboration prompt are hardcoded in `src/collaboration-content.ts`; there is no per-project role customization yet
 
 ### Codex git restrictions
 
