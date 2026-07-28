@@ -17,6 +17,16 @@ export interface DaemonStatus {
   claudeAttached: boolean;
   /** Claude→Codex replies deferred because Codex was mid-turn. */
   pendingReplyCount: number;
+  /**
+   * Which project this daemon serves — `null` outside a project.
+   *
+   * Reported so a health probe can ask *whose* daemon answered. Ids
+   * hash into 1000 port slots, so two projects can derive the same
+   * control port; without this, the loser of that collision attaches
+   * to the winner's daemon and its Claude ends up driving another
+   * project's Codex with nothing failing anywhere.
+   */
+  projectId: string | null;
 }
 
 /**
@@ -37,7 +47,14 @@ export interface ReplyOutcome {
 }
 
 export type ControlClientMessage =
-  | { type: "claude_connect" }
+  /**
+   * `projectId` is the frontend declaring who it is, so the daemon can
+   * refuse a Claude that reached it through a port-slot collision
+   * rather than quietly wiring it to another project's Codex. Optional:
+   * a pre-0.7 frontend does not send it, and single-instance mode has
+   * nothing to send.
+   */
+  | { type: "claude_connect"; projectId?: string | null }
   | { type: "claude_disconnect" }
   | { type: "claude_to_codex"; requestId: string; message: BridgeMessage; requireReply?: boolean }
   | { type: "status" };
@@ -86,6 +103,15 @@ export const CLOSE_CODE_REPLACED = 4001;
  * so a newer session can take over when the OS never surfaced FIN on a dead peer.
  */
 export const CLOSE_CODE_EVICTED_STALE = 4002;
+
+/**
+ * WebSocket close code sent by the daemon when a frontend from a
+ * different project connects — the data-level half of the identity
+ * check in `DaemonLifecycle`. Reaching this means two projects derive
+ * the same control port; the connection is refused rather than served,
+ * because serving it crosses two repos' messages.
+ */
+export const CLOSE_CODE_PROJECT_MISMATCH = 4003;
 
 /**
  * WebSocket close code sent by the daemon when a contestant arrives while a

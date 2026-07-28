@@ -29,6 +29,9 @@ interface DaemonClientEvents {
 
 let nextSocketId = 0;
 
+/** How long to wait for the daemon to accept a control connection. */
+const CONNECT_TIMEOUT_MS = 5000;
+
 export class DaemonClient extends EventEmitter<DaemonClientEvents> {
   private ws: WebSocket | null = null;
   private wsId: number = 0; // Track socket identity for debugging
@@ -65,31 +68,53 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
       const ws = new WebSocket(this.url);
       let settled = false;
 
-      ws.onopen = () => {
+      // A connect to a dead daemon is only fast when the host answers
+      // with RST. Where the SYN is dropped instead (WSL2 behind the
+      // Windows firewall), this socket sits in CONNECTING for the
+      // kernel's full SYN-retry budget — over two minutes of a Claude
+      // session hanging with no explanation. The daemon is on loopback:
+      // if it has not accepted in five seconds, it is not there.
+      const timer = setTimeout(() => {
+        if (settled) return;
         settled = true;
-        this.ws = ws;
-        this.wsId = socketId;
-        this.attachSocketHandlers(ws, socketId);
-        this.log(`ws#${socketId} opened and attached`);
-        resolve();
+        try { ws.close(); } catch {}
+        reject(new Error(`Timed out connecting to AgentBridge daemon at ${this.url}`));
+      }, CONNECT_TIMEOUT_MS);
+
+      const settle = (action: () => void) => {
+        settled = true;
+        clearTimeout(timer);
+        action();
+      };
+
+      ws.onopen = () => {
+        settle(() => {
+          this.ws = ws;
+          this.wsId = socketId;
+          this.attachSocketHandlers(ws, socketId);
+          this.log(`ws#${socketId} opened and attached`);
+          resolve();
+        });
       };
 
       ws.onerror = () => {
         if (settled) return;
-        settled = true;
-        reject(new Error(`Failed to connect to AgentBridge daemon at ${this.url}`));
+        settle(() => reject(new Error(`Failed to connect to AgentBridge daemon at ${this.url}`)));
       };
 
       ws.onclose = () => {
         if (settled) return;
-        settled = true;
-        reject(new Error(`AgentBridge daemon closed the connection during startup (${this.url})`));
+        settle(() =>
+          reject(new Error(`AgentBridge daemon closed the connection during startup (${this.url})`)),
+        );
       };
     });
   }
 
   attachClaude() {
-    this.send({ type: "claude_connect" });
+    // Declare who we are: the daemon refuses a frontend from another
+    // project rather than wiring it to the wrong Codex.
+    this.send({ type: "claude_connect", projectId: process.env.AGENTBRIDGE_PROJECT_ID ?? null });
   }
 
   async attachClaudeAndWaitForStatus(timeoutMs = 1000): Promise<boolean> {

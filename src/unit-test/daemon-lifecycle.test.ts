@@ -127,4 +127,93 @@ describe("DaemonLifecycle", () => {
     const result = await lc.kill();
     expect(result).toBe(false);
   });
+
+  describe("identityMatches", () => {
+    test("same project id matches", () => {
+      expect(DaemonLifecycle.identityMatches("abc12345", "abc12345")).toBe(true);
+    });
+
+    test("a different project id does not", () => {
+      expect(DaemonLifecycle.identityMatches("abc12345", "def67890")).toBe(false);
+    });
+
+    test("no expectation accepts anything, which is single-instance mode", () => {
+      expect(DaemonLifecycle.identityMatches(null, "abc12345")).toBe(true);
+      expect(DaemonLifecycle.identityMatches(null, null)).toBe(true);
+      expect(DaemonLifecycle.identityMatches(null, undefined)).toBe(true);
+    });
+
+    test("a daemon that reports no id is accepted, so an upgrade does not orphan it", () => {
+      // Pre-0.7 daemons have no projectId in /healthz. Refusing them
+      // would strand a running daemon on the first launch after upgrade.
+      expect(DaemonLifecycle.identityMatches("abc12345", undefined)).toBe(true);
+    });
+
+    test("a daemon outside any project does not serve a project", () => {
+      // `null` is reported, not absent: the daemon is new enough to
+      // answer, and its answer is "I belong to no project".
+      expect(DaemonLifecycle.identityMatches("abc12345", null)).toBe(false);
+    });
+  });
+
+  describe("isHealthy identity check", () => {
+    let server: ReturnType<typeof Bun.serve> | null = null;
+
+    afterEach(() => {
+      server?.stop(true);
+      server = null;
+    });
+
+    /** Stand up a /healthz that answers like a daemon of `projectId`. */
+    function serveHealthz(body: Record<string, unknown>): number {
+      server = Bun.serve({
+        port: 0,
+        hostname: "127.0.0.1",
+        fetch: () => Response.json(body),
+      });
+      const port = server.port;
+      if (port === undefined) throw new Error("test server did not bind a port");
+      return port;
+    }
+
+    function lifecycleFor(port: number, projectId: string | null) {
+      return new DaemonLifecycle({
+        stateDir,
+        controlPort: port,
+        log: (msg) => logs.push(msg),
+        projectId,
+      });
+    }
+
+    test("healthy when the daemon on the port belongs to this project", async () => {
+      const port = serveHealthz({ projectId: "abc12345", proxyUrl: "ws://127.0.0.1:1" });
+      expect(await lifecycleFor(port, "abc12345").isHealthy()).toBe(true);
+    });
+
+    test("not healthy when another project's daemon holds the port", async () => {
+      // The whole point of F2: something answers /healthz, so the old
+      // check said yes and this project attached to a foreign Codex.
+      const port = serveHealthz({ projectId: "def67890", proxyUrl: "ws://127.0.0.1:1" });
+      const lc = lifecycleFor(port, "abc12345");
+
+      expect(await lc.isHealthy()).toBe(false);
+      expect(logs.some((l) => l.includes("held by the daemon of project def67890"))).toBe(true);
+    });
+
+    test("the foreign-daemon warning is logged once, not once per retry", async () => {
+      const port = serveHealthz({ projectId: "def67890", proxyUrl: "ws://127.0.0.1:1" });
+      const lc = lifecycleFor(port, "abc12345");
+
+      await lc.isHealthy();
+      await lc.isHealthy();
+      await lc.isHealthy();
+
+      expect(logs.filter((l) => l.includes("held by the daemon of project")).length).toBe(1);
+    });
+
+    test("a daemon without a reported id is still accepted", async () => {
+      const port = serveHealthz({ proxyUrl: "ws://127.0.0.1:1" });
+      expect(await lifecycleFor(port, "abc12345").isHealthy()).toBe(true);
+    });
+  });
 });

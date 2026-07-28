@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# A `codex` that is only a codex to the one caller that matters.
+#
+# CodexAdapter spawns the binary by name (`spawn("codex", ["app-server",
+# "--listen", url])`), so putting this directory first on PATH is enough
+# to swap the app-server for the deterministic fake without touching
+# production code. Any other subcommand falls through to the real binary
+# so a stray call is a visible failure rather than a silent no-op.
+set -euo pipefail
+
+if [[ "${1:-}" == "app-server" ]]; then
+  shift
+  exec bun run "$(dirname "$(readlink -f "$0")")/../fake-codex-app-server.ts" "$@"
+fi
+
+real="$(PATH="$(echo "$PATH" | tr ':' '\n' | grep -v "$(dirname "$(readlink -f "$0")")" | paste -sd:)" command -v codex || true)"
+if [[ -z "$real" ]]; then
+  echo "fake codex shim: no real codex on PATH for subcommand '${1:-}'" >&2
+  exit 127
+fi
+exec "$real" "$@"

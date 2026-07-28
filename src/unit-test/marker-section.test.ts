@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { upsertMarkedSection } from "../marker-section";
+import { upsertMarkedSection, readMarkedSection } from "../marker-section";
 
 const SECTION_ID = "TestSection";
 const START = `<!-- ${SECTION_ID}:start -->`;
@@ -88,5 +88,43 @@ describe("upsertMarkedSection", () => {
     expect(() => upsertMarkedSection(existing, SECTION_ID, "NEW")).toThrow(
       /Malformed .* markers/,
     );
+  });
+});
+
+describe("readMarkedSection", () => {
+  test("returns the text a write put between the markers", () => {
+    const content = upsertMarkedSection("# Title\n", SECTION_ID, "ROLE TEXT");
+    expect(readMarkedSection(content, SECTION_ID)).toBe("ROLE TEXT");
+  });
+
+  test("reads a multi-line block without the markers", () => {
+    const content = upsertMarkedSection("", SECTION_ID, "line one\n\nline two");
+    expect(readMarkedSection(content, SECTION_ID)).toBe("line one\n\nline two");
+  });
+
+  test("leaves surrounding content out of the result", () => {
+    const content = `# Before\n${START}\nINSIDE\n${END}\n# After\n`;
+    expect(readMarkedSection(content, SECTION_ID)).toBe("INSIDE");
+  });
+
+  test("no markers → null", () => {
+    expect(readMarkedSection("# Just notes\n", SECTION_ID)).toBeNull();
+  });
+
+  test("empty block → null, since there is nothing worth adopting", () => {
+    expect(readMarkedSection(`${START}\n\n${END}\n`, SECTION_ID)).toBeNull();
+  });
+
+  test("malformed markers → null rather than a throw", () => {
+    // The write path refuses these loudly. The read path is used for
+    // salvage, where half a block is not text worth recovering.
+    expect(readMarkedSection(`${START}\nno end\n`, SECTION_ID)).toBeNull();
+    expect(readMarkedSection(`${END}\nno start\n`, SECTION_ID)).toBeNull();
+    expect(readMarkedSection(`${END}\nreversed\n${START}\n`, SECTION_ID)).toBeNull();
+  });
+
+  test("a different section id is not read", () => {
+    const content = upsertMarkedSection("", SECTION_ID, "MINE");
+    expect(readMarkedSection(content, "OtherSection")).toBeNull();
   });
 });

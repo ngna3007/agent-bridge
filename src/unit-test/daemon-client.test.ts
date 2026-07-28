@@ -71,10 +71,15 @@ describe("DaemonClient", () => {
   });
 
   test("connect() rejects when server is not reachable", async () => {
+    // Where the host refuses the connection this fails at once. Where it
+    // drops the SYN instead (WSL2 behind the Windows firewall), only the
+    // client's own timer ends it — untimed, this call sat in CONNECTING
+    // for over two minutes. Hence the headroom: the point is that it
+    // rejects on its own clock, not the kernel's.
     stopServer();
     const badClient = new DaemonClient("ws://127.0.0.1:19999/ws");
-    await expect(badClient.connect()).rejects.toThrow();
-  });
+    await expect(badClient.connect()).rejects.toThrow(/Failed to connect|Timed out connecting/);
+  }, 15_000);
 
   test("emits disconnect when server closes the socket", async () => {
     await client.connect();

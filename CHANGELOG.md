@@ -117,6 +117,54 @@ branches still in review. Cutting a release from here means a minor bump
   error when the other daemon is live. `ps` and `kill` in that path
   moved off the shell to `execFileSync` / `process.kill` with a
   validated numeric pid.
+- **A colliding project could attach to another project's daemon, and
+  its Claude would drive the wrong Codex.** The refusal above stops the
+  second *daemon* from binding a taken port; nothing stopped the second
+  *frontend* from using the daemon it found there. `isHealthy()` was
+  `fetch(/healthz).ok` with no identity in it, so a colliding project
+  decided the other project's daemon was its own, skipped launching,
+  and wired its Claude to a Codex running in an unrelated repo — with
+  no error on either side. Reproduced at the data level: a reply sent
+  by the second project was accepted and forwarded by the first
+  project's daemon. `/healthz` now reports `projectId`, health and
+  readiness probes refuse a daemon that belongs to someone else, and
+  the daemon closes a frontend from another project with
+  `CLOSE_CODE_PROJECT_MISMATCH` rather than serving it. A daemon that
+  reports no id at all is still accepted, so upgrading does not orphan
+  one that is already running.
+- **Every health probe could hang for over two minutes.** A `fetch` to
+  a port nothing listens on is fast only when the host answers with
+  RST. Where the SYN is dropped instead — WSL2 behind the default
+  Windows firewall does exactly this — connect() runs out the kernel's
+  SYN-retry budget first: measured at **141 seconds** per probe, before
+  `ensureRunning` even tries to launch the daemon, and turning
+  `waitForReady`'s 40 retries into over an hour of a session hanging
+  with no explanation. Probes now carry their own deadline (1.5s), as
+  does the control-socket connect in `DaemonClient` (5s). A probe is a
+  question about a local process; if it cannot be answered in a second
+  and a half, the answer is no.
+- **A taken control port produced `Failed to start server. Is port
+  17843 in use?`** — an uncaught `Bun.serve` exception naming neither
+  the holder nor the fix, while the message that explains port slots
+  sat further down a startup path the daemon never reached. Both the
+  daemon and `ensureRunning` now ask who holds the port before binding
+  it, and fail with a message that names the holding project, its pid,
+  why two projects can share a slot, and the two ways out.
+- **The daemon exited 0 after failing to start.** Anything fatal during
+  startup — a lost bind race, an unbindable port — was reported to the
+  log and then left the process to exit successfully, so a supervisor,
+  a launcher, or a script saw a clean shutdown rather than a failure.
+  A startup failure now exits 1.
+- **Upgrading overwrote hand-edited role text.** Before 0.7 the marked
+  block in `CLAUDE.md` / `AGENTS.md` *was* the role, and editing it in
+  place was the documented way to change what an agent is told. On the
+  first launch after upgrading, `syncRoleSections` rendered
+  `.agentbridge/roles/<agent>.md` — freshly seeded from the built-in
+  default — straight over that text, with no warning and nothing to
+  recover from. Both `abg init` and every launch now adopt an existing
+  marked block into the role file when the role file does not exist
+  yet, and say where the text went. Only a missing role file is
+  adopted into; an existing one is never touched.
 - `[REPLY]` marker identity is preserved in `full` filter mode.
   `classifyMessage()` hard-coded `marker: "untagged"` there, discarding
   what `parseMarker()` had already resolved, so a correctly-tagged Codex
