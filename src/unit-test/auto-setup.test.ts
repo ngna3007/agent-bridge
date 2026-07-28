@@ -148,6 +148,26 @@ describe("decideSetupOffer", () => {
     expect(d.offer).toBe(false);
     if (!d.offer) expect(d.reason).toBe("already-a-project");
   });
+
+  test("the project lookup is injectable", () => {
+    // The real lookup walks up from cwd, so a checkout that is itself an
+    // AgentBridge project would answer "already-a-project" for every
+    // path a test could pass. Overriding it keeps the decision under the
+    // test's control rather than the working directory's.
+    const seen: string[] = [];
+    const d = decideSetupOffer(
+      ctx({
+        findExistingProject: (from) => {
+          seen.push(from);
+          return "/elsewhere/some-other-project";
+        },
+      }),
+    );
+
+    expect(seen).toEqual([root]);
+    expect(d.offer).toBe(false);
+    if (!d.offer) expect(d.reason).toBe("already-a-project");
+  });
 });
 
 describe("findGitRoot", () => {

@@ -1,13 +1,5 @@
-import { spawn, execSync } from "node:child_process";
-import {
-  openSync,
-  writeSync,
-  closeSync,
-  writeFileSync,
-  unlinkSync,
-  existsSync,
-  mkdirSync,
-} from "node:fs";
+import { spawn } from "node:child_process";
+import { writeFileSync, unlinkSync, existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { StateDirResolver } from "../state-dir";
 import { ConfigService } from "../config-service";
@@ -16,6 +8,7 @@ import { StderrRingBuffer } from "../stderr-ring-buffer";
 import { getRotatingLogger } from "../log-rotator";
 import { checkOwnedFlagConflicts } from "./claude";
 import { syncRolesForLaunch } from "./role-sync";
+import { restoreTerminal as restoreTerminalState, saveTerminalState } from "./terminal-restore";
 
 /**
  * Write a timestamped entry to the codex wrapper log.
@@ -196,55 +189,11 @@ export async function runCodex(args: string[]) {
   // Save terminal state and launch Codex with protection
   console.log(`Connecting Codex TUI to AgentBridge at ${proxyUrl}...`);
 
-  // Save terminal state
-  let savedStty: string | null = null;
-  if (process.stdin.isTTY) {
-    try {
-      savedStty = execSync("stty -g", { encoding: "utf-8", stdio: ["inherit", "pipe", "pipe"] }).trim();
-    } catch {}
-  }
-
-  function restoreTerminal() {
-    // Restore saved terminal settings
-    if (savedStty && process.stdin.isTTY) {
-      try {
-        execSync(`stty ${savedStty}`, { stdio: ["inherit", "ignore", "ignore"] });
-      } catch {
-        try {
-          execSync("stty sane", { stdio: ["inherit", "ignore", "ignore"] });
-        } catch {}
-      }
-    }
-
-    // Write escape sequences to /dev/tty if available
-    let ttyFd: number | null = null;
-    try {
-      ttyFd = openSync("/dev/tty", "w");
-    } catch {
-      if (process.stdout.isTTY) {
-        ttyFd = 1; // stdout
-      }
-    }
-
-    if (ttyFd !== null) {
-      const sequences = [
-        "\x1b[<u",       // Disable keyboard enhancement
-        "\x1b[?2004l",   // Disable bracketed paste
-        "\x1b[?1004l",   // Disable focus tracking
-        "\x1b[?1049l",   // Leave alternate screen
-        "\x1b[?25h",     // Show cursor
-        "\x1b[0m",       // Reset character attributes
-      ];
-      for (const seq of sequences) {
-        try {
-          writeSync(ttyFd, seq);
-        } catch {}
-      }
-      if (ttyFd !== 1) {
-        try { closeSync(ttyFd); } catch {}
-      }
-    }
-  }
+  // Capture the terminal before the TUI takes it over, so every exit
+  // path below can hand it back. See src/cli/terminal-restore.ts for
+  // why this lives in its own module.
+  const savedStty = saveTerminalState();
+  const restoreTerminal = () => restoreTerminalState(savedStty);
 
   const { fullArgs } = buildCodexArgs(args, proxyUrl);
 

@@ -357,14 +357,28 @@ try {
 // reason.
 console.log("\n== T2.4 daemon's Claude-online kickoff runs as a real Codex turn ==");
 
+/**
+ * True once a `turn/completed` has arrived *after* a `turn/started`.
+ *
+ * The ordering matters. Checking each method independently would accept
+ * a `turn/completed` left over from an earlier turn paired with a
+ * `turn/started` for one still running — which is exactly the state
+ * this harness is in between steps, so the looser check would report a
+ * finished turn while Codex was still working.
+ */
+function turnCompletedAfterStart(notes: ReadonlyArray<{ method: string }>): boolean {
+  const start = notes.findIndex((n) => n.method === "turn/started");
+  if (start === -1) return false;
+  return notes.slice(start + 1).some((n) => n.method === "turn/completed");
+}
+
 async function waitForTurn(label: string, timeoutMs: number): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
-  let sawStart = false;
   while (Date.now() < deadline) {
-    if (tuiNotifications.some((n) => n.method === "turn/started")) sawStart = true;
-    if (sawStart && tuiNotifications.some((n) => n.method === "turn/completed")) return true;
+    if (turnCompletedAfterStart(tuiNotifications)) return true;
     await sleep(500);
   }
+  const sawStart = tuiNotifications.some((n) => n.method === "turn/started");
   console.log(`  (timed out waiting for ${label}: sawStart=${sawStart})`);
   return false;
 }

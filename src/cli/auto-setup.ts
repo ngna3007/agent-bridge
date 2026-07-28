@@ -59,6 +59,13 @@ export interface SetupOfferContext {
   autoSetupEnv?: string;
   /** Injectable for tests. Defaults to a real `.git` lookup. */
   findGitRoot?: (from: string) => string | null;
+  /**
+   * Injectable for tests. Defaults to the real `.agentbridge/` walk-up.
+   * Without this, a test running from inside a checkout that is itself
+   * an AgentBridge project would take the "already-a-project" branch no
+   * matter what `cwd` it passed.
+   */
+  findExistingProject?: (from: string) => string | null;
   /** Injectable for tests. Defaults to the real home directory. */
   home?: string;
 }
@@ -77,7 +84,7 @@ export function decideSetupOffer(ctx: SetupOfferContext): SetupOfferDecision {
   if (!ctx.command || !SETUP_AWARE_COMMANDS.has(ctx.command)) {
     return { offer: false, reason: "not-setup-aware-command" };
   }
-  if (findProjectRoot(ctx.cwd)) {
+  if ((ctx.findExistingProject ?? findProjectRoot)(ctx.cwd)) {
     return { offer: false, reason: "already-a-project" };
   }
   const optOut = ctx.autoSetupEnv?.toLowerCase();
@@ -180,7 +187,13 @@ export async function maybeOfferSetup(command: string | undefined): Promise<bool
 
   try {
     const { performProjectSetup, printCustomizationSummary } = await import("./init");
-    performProjectSetup(targetDir);
+    const { unrendered } = performProjectSetup(targetDir);
+    // A section that did not render is not a reason to abandon the
+    // launch: the project is real, the ports are right, and the
+    // launcher re-renders and reports properly a moment from now.
+    for (const line of unrendered) {
+      console.error(`[abg] ${line}`);
+    }
     printCustomizationSummary(targetDir);
     console.log("");
     return true;

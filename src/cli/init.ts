@@ -3,7 +3,13 @@ import { basename, relative } from "node:path";
 import { ConfigService, DEFAULT_CONFIG } from "../config-service";
 import { MARKETPLACE_NAME, PLUGIN_NAME } from "../cli";
 import { findPackageRoot, registerMarketplace } from "./pkg-root";
-import { seedRoleFiles, syncRoleSections } from "../roles";
+import {
+  ROLE_AGENTS,
+  RoleFileError,
+  instructionFilePath,
+  seedRoleFiles,
+  syncRoleSections,
+} from "../roles";
 import { checkSetupLocation, computeProjectId, computeProjectPorts } from "../project-id";
 import { homedir } from "node:os";
 
@@ -40,7 +46,21 @@ export async function runInit() {
   checkCodex();
   console.log("");
 
-  performProjectSetup(cwd);
+  const { unrendered } = performProjectSetup(cwd);
+
+  if (unrendered.length > 0) {
+    // The project exists and is usable, but an agent is missing its
+    // instructions. Exit non-zero so a scripted setup notices, and say
+    // which file to fix rather than reporting a clean "Setup complete!".
+    console.log("Setup finished with problems.\n");
+    for (const line of unrendered) console.log(`  ${line}`);
+    console.log("");
+    console.log("The project is configured, but the section above never reached its file,");
+    console.log("so that agent will launch without its role. Fix the role file and rerun");
+    console.log("`abg roles apply` — `abg roles` shows the current state of both.");
+    process.exitCode = 1;
+    return;
+  }
 
   console.log("Setup complete!\n");
   printCustomizationSummary(cwd);
@@ -61,8 +81,13 @@ export async function runInit() {
  * Caller is responsible for `checkSetupLocation` and dependency checks —
  * they differ between the two entry points (init exits, auto-setup
  * declines silently).
+ *
+ * Returns the collaboration sections that did not render. The project
+ * is still set up when that list is non-empty — config.json, the role
+ * files, and the plugin are all in place — but the agent whose section
+ * is missing will not see its instructions, so callers have to say so.
  */
-export function performProjectSetup(projectRoot: string): void {
+export function performProjectSetup(projectRoot: string): { unrendered: string[] } {
   // Generate project config with per-project derived ports. The
   // .agentbridge/ directory acts as the project marker for the CLI's
   // namespace logic (project-id.ts), and the codex ports in
@@ -101,8 +126,9 @@ export function performProjectSetup(projectRoot: string): void {
   console.log("");
 
   console.log("Rendering collaboration sections...");
-  for (const result of writeCollaborationSections(projectRoot)) {
-    console.log(`  ${result}`);
+  const sections = writeCollaborationSections(projectRoot);
+  for (const result of sections) {
+    console.log(`  ${result.line}`);
   }
   console.log("");
 
@@ -122,6 +148,8 @@ export function performProjectSetup(projectRoot: string): void {
     console.log(`    abg dev   # registers marketplace and installs plugin`);
   }
   console.log("");
+
+  return { unrendered: sections.filter((s) => !s.ok).map((s) => s.line) };
 }
 
 /**
@@ -231,29 +259,56 @@ function compareVersions(a: string, b: string): number {
   return 0;
 }
 
+/** One rendered instruction file: what happened, and whether it worked. */
+export interface CollaborationSectionResult {
+  /** Human-readable status line, already prefixed with the file name. */
+  line: string;
+  /** False when the section did not make it into the file. */
+  ok: boolean;
+}
+
 /**
  * Render the per-agent role files into CLAUDE.md / AGENTS.md and
- * return one human-readable status line per file.
+ * return one status line per file.
  *
  * The section content comes from `.agentbridge/roles/<agent>.md`, not
  * from a constant — see `src/roles.ts`. Callers that have not seeded
  * those files yet still get the built-in defaults, so this stays safe
  * to call on a project created by an older version.
+ *
+ * Renders one agent at a time and reports a bad role file as a result
+ * rather than throwing. Setup has already written config.json by the
+ * time this runs, so an exception here would leave a half-made project
+ * behind — and one unusable role file is no reason to skip the other
+ * agent's section or the plugin install.
  */
-export function writeCollaborationSections(projectRoot: string): string[] {
-  return syncRoleSections(projectRoot).map((outcome) => {
-    const name = basename(outcome.file);
-    switch (outcome.status) {
+export function writeCollaborationSections(projectRoot: string): CollaborationSectionResult[] {
+  return ROLE_AGENTS.map((agent) => {
+    const name = basename(instructionFilePath(projectRoot, agent));
+    let outcome;
+    try {
+      [outcome] = syncRoleSections(projectRoot, { agents: [agent] });
+    } catch (err) {
+      const reason =
+        err instanceof RoleFileError
+          ? err.message.split("\n")[0]
+          : err instanceof Error
+            ? err.message
+            : String(err);
+      return { line: `${name}: skipped — ${reason}`, ok: false };
+    }
+
+    switch (outcome!.status) {
       case "skipped":
-        return `${name}: skipped — ${outcome.detail}`;
+        return { line: `${name}: skipped — ${outcome!.detail}`, ok: false };
       case "unchanged":
-        return `${name}: unchanged (section already up to date)`;
+        return { line: `${name}: unchanged (section already up to date)`, ok: true };
       case "created":
-        return `${name}: created with collaboration section`;
+        return { line: `${name}: created with collaboration section`, ok: true };
       case "updated":
-        return `${name}: updated collaboration section`;
+        return { line: `${name}: updated collaboration section`, ok: true };
       case "appended":
-        return `${name}: appended collaboration section`;
+        return { line: `${name}: appended collaboration section`, ok: true };
     }
   });
 }

@@ -204,3 +204,8 @@ temp directory.
   the obvious next thing to add.
 - Neither live tier asserts on token cost or latency, so a regression
   that makes the bridge slow but correct would pass.
+- Tier 4's list shrank by one: terminal save/restore now has unit
+  coverage via the injected seam in `src/cli/terminal-restore.ts`. What
+  a human still has to confirm is that the *real* escape sequences fix a
+  *real* wrecked terminal — the tests prove the calls are made, in
+  order, with the right fallbacks, not that the codes work.

@@ -44,6 +44,17 @@ branches still in review. Cutting a release from here means a minor bump
   changes what a real agent actually does. Both spend real model tokens,
   so they run via `bun run test:live:bridge` / `test:live:roles` rather
   than `bun test src`. `docs/test-plan.md` maps the five tiers.
+- **Coverage for terminal restore.** `src/cli/terminal-restore.ts` lifts
+  the save/restore out of `abg codex` behind an injected syscall seam,
+  with 12 tests. This is the code that rescues a shell after the Codex
+  TUI dies without cleaning up — no echo, no cursor, stuck in the
+  alternate screen — and it had no coverage at all, because none of it
+  is reachable from a test runner: no TTY, `stty` fails, `/dev/tty` will
+  not open. The fallbacks are now assertable: `stty sane` when the saved
+  state is rejected, stdout when `/dev/tty` is unavailable, no writes at
+  all when stdout is a pipe, and the remaining sequences still sent
+  after one write fails. `stty` also moved from `execSync` with an
+  interpolated command string to `execFileSync` with an argv array.
 
 ### Fixed
 
@@ -70,6 +81,23 @@ branches still in review. Cutting a release from here means a minor bump
 - Tier 3's `T3.6` assertion could not fail: it refuted a token that an
   earlier step had already replaced. It now asserts that the previous
   role text survived the aborted render, which is the actual claim.
+- `abg init` no longer aborts halfway through on an unusable role file.
+  `writeCollaborationSections` threw, and it runs *after* `config.json`
+  is written and *before* the plugin install — so a blank role file left
+  a half-made project and skipped the other agent's section for a
+  problem unrelated to it. It now renders one agent at a time, reports
+  the bad one, finishes the rest, and exits non-zero with the file to
+  fix.
+- `abg claude` says something when setup succeeds but the namespace does
+  not resolve. `maybeOfferSetup`'s return value was discarded, so the
+  one case it was there to catch — the user answers "yes" and still gets
+  the shared ports — was indistinguishable from a normal unconfigured
+  launch.
+- Tier 2's turn detection accepted a `turn/completed` from an earlier
+  turn paired with a `turn/started` from one still running. It now
+  requires the completion to come *after* the start, which is the state
+  the harness is actually in between steps.
+
 - Codex's default role no longer contradicts itself. `AGENTS_MD_SECTION`
   shipped both "you are the Advisor / Reviewer, you do NOT ship the
   change" and "Default role: Implementer, Executor, Verifier" in the

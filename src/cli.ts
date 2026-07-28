@@ -29,7 +29,7 @@ export const PLUGIN_NAME = "agentbridge";
  * `init`, `dev`, and metadata commands - they should not pick up a
  * project namespace from a stale ancestor `.agentbridge/`.
  */
-function maybeApplyProjectNamespace(cmd: string | undefined): void {
+function maybeApplyProjectNamespace(cmd: string | undefined, justCreatedProject = false): void {
   if (!cmd) return;
   // init / dev / --help / --version run in "no project yet" mode -
   // their decisions don't depend on a daemon, so we leave env alone.
@@ -42,7 +42,20 @@ function maybeApplyProjectNamespace(cmd: string | undefined): void {
   if (!namespaced.has(cmd)) return;
 
   const ns = resolveRuntimeNamespace({ mutateEnv: true });
-  if (!ns.project) return; // single-instance fallback - historical behavior
+  if (!ns.project) {
+    // Normally this is the historical single-instance fallback and is
+    // fine. But if setup just wrote a `.agentbridge/` marker, the
+    // namespace has to resolve — not resolving means the user answered
+    // "yes" and is silently getting the shared ports anyway, which is
+    // the exact failure the first-run offer exists to prevent.
+    if (justCreatedProject) {
+      process.stderr.write(
+        "[abg] Project was created but its namespace did not resolve — " +
+          "continuing on the shared ports 4500/4501/4502. Run `abg doctor`.\n",
+      );
+    }
+    return;
+  }
 
   // One-line startup banner so the user can see at a glance which
   // project this terminal is talking to. Stays out of automation
@@ -61,9 +74,9 @@ async function main() {
   // otherwise the user answers "yes" and still gets fallback ports for
   // the rest of this session.
   const { maybeOfferSetup } = await import("./cli/auto-setup");
-  await maybeOfferSetup(command);
+  const createdProject = await maybeOfferSetup(command);
 
-  maybeApplyProjectNamespace(command);
+  maybeApplyProjectNamespace(command, createdProject);
 
   switch (command) {
     case "init":
