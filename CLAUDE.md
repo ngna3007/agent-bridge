@@ -14,6 +14,8 @@ Runtime is **Bun** — do not change the local Bun version.
 | Run a single test file | `bun test src/unit-test/<name>.test.ts` |
 | Run a single test by name | `bun test src -t "<test name pattern>"` |
 | Full pre-commit check | `bun run check` (typecheck + tests + plugin sync + plugin versions) |
+| Live bridge E2E (real tokens) | `bun run test:live:bridge` (Tier 2 — see `docs/test-plan.md`) |
+| Live roles E2E (real tokens) | `bun run test:live:roles` (Tier 3) |
 | Build CLI binary | `bun run build:cli` → `dist/cli.js` |
 | Build plugin bundle | `bun run build:plugin` → `plugins/agentbridge/server/{bridge-server,daemon}.js` |
 | Verify plugin sync | `bun run verify:plugin-sync` |
@@ -77,6 +79,8 @@ Ports are per-project (see the namespace invariant below), falling back to `4502
 - CLI integration: `src/e2e-cli.test.ts` + `src/unit-test/cli.test.ts`.
 - Reconnect E2E: `src/unit-test/e2e-reconnect.test.ts` and `src/unit-test/e2e/`.
 - `dual-mode.test.ts` covers push vs. pull delivery.
+- Live tests: `src/live-test/` — not in `bun test src`, because they spend real model tokens. `tier2-bridge-e2e.ts` drives the whole stack headlessly by having the harness speak the Codex TUI handshake itself (the adapter only needs the `thread/start` traffic to go past, not a real terminal); `tier3-roles.sh` proves an edited role file changes what a real agent does.
+- `docs/test-plan.md` is the tier map — what each level proves, what is headless, and what is still terminal-only.
 - Every PR must ship both unit tests and an E2E test plan before merge.
 
 ## Git Workflow
