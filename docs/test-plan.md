@@ -38,13 +38,21 @@ handshake traffic went past.
 | 0 | Unit — pure logic, adapters against fakes | yes | `bun test src` | seconds |
 | 1 | CLI integration — commands, setup, namespacing | yes | `bun test src` | seconds |
 | 2 | Full bridge E2E — real daemon, real app-server, real turn | yes | `bun run test:live:bridge` | minutes + tokens |
+| 2b | Reply outbox under a real held turn | yes | `bun run test:live:outbox` | ~1 min, no tokens |
+| 2c | A real port-slot collision between two projects | yes | `bun run test:live:collision` | ~1 min, no tokens |
+| 2d | `abg doctor --fix` against real drift | yes | `bun run test:live:doctor` | ~1 min, no tokens |
 | 3 | Role files change real agent behavior | yes | `bun run test:live:roles` | minutes + tokens |
 | 4 | Terminal-only — TUI rendering, keys, resume, restore | no | `docs/manual-test-plan.md` | manual |
 
-Tiers 0 and 1 gate every change. Tiers 2 and 3 spend real model tokens
-and take minutes, so they are deliberately outside `bun test src`; run
-them before a release or when touching the transport or the role
-pipeline.
+Tiers 0 and 1 gate every change. Tier 2 and Tier 3 spend real model
+tokens and take minutes, so they are deliberately outside `bun test
+src`; run them before a release or when touching the transport or the
+role pipeline.
+
+Tiers 2b–2d are outside `bun test src` for a different reason: they
+spawn real daemons on fixed ports and signal real processes, which is
+not something a unit run should do on a developer's machine. They cost
+no tokens — the app-server is a deterministic fake — so run them freely.
 
 ---
 
@@ -57,18 +65,22 @@ lifecycle bookkeeping, the app-server protocol helpers, role file
 seeding and rendering, the reply outbox, and the `abg log` parsing and
 filtering layer.
 
-Most recent run: **580 pass, 2 fail, 582 tests across 38 files (146s)**.
+Most recent run: **634 pass, 0 fail, 634 tests across 40 files (32s)**.
 
-The two failures are environmental and expected on this host:
+Two of these used to fail on WSL2 and were written off as
+environmental:
 
 - `DaemonLifecycle > isHealthy returns false for non-existent port`
 - `DaemonClient > connect() rejects when server is not reachable`
 
 WSL2 drops SYN to closed loopback ports rather than answering RST, so
-both tests wait for a refusal that never arrives. They pass on Linux and
-macOS. Any *other* failure is a real one. (The same quirk is why
-`portOpen` in the Tier 2 harness sets an explicit socket timeout instead
-of relying on `ECONNREFUSED`.)
+both waited for a refusal that never arrived. That was not a test
+problem. The probe measured **141 seconds** against a dead port, which
+is 141 seconds of an unexplained hang in a real session and turns
+`waitForReady`'s 40 retries into over an hour. Both probes now carry
+their own deadline (1.5s for health/readiness, 5s for the control
+connect), so the tests pass everywhere and the product no longer waits
+on the kernel's SYN-retry budget. Any failure here is now a real one.
 
 ## Tier 1 — CLI integration
 
@@ -144,6 +156,48 @@ CLI derives per project, so a live session on the same machine cannot
 collide. Override with `TIER2_APP_PORT`, `TIER2_PROXY_PORT`,
 `TIER2_CONTROL_PORT`.
 
+## Tiers 2b–2d — the failure edges, with a fake app-server
+
+Tier 2 needs a real `codex app-server` because its claim is that a real
+model turn survives the whole chain. The failure edges do not: what they
+assert is daemon behavior, and a real model only makes them slow and
+non-deterministic. `src/live-test/fake-codex-app-server.ts` speaks the
+app-server protocol — `thread/start`, `turn/start`, `turn/started` and
+`turn/completed` notifications, `item/agentMessage` — with turn duration
+set by `FAKE_TURN_MS`, so a harness can hold a turn open for exactly as
+long as it needs. `src/live-test/fake-codex-bin/codex` puts it on `PATH`
+under the name the daemon spawns.
+
+**2b — reply outbox** (`tier2-outbox-e2e.ts`). A reply sent while Codex
+is mid-turn must be held and injected on completion, and the daemon must
+say so rather than reporting success. Covers: the queue-on-refusal path,
+the drain on `turn/completed`, FIFO order across several held replies,
+the bounded-outbox eviction notice, expiry, and the "held reply was
+lost" notice when the app-server dies with a reply still queued — each
+asserted from Claude's side, where a dropped reply would look like
+silence. Most recent run: **19 passed, 0 failed**.
+
+**2c — port-slot collision** (`tier2-slot-collision.ts`). Project ids
+hash into 1000 port slots, so two projects on one machine can derive the
+same triple. Two daemons are started on one triple with different state
+dirs; the second must refuse to bind rather than kill the first's
+app-server, and must name the holder and the fix. The second half proves
+the identity guard at the data level: a frontend declaring project B
+against project A's daemon is closed with `CLOSE_CODE_PROJECT_MISMATCH`
+and its reply never reaches A's Codex — with a live thread on A first,
+so the check can actually fail. The last part finds two real directory
+paths whose ids genuinely collide (by search, not hand-picked hex) and
+asserts `abg doctor` names them. Most recent run: **18 passed, 0
+failed**.
+
+**2d — `abg doctor --fix`** (`tier2-doctor-fix.ts`). `--fix` deletes
+files and signals processes, so the refusals matter more than the
+repairs. Covers config drift, a stale pid file versus a live daemon, a
+stale lock versus a fresh one, reaping an orphaned `bridge-server`
+(a real detached process, via `setsid`), and a clean state dir where the
+correct behavior is to do nothing. Most recent run: **23 passed, 0
+failed**.
+
 ## Tier 3 — role files change real agent behavior
 
 `src/live-test/tier3-roles.sh`, via `bun run test:live:roles`.
@@ -199,10 +253,13 @@ presentation and terminal handling rather than message delivery.
 ## Running it
 
 ```bash
-bun run check              # typecheck + Tier 0/1 + plugin sync + version check
-bun test src               # Tier 0 + Tier 1 alone
-bun run test:live:bridge   # Tier 2  (minutes, real tokens)
-bun run test:live:roles    # Tier 3  (minutes, real tokens)
+bun run check               # typecheck + Tier 0/1 + plugin sync + version check
+bun test src                # Tier 0 + Tier 1 alone
+bun run test:live:bridge    # Tier 2   (minutes, real tokens)
+bun run test:live:outbox    # Tier 2b  (~1 min, no tokens)
+bun run test:live:collision # Tier 2c  (~1 min, no tokens)
+bun run test:live:doctor    # Tier 2d  (~1 min, no tokens)
+bun run test:live:roles     # Tier 3   (minutes, real tokens)
 ```
 
 Both live tiers take an optional lab directory as their first argument
@@ -211,19 +268,17 @@ temp directory.
 
 ## Known gaps
 
-- Tier 2 covers the happy path and the missing-thread rejection. The
-  failure edges — app-server crash mid-turn, Claude session swap,
-  daemon crash recovery — are still Tier 4 only. They are reachable from
-  the same harness (kill a process, assert the recovery path) and are
-  the obvious next thing to add.
-- Neither live tier asserts on token cost or latency, so a regression
-  that makes the bridge slow but correct would pass.
-- The reply outbox is unit-tested as a data structure, and the daemon
-  wiring around it (queue on refusal, drain on `turn/completed`, notice
-  on expiry or loss) is not covered end-to-end. Proving it needs a real
-  mid-turn refusal, which is exactly the Tier 2 shape — reply while the
-  harness holds a turn open, then assert the injection lands after the
-  completion. Worth adding alongside the failure edges above.
+- Tier 2 covers the happy path and the missing-thread rejection; 2b
+  covers a mid-turn app-server death. A Claude session swap and daemon
+  crash recovery are still Tier 4 only. Both are reachable from the 2b
+  harness (kill a process, assert the recovery path).
+- No live tier asserts on token cost or latency, so a regression that
+  makes the bridge slow but correct would pass.
+- 2c forces the colliding port triple through env rather than by
+  arranging two project roots that hash into it. The last part of the
+  same file proves real ids do collide and that `abg doctor` names them,
+  so what is untested is only the arithmetic in between — which is unit
+  covered.
 - Tier 4's list shrank by one: terminal save/restore now has unit
   coverage via the injected seam in `src/cli/terminal-restore.ts`. What
   a human still has to confirm is that the *real* escape sequences fix a

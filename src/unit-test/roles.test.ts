@@ -1,10 +1,11 @@
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   ROLE_AGENTS,
   RoleFileError,
+  adoptRoleSectionsFromInstructionFiles,
   instructionFilePath,
   missingRoutingMarkers,
   readRoleText,
@@ -161,6 +162,75 @@ describe("roles", () => {
       } catch (err) {
         expect((err as RoleFileError).path).toBe(roleFilePath(root, "claude"));
       }
+    });
+  });
+
+  describe("adoptRoleSectionsFromInstructionFiles", () => {
+    /** A project set up before role files existed: block, no roles dir. */
+    function legacyProject(text: string) {
+      writeFileSync(
+        instructionFilePath(root, "claude"),
+        `# Notes\n\n${START}\n${text}\n${END}\n\ntrailing\n`,
+        "utf-8",
+      );
+    }
+
+    test("salvages a hand-edited block into the role file", () => {
+      legacyProject("MY OWN ROLE TEXT");
+
+      const adopted = adoptRoleSectionsFromInstructionFiles(root, ["claude"]);
+
+      expect(adopted.map((a) => a.agent)).toEqual(["claude"]);
+      expect(readFileSync(roleFilePath(root, "claude"), "utf-8")).toBe("MY OWN ROLE TEXT\n");
+    });
+
+    test("the upgrade path no longer overwrites hand-edited text", () => {
+      legacyProject("MY OWN ROLE TEXT");
+
+      // What `syncRolesForLaunch` now does, in order.
+      adoptRoleSectionsFromInstructionFiles(root, ["claude"]);
+      const outcomes = syncRoleSections(root, { agents: ["claude"] });
+
+      expect(outcomes[0].usedDefault).toBe(false);
+      const rendered = readFileSync(instructionFilePath(root, "claude"), "utf-8");
+      expect(rendered).toContain("MY OWN ROLE TEXT");
+      expect(rendered).not.toContain(CLAUDE_MD_SECTION);
+      expect(rendered).toContain("trailing");
+    });
+
+    test("never touches an agent that already has a role file", () => {
+      seedRoleFiles(root, ["claude"]);
+      writeFileSync(roleFilePath(root, "claude"), "THE SOURCE", "utf-8");
+      legacyProject("STALE RENDERED OUTPUT");
+
+      expect(adoptRoleSectionsFromInstructionFiles(root, ["claude"])).toEqual([]);
+      expect(readFileSync(roleFilePath(root, "claude"), "utf-8")).toBe("THE SOURCE");
+    });
+
+    test("ignores a project with no instruction file", () => {
+      expect(adoptRoleSectionsFromInstructionFiles(root)).toEqual([]);
+      expect(existsSync(roleFilePath(root, "claude"))).toBe(false);
+    });
+
+    test("ignores an instruction file with no marked block", () => {
+      writeFileSync(instructionFilePath(root, "claude"), "# Just my notes\n", "utf-8");
+
+      expect(adoptRoleSectionsFromInstructionFiles(root, ["claude"])).toEqual([]);
+      expect(existsSync(roleFilePath(root, "claude"))).toBe(false);
+    });
+
+    test("ignores malformed markers rather than adopting half a block", () => {
+      writeFileSync(instructionFilePath(root, "claude"), `# Notes\n${START}\nno end marker\n`, "utf-8");
+
+      expect(adoptRoleSectionsFromInstructionFiles(root, ["claude"])).toEqual([]);
+      expect(existsSync(roleFilePath(root, "claude"))).toBe(false);
+    });
+
+    test("is idempotent - the second call has nothing left to adopt", () => {
+      legacyProject("MY OWN ROLE TEXT");
+
+      expect(adoptRoleSectionsFromInstructionFiles(root, ["claude"]).length).toBe(1);
+      expect(adoptRoleSectionsFromInstructionFiles(root, ["claude"])).toEqual([]);
     });
   });
 

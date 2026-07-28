@@ -14,6 +14,7 @@ import { relative } from "node:path";
 import { findProjectRoot } from "../project-id";
 import {
   RoleFileError,
+  adoptRoleSectionsFromInstructionFiles,
   missingRoutingMarkers,
   readRoleText,
   syncRoleSections,
@@ -34,6 +35,17 @@ import {
 export function syncRolesForLaunch(agent: RoleAgent, cwd = process.cwd()): void {
   const projectRoot = findProjectRoot(cwd);
   if (!projectRoot) return;
+
+  // Must run before anything renders: on a project that predates role
+  // files, the marked block is the only copy of the user's text, and
+  // rendering would overwrite it with the built-in default.
+  for (const adopted of adoptRoleSectionsFromInstructionFiles(projectRoot, [agent])) {
+    const source = relative(projectRoot, adopted.from) || adopted.from;
+    console.error(
+      `[agentbridge] adopted the existing ${source} role section into ` +
+        `.agentbridge/roles/${adopted.agent}.md — edit that file from now on.`,
+    );
+  }
 
   let outcomes;
   try {

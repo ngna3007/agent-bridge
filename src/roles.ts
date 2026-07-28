@@ -24,7 +24,7 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { upsertMarkedSection } from "./marker-section";
+import { upsertMarkedSection, readMarkedSection } from "./marker-section";
 import {
   MARKER_ID,
   CLAUDE_MD_SECTION,
@@ -125,6 +125,63 @@ export function seedRoleFiles(
     writeFileSync(path, seededRoleText(agent), "utf-8");
     return { agent, path, created: true };
   });
+}
+
+export interface AdoptOutcome {
+  agent: RoleAgent;
+  /** The role file that now holds the salvaged text. */
+  path: string;
+  /** The instruction file the text came from. */
+  from: string;
+}
+
+/**
+ * Rescue hand-edited role text from a project that predates role files.
+ *
+ * Before role files existed, the marked block in CLAUDE.md / AGENTS.md
+ * was the only copy of the collaboration text, and editing it was the
+ * only way to change what an agent was told. On such a project there is
+ * no `.agentbridge/roles/` directory, so the first launch after
+ * upgrading would read the built-in default (`readRoleText` falls back
+ * on a missing file) and render it straight over the block — silently
+ * replacing the user's text with stock instructions.
+ *
+ * So before anything renders: if an agent has no role file but its
+ * instruction file still carries a marked block, that block becomes the
+ * role file. The user's words survive the upgrade, and from then on the
+ * normal source-and-output relationship holds.
+ *
+ * Only ever *creates* role files. An agent that already has one is
+ * skipped entirely — the file is the source of truth and the block is
+ * disposable output, never the other way round.
+ */
+export function adoptRoleSectionsFromInstructionFiles(
+  projectRoot: string,
+  agents: readonly RoleAgent[] = ROLE_AGENTS,
+): AdoptOutcome[] {
+  const adopted: AdoptOutcome[] = [];
+
+  for (const agent of agents) {
+    const path = roleFilePath(projectRoot, agent);
+    if (existsSync(path)) continue;
+
+    const from = instructionFilePath(projectRoot, agent);
+    let existing: string;
+    try {
+      existing = readFileSync(from, "utf-8");
+    } catch {
+      continue; // No instruction file: nothing to salvage, seed/default applies.
+    }
+
+    const block = readMarkedSection(existing, MARKER_ID);
+    if (block === null) continue;
+
+    mkdirSync(rolesDir(projectRoot), { recursive: true });
+    writeFileSync(path, `${block}\n`, "utf-8");
+    adopted.push({ agent, path, from });
+  }
+
+  return adopted;
 }
 
 /**

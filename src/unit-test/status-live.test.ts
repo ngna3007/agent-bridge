@@ -33,6 +33,7 @@ const BASE_STATUS: DaemonStatus = {
   pid: 4242,
   claudeAttached: true,
   pendingReplyCount: 0,
+  projectId: null,
 };
 
 /**

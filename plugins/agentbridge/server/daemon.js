@@ -1729,6 +1729,59 @@ class TuiConnectionState {
 import { spawn as spawn2, execFileSync as execFileSync2 } from "child_process";
 import { existsSync as existsSync3, readFileSync as readFileSync2, unlinkSync as unlinkSync2, writeFileSync as writeFileSync3, openSync, closeSync, constants } from "fs";
 import { fileURLToPath } from "url";
+
+// src/port-preflight.ts
+import { connect } from "net";
+var PROBE_TIMEOUT_MS = 1500;
+var CONNECT_TIMEOUT_MS = 500;
+function isPortListening(port, timeoutMs = CONNECT_TIMEOUT_MS) {
+  return new Promise((resolve) => {
+    const socket = connect({ port, host: "127.0.0.1" });
+    const done = (answer) => {
+      socket.removeAllListeners();
+      socket.destroy();
+      resolve(answer);
+    };
+    socket.setTimeout(timeoutMs);
+    socket.once("connect", () => done(true));
+    socket.once("timeout", () => done(false));
+    socket.once("error", () => done(false));
+  });
+}
+async function probeControlPort(port) {
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/healthz`, {
+      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS)
+    });
+    if (response.ok) {
+      const body = await response.json();
+      if (body && typeof body === "object" && "proxyUrl" in body) {
+        return {
+          kind: "agentbridge",
+          projectId: "projectId" in body ? body.projectId ?? null : undefined,
+          pid: typeof body.pid === "number" ? body.pid : null
+        };
+      }
+    }
+    return { kind: "unknown" };
+  } catch {
+    return await isPortListening(port) ? { kind: "unknown" } : { kind: "free" };
+  }
+}
+function describeControlPortConflict(port, selfProjectId, holder) {
+  const move = `Set AGENTBRIDGE_CONTROL_PORT to move this project off the collision, ` + `or run \`abg kill\` in the other project.`;
+  if (holder.kind === "agentbridge") {
+    const other = holder.projectId === undefined ? "an older AgentBridge daemon that does not report its project" : holder.projectId === null ? "an AgentBridge daemon running outside any project" : `the AgentBridge daemon of project ${holder.projectId}`;
+    const self = selfProjectId ? `Project ${selfProjectId}` : "This project";
+    return `Control port ${port} is already held by ${other}` + `${holder.pid !== null ? ` (pid ${holder.pid})` : ""}.
+` + `${self} derives the same port slot \u2014 project ids hash into 1000 slots, so this happens.
+` + `Run \`abg doctor\` to see both projects. ${move}`;
+  }
+  return `Control port ${port} is already in use by a process that is not an AgentBridge daemon.
+` + `Stop whatever is listening on it, or ${move.charAt(0).toLowerCase()}${move.slice(1)}`;
+}
+
+// src/daemon-lifecycle.ts
 function resolveDaemonPath() {
   if (process.env.AGENTBRIDGE_DAEMON_ENTRY) {
     return fileURLToPath(new URL(process.env.AGENTBRIDGE_DAEMON_ENTRY, import.meta.url));
@@ -1746,15 +1799,19 @@ function resolveDaemonPath() {
   return fileURLToPath(new URL("./daemon.ts", import.meta.url));
 }
 var DAEMON_PATH = resolveDaemonPath();
+var PROBE_TIMEOUT_MS2 = 1500;
 
 class DaemonLifecycle {
   stateDir;
   controlPort;
   log;
+  projectId;
+  reportedForeignDaemon = false;
   constructor(opts) {
     this.stateDir = opts.stateDir;
     this.controlPort = opts.controlPort;
     this.log = opts.log;
+    this.projectId = opts.projectId !== undefined ? opts.projectId : process.env.AGENTBRIDGE_PROJECT_ID ?? null;
   }
   get healthUrl() {
     return `http://127.0.0.1:${this.controlPort}/healthz`;
@@ -1792,6 +1849,10 @@ class DaemonLifecycle {
       return;
     }
     try {
+      const holder = await probeControlPort(this.controlPort);
+      if (holder.kind !== "free") {
+        throw new Error(describeControlPortConflict(this.controlPort, this.projectId, holder));
+      }
       this.launch();
       await this.waitForReady();
     } finally {
@@ -1799,12 +1860,37 @@ class DaemonLifecycle {
     }
   }
   async isHealthy() {
+    const probe = await this.probe(this.healthUrl);
+    return probe !== null && probe.ok && this.acceptsDaemon(probe.body);
+  }
+  async probe(url) {
     try {
-      const response = await fetch(this.healthUrl);
-      return response.ok;
+      const response = await fetch(url, { signal: AbortSignal.timeout(PROBE_TIMEOUT_MS2) });
+      let body = null;
+      try {
+        body = await response.json();
+      } catch {}
+      return { ok: response.ok, body };
     } catch {
-      return false;
+      return null;
     }
+  }
+  acceptsDaemon(body) {
+    const reported = body && typeof body === "object" && "projectId" in body ? body.projectId ?? null : undefined;
+    if (DaemonLifecycle.identityMatches(this.projectId, reported))
+      return true;
+    if (!this.reportedForeignDaemon) {
+      this.reportedForeignDaemon = true;
+      this.log(`Control port ${this.controlPort} is held by the daemon of project ${reported} ` + `(this project is ${this.projectId}). Not attaching to it. ` + `Run \`abg doctor\` \u2014 two projects derive the same port slot.`);
+    }
+    return false;
+  }
+  static identityMatches(expected, reported) {
+    if (expected === null)
+      return true;
+    if (reported === undefined)
+      return true;
+    return reported === expected;
   }
   async waitForHealthy(maxRetries = 40, delayMs = 250) {
     for (let attempt = 0;attempt < maxRetries; attempt++) {
@@ -1815,12 +1901,8 @@ class DaemonLifecycle {
     throw new Error(`Timed out waiting for AgentBridge daemon health on ${this.healthUrl}`);
   }
   async isReady() {
-    try {
-      const response = await fetch(this.readyUrl);
-      return response.ok;
-    } catch {
-      return false;
-    }
+    const probe = await this.probe(this.readyUrl);
+    return probe !== null && probe.ok && this.acceptsDaemon(probe.body);
   }
   async waitForReady(maxRetries = 40, delayMs = 250) {
     for (let attempt = 0;attempt < maxRetries; attempt++) {
@@ -2099,6 +2181,7 @@ class ConfigService {
 // src/control-protocol.ts
 var CLOSE_CODE_REPLACED = 4001;
 var CLOSE_CODE_EVICTED_STALE = 4002;
+var CLOSE_CODE_PROJECT_MISMATCH = 4003;
 var CLOSE_CODE_PROBE_IN_PROGRESS = 4003;
 
 // src/env-utils.ts
@@ -2192,6 +2275,7 @@ async function probeLiveness(target, options) {
 }
 
 // src/daemon.ts
+var DAEMON_PROJECT_ID = process.env.AGENTBRIDGE_PROJECT_ID ?? null;
 var stateDir = new StateDirResolver;
 stateDir.ensure();
 var configService = new ConfigService;
@@ -2378,7 +2462,18 @@ function startControlServer() {
     }
   });
 }
+function acceptsFrontend(theirs) {
+  if (theirs === undefined) {
+    if (DAEMON_PROJECT_ID !== null) {
+      log(`Frontend did not declare a project id; serving it as ${DAEMON_PROJECT_ID} (older bundle?).`);
+    }
+    return true;
+  }
+  return theirs === DAEMON_PROJECT_ID;
+}
 function handleControlMessage(ws, raw) {
+  if (ws.data.rejected)
+    return;
   let message;
   try {
     const text = typeof raw === "string" ? raw : raw.toString();
@@ -2389,6 +2484,12 @@ function handleControlMessage(ws, raw) {
   }
   switch (message.type) {
     case "claude_connect":
+      if (!acceptsFrontend(message.projectId)) {
+        log(`Refusing claude_connect from project ${message.projectId} \u2014 ` + `this daemon serves ${DAEMON_PROJECT_ID}.`);
+        ws.data.rejected = true;
+        ws.close(CLOSE_CODE_PROJECT_MISMATCH, `This daemon serves project ${DAEMON_PROJECT_ID}, not ${message.projectId}. ` + `Two projects derive the same control port \u2014 run \`abg doctor\`.`);
+        return;
+      }
       attachClaude(ws).catch((err) => {
         log(`attachClaude threw for #${ws.data.clientId}: ${err?.message ?? err}`);
       });
@@ -2769,7 +2870,8 @@ function currentStatus() {
     appServerUrl: codex.appServerUrl,
     pid: process.pid,
     claudeAttached: attachedClaude !== null && attachedClaude.readyState === WebSocket.OPEN,
-    pendingReplyCount: replyOutbox.size
+    pendingReplyCount: replyOutbox.size,
+    projectId: DAEMON_PROJECT_ID
   };
 }
 function currentWaitingMessage() {
@@ -2872,8 +2974,13 @@ process.on("exit", () => {
   removePidFile();
   removeStatusFile();
 });
+var startupComplete = false;
 process.on("uncaughtException", (err) => {
   log(`UNCAUGHT EXCEPTION: ${err.stack ?? err.message}`);
+  if (!startupComplete) {
+    log("Exception happened during startup \u2014 the daemon never came up. Exiting 1.");
+    process.exit(1);
+  }
 });
 process.on("unhandledRejection", (reason) => {
   log(`UNHANDLED REJECTION: ${reason?.stack ?? reason}`);
@@ -2888,6 +2995,21 @@ if (daemonLifecycle.wasKilled()) {
   log("Killed sentinel found \u2014 daemon was intentionally stopped. Exiting immediately.");
   process.exit(0);
 }
+var controlPortHolder = await probeControlPort(CONTROL_PORT);
+if (controlPortHolder.kind !== "free") {
+  const detail = describeControlPortConflict(CONTROL_PORT, DAEMON_PROJECT_ID, controlPortHolder);
+  for (const line of detail.split(`
+`))
+    log(line);
+  process.exit(1);
+}
 writePidFile();
-startControlServer();
+try {
+  startControlServer();
+} catch (err) {
+  log(`Failed to start the control server on port ${CONTROL_PORT}: ${err?.message ?? err}`);
+  removePidFile();
+  process.exit(1);
+}
+startupComplete = true;
 bootCodex();

@@ -58,3 +58,28 @@ export function upsertMarkedSection(
   const trimmed = content.endsWith("\n") ? content : content + "\n";
   return trimmed + "\n" + block + "\n";
 }
+
+/**
+ * Read back the text a previous `upsertMarkedSection` wrote, or null
+ * when the file has no well-formed marker pair.
+ *
+ * The inverse of the write path, and used for exactly one thing: a
+ * project that predates role files has its role text living *only*
+ * inside the markers, so that block is the sole copy of whatever the
+ * user hand-edited. Recovering it is how the upgrade avoids
+ * overwriting their work with the built-in default.
+ *
+ * Malformed markers return null rather than throwing — the caller is
+ * salvaging, and half a block is not text worth adopting. The write
+ * path still refuses loudly on the same input.
+ */
+export function readMarkedSection(content: string, sectionId: string): string | null {
+  const startMarker = MARKER_START(sectionId);
+  const endMarker = MARKER_END(sectionId);
+  const startIdx = content.indexOf(startMarker);
+  const endIdx = content.indexOf(endMarker);
+  if (startIdx === -1 || endIdx === -1 || startIdx >= endIdx) return null;
+
+  const body = content.slice(startIdx + startMarker.length, endIdx).trim();
+  return body === "" ? null : body;
+}

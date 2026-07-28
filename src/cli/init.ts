@@ -6,6 +6,7 @@ import { findPackageRoot, registerMarketplace } from "./pkg-root";
 import {
   ROLE_AGENTS,
   RoleFileError,
+  adoptRoleSectionsFromInstructionFiles,
   instructionFilePath,
   seedRoleFiles,
   syncRoleSections,
@@ -119,6 +120,15 @@ export function performProjectSetup(projectRoot: string): { unrendered: string[]
   // Seeding never overwrites, so re-running setup after the user has
   // customized a role leaves their text alone.
   console.log("Writing role files...");
+  // Salvage first. On a project set up before role files existed, the
+  // marked block holds text the user may have edited by hand, and
+  // seeding a default over it would render that default straight back
+  // over their words a few lines below.
+  for (const adopted of adoptRoleSectionsFromInstructionFiles(projectRoot)) {
+    const shown = relative(projectRoot, adopted.path);
+    const from = relative(projectRoot, adopted.from);
+    console.log(`  ${shown}: adopted the existing ${from} section (your text, kept)`);
+  }
   for (const outcome of seedRoleFiles(projectRoot)) {
     const shown = relative(projectRoot, outcome.path);
     console.log(`  ${shown}: ${outcome.created ? "created with default role" : "already exists, left untouched"}`);

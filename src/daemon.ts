@@ -20,7 +20,9 @@ import {
   CLOSE_CODE_REPLACED,
   CLOSE_CODE_EVICTED_STALE,
   CLOSE_CODE_PROBE_IN_PROGRESS,
+  CLOSE_CODE_PROJECT_MISMATCH,
 } from "./control-protocol";
+import { probeControlPort, describeControlPortConflict } from "./port-preflight";
 import { parsePositiveIntEnv } from "./env-utils";
 import { ReplyOutbox, type QueuedReply } from "./reply-outbox";
 import type { ControlClientMessage, ControlServerMessage, DaemonStatus } from "./control-protocol";
@@ -31,7 +33,17 @@ interface ControlSocketData {
   clientId: number;
   attached: boolean;
   lastPongAt: number;
+  /** Set when the frontend was refused for belonging to another project. */
+  rejected?: boolean;
 }
+
+/**
+ * The project this daemon serves, inherited from the launcher's env
+ * (`applyProjectEnv` sets it). `null` in single-instance mode. Reported
+ * on /healthz and checked on every Claude attach, so a port-slot
+ * collision fails loudly instead of crossing two projects' messages.
+ */
+const DAEMON_PROJECT_ID = process.env.AGENTBRIDGE_PROJECT_ID ?? null;
 
 const stateDir = new StateDirResolver();
 stateDir.ensure();
@@ -340,7 +352,30 @@ function startControlServer() {
   });
 }
 
+/**
+ * May a frontend declaring `theirs` talk to this daemon?
+ *
+ * Permissive in exactly one direction: a frontend that sends no id at
+ * all (pre-0.7 bundle still sitting in a plugin cache) is served, with
+ * a note in the log. Refusing it would break an upgrade path in a way
+ * the user cannot diagnose, and that frontend's own launcher already
+ * had to pick this control port deliberately.
+ */
+function acceptsFrontend(theirs: string | null | undefined): boolean {
+  if (theirs === undefined) {
+    if (DAEMON_PROJECT_ID !== null) {
+      log(`Frontend did not declare a project id; serving it as ${DAEMON_PROJECT_ID} (older bundle?).`);
+    }
+    return true;
+  }
+  return theirs === DAEMON_PROJECT_ID;
+}
+
 function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: string | Buffer) {
+  // A refused frontend may already have pipelined a reply behind its
+  // connect. Nothing from that socket is ours to act on.
+  if (ws.data.rejected) return;
+
   let message: ControlClientMessage;
   try {
     const text = typeof raw === "string" ? raw : raw.toString();
@@ -352,6 +387,24 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
 
   switch (message.type) {
     case "claude_connect":
+      if (!acceptsFrontend(message.projectId)) {
+        // Refusing here is the last line of defence. `DaemonLifecycle`
+        // already declines to adopt a foreign daemon, but a frontend
+        // with a hardcoded control port never asks — and a Claude
+        // attached to the wrong project's Codex fails silently, which
+        // is the one failure mode worth being rude about.
+        log(
+          `Refusing claude_connect from project ${message.projectId} — ` +
+            `this daemon serves ${DAEMON_PROJECT_ID}.`,
+        );
+        ws.data.rejected = true;
+        ws.close(
+          CLOSE_CODE_PROJECT_MISMATCH,
+          `This daemon serves project ${DAEMON_PROJECT_ID}, not ${message.projectId}. ` +
+            `Two projects derive the same control port — run \`abg doctor\`.`,
+        );
+        return;
+      }
       attachClaude(ws).catch((err) => {
         log(`attachClaude threw for #${ws.data.clientId}: ${err?.message ?? err}`);
       });
@@ -891,6 +944,7 @@ function currentStatus(): DaemonStatus {
     pid: process.pid,
     claudeAttached: attachedClaude !== null && attachedClaude.readyState === WebSocket.OPEN,
     pendingReplyCount: replyOutbox.size,
+    projectId: DAEMON_PROJECT_ID,
   };
 }
 
@@ -1027,8 +1081,22 @@ function shutdown(reason: string) {
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("exit", () => { removePidFile(); removeStatusFile(); });
+/**
+ * Flipped once the daemon is serving. Before that point an uncaught
+ * exception means the daemon never came up, and staying alive to log
+ * about it is worse than dying: the process lingers with no control
+ * server, `wait` reports exit 0, and every caller reads that as
+ * "started fine". After that point a stray exception is not a reason
+ * to drop a live Codex session, so it stays a log line.
+ */
+let startupComplete = false;
+
 process.on("uncaughtException", (err) => {
   log(`UNCAUGHT EXCEPTION: ${err.stack ?? err.message}`);
+  if (!startupComplete) {
+    log("Exception happened during startup — the daemon never came up. Exiting 1.");
+    process.exit(1);
+  }
 });
 process.on("unhandledRejection", (reason: any) => {
   log(`UNHANDLED REJECTION: ${reason?.stack ?? reason}`);
@@ -1048,6 +1116,27 @@ if (daemonLifecycle.wasKilled()) {
   process.exit(0);
 }
 
+// Ask who holds the control port before binding it. `Bun.serve` throws
+// "Failed to start server. Is port N in use?", which names neither the
+// holder nor the fix — and in the collision this actually guards
+// against, the adapter's clear message sits further down a path we
+// would never reach.
+const controlPortHolder = await probeControlPort(CONTROL_PORT);
+if (controlPortHolder.kind !== "free") {
+  const detail = describeControlPortConflict(CONTROL_PORT, DAEMON_PROJECT_ID, controlPortHolder);
+  for (const line of detail.split("\n")) log(line);
+  process.exit(1);
+}
+
 writePidFile();
-startControlServer();
+try {
+  startControlServer();
+} catch (err: any) {
+  // Lost a race between the probe and the bind, or the port is
+  // unbindable for a reason the probe cannot see.
+  log(`Failed to start the control server on port ${CONTROL_PORT}: ${err?.message ?? err}`);
+  removePidFile();
+  process.exit(1);
+}
+startupComplete = true;
 void bootCodex();

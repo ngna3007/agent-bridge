@@ -2,6 +2,7 @@ import { spawn, execFileSync } from "node:child_process";
 import { existsSync, readFileSync, unlinkSync, writeFileSync, openSync, closeSync, constants } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { StateDirResolver } from "./state-dir";
+import { probeControlPort, describeControlPortConflict } from "./port-preflight";
 
 // When bundled into a Claude Code plugin, the frontend runs from the plugin
 // cache directory and the daemon bundle sits next to bridge-server.js, so
@@ -32,7 +33,29 @@ export interface DaemonLifecycleOptions {
   stateDir: StateDirResolver;
   controlPort: number;
   log: (msg: string) => void;
+  /**
+   * Project this caller belongs to. Defaults to the resolved
+   * namespace's id. `null` means single-instance mode, which accepts
+   * any daemon on the port — see `identityMatches`.
+   */
+  projectId?: string | null;
 }
+
+/**
+ * Cap on every health/readiness probe.
+ *
+ * A bare `fetch` to a port nothing listens on is only fast when the
+ * host answers with RST. Where a firewall drops the SYN instead — WSL2
+ * with the default Windows firewall does exactly this — connect() runs
+ * out the kernel's SYN retries first: measured at 141s per probe on
+ * that platform, which is 141s of an unexplained hang before
+ * `ensureRunning` even tries to launch the daemon, and turns
+ * `waitForReady`'s 40 retries into over an hour.
+ *
+ * A probe is a question about a local process. If it cannot be
+ * answered in a second and a half, the answer is no.
+ */
+const PROBE_TIMEOUT_MS = 1500;
 
 /**
  * Shared daemon lifecycle management.
@@ -42,11 +65,16 @@ export class DaemonLifecycle {
   private readonly stateDir: StateDirResolver;
   private readonly controlPort: number;
   private readonly log: (msg: string) => void;
+  private readonly projectId: string | null;
+  /** So a retry loop reports a foreign daemon once, not forty times. */
+  private reportedForeignDaemon = false;
 
   constructor(opts: DaemonLifecycleOptions) {
     this.stateDir = opts.stateDir;
     this.controlPort = opts.controlPort;
     this.log = opts.log;
+    this.projectId =
+      opts.projectId !== undefined ? opts.projectId : (process.env.AGENTBRIDGE_PROJECT_ID ?? null);
   }
 
   get healthUrl(): string {
@@ -98,6 +126,14 @@ export class DaemonLifecycle {
     }
 
     try {
+      // The daemon refuses to bind a port it does not own, so launching
+      // into a collision produces a detached process that logs and
+      // exits — and the caller would only learn that as a readiness
+      // timeout half a minute later. Ask first and say the real reason.
+      const holder = await probeControlPort(this.controlPort);
+      if (holder.kind !== "free") {
+        throw new Error(describeControlPortConflict(this.controlPort, this.projectId, holder));
+      }
       this.launch();
       await this.waitForReady();
     } finally {
@@ -105,14 +141,81 @@ export class DaemonLifecycle {
     }
   }
 
-  /** Check if daemon health endpoint responds. */
+  /**
+   * Whether the daemon *this project owns* is up on the control port.
+   *
+   * Two separate questions, and the second one used to be missing.
+   * Project ids hash into 1000 port slots, so two projects on one
+   * machine can derive the same control port; a probe that only asked
+   * "does something answer /healthz?" would say yes to the other
+   * project's daemon. `ensureRunning` would then skip launching, and
+   * this project's Claude would sit attached to another project's
+   * Codex — no error anywhere, messages crossing between two unrelated
+   * repos. Identity has to be part of the health question.
+   */
   async isHealthy(): Promise<boolean> {
+    const probe = await this.probe(this.healthUrl);
+    return probe !== null && probe.ok && this.acceptsDaemon(probe.body);
+  }
+
+  /**
+   * A probe result: `null` when nothing answered (closed port, timeout,
+   * non-JSON body), otherwise the HTTP status and parsed body.
+   */
+  private async probe(url: string): Promise<{ ok: boolean; body: unknown } | null> {
     try {
-      const response = await fetch(this.healthUrl);
-      return response.ok;
+      const response = await fetch(url, { signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
+      let body: unknown = null;
+      try {
+        body = await response.json();
+      } catch {
+        // A 503 from /readyz still carries a body; anything that is not
+        // JSON is not our daemon, and `acceptsDaemon` decides what that
+        // means rather than this parser.
+      }
+      return { ok: response.ok, body };
     } catch {
-      return false;
+      return null;
     }
+  }
+
+  /** Does the daemon that answered belong to this project? */
+  private acceptsDaemon(body: unknown): boolean {
+    const reported =
+      body && typeof body === "object" && "projectId" in body
+        ? ((body as { projectId?: string | null }).projectId ?? null)
+        : undefined;
+
+    if (DaemonLifecycle.identityMatches(this.projectId, reported)) return true;
+
+    if (!this.reportedForeignDaemon) {
+      this.reportedForeignDaemon = true;
+      this.log(
+        `Control port ${this.controlPort} is held by the daemon of project ${reported} ` +
+          `(this project is ${this.projectId}). Not attaching to it. ` +
+          `Run \`abg doctor\` — two projects derive the same port slot.`,
+      );
+    }
+    return false;
+  }
+
+  /**
+   * Whether a daemon reporting `reported` may serve a caller belonging
+   * to `expected`.
+   *
+   * - No expectation (single-instance mode, or an explicit port/state
+   *   dir the user chose): accept anything. This is the pre-0.7
+   *   behaviour and the only sane answer when there is no project to
+   *   compare against.
+   * - `undefined` reported: a daemon from before /healthz carried an
+   *   id. Accept it, so an upgrade does not orphan a running daemon;
+   *   it is replaced on its next restart.
+   * - Otherwise the ids must be equal.
+   */
+  static identityMatches(expected: string | null, reported: string | null | undefined): boolean {
+    if (expected === null) return true;
+    if (reported === undefined) return true;
+    return reported === expected;
   }
 
   /** Wait for daemon to become healthy. */
@@ -126,12 +229,8 @@ export class DaemonLifecycle {
 
   /** Check if daemon is ready to accept Codex TUI connections. */
   async isReady(): Promise<boolean> {
-    try {
-      const response = await fetch(this.readyUrl);
-      return response.ok;
-    } catch {
-      return false;
-    }
+    const probe = await this.probe(this.readyUrl);
+    return probe !== null && probe.ok && this.acceptsDaemon(probe.body);
   }
 
   /** Wait for daemon to become ready. */
