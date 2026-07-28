@@ -56,6 +56,13 @@ function maybeApplyProjectNamespace(cmd: string | undefined): void {
 }
 
 async function main() {
+  // First-run setup offer, before the namespace is resolved. A project
+  // created here must be visible to maybeApplyProjectNamespace below,
+  // otherwise the user answers "yes" and still gets fallback ports for
+  // the rest of this session.
+  const { maybeOfferSetup } = await import("./cli/auto-setup");
+  await maybeOfferSetup(command);
+
   maybeApplyProjectNamespace(command);
 
   switch (command) {
@@ -132,10 +139,12 @@ Options:
   --version, -v     Show version
 
 Multi-project:
-  Run \`abg init\` inside each project root. Each project gets its own
-  port triple (derived from the project path) and its own daemon slot.
-  Without an .agentbridge/ marker in cwd or its ancestors, abg falls
-  back to the historical single-instance mode (ports 4500/4501/4502).
+  Each project gets its own port triple (derived from the project path)
+  and its own daemon slot. \`abg claude\` / \`abg codex\` offer to set the
+  project up on first run in an unconfigured directory; \`abg init\` does
+  the same thing explicitly. Declining, or running non-interactively,
+  falls back to the shared single-instance mode (ports 4500/4501/4502).
+  Set AGENTBRIDGE_AUTO_SETUP=0 to suppress the offer entirely.
 
 Examples:
   abg init                     # First-time setup, in this project root

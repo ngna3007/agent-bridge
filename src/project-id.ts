@@ -80,6 +80,34 @@ export function findProjectRoot(startDir: string): string | null {
   }
 }
 
+/**
+ * Reasons a directory may not become an AgentBridge project root.
+ * Returned rather than thrown so callers can choose their register:
+ * `abg init` errors loudly, the first-run offer just stays quiet.
+ */
+export type SetupRefusal =
+  | { kind: "unsafe-root"; dir: string }
+  | { kind: "nested"; dir: string; existingRoot: string };
+
+/**
+ * Decide whether `dir` may hold a `.agentbridge/` marker.
+ *
+ * Two refusals, both about the marker's blast radius: a marker at $HOME
+ * or `/` namespaces every directory beneath it, and a marker nested
+ * inside an existing project splits one project's namespace in two.
+ */
+export function checkSetupLocation(dir: string, home: string): SetupRefusal | null {
+  const target = resolve(dir);
+  if (target === resolve(home) || target === dirname(resolve(home)) || target === "/") {
+    return { kind: "unsafe-root", dir: target };
+  }
+  const existingAncestor = findProjectRoot(target);
+  if (existingAncestor && existingAncestor !== target) {
+    return { kind: "nested", dir: target, existingRoot: existingAncestor };
+  }
+  return null;
+}
+
 /** SHA-256 the absolute project path; return first 8 hex chars. */
 export function computeProjectId(rootPath: string): string {
   return createHash("sha256").update(resolve(rootPath)).digest("hex").slice(0, 8);

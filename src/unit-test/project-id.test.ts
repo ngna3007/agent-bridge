@@ -8,6 +8,7 @@ import {
   computeProjectPorts,
   resolveProject,
   applyProjectEnv,
+  checkSetupLocation,
 } from "../project-id";
 
 let tmp: string;
@@ -160,5 +161,51 @@ describe("applyProjectEnv", () => {
     applyProjectEnv(proj, "/state");
     expect(process.env.AGENTBRIDGE_CONTROL_PORT).toBe(snapshot.ctrl!);
     expect(process.env.AGENTBRIDGE_STATE_DIR).toBe(snapshot.state!);
+  });
+});
+
+describe("checkSetupLocation", () => {
+  const HOME = "/home/someone";
+
+  test("allows a normal project directory", () => {
+    expect(checkSetupLocation(tmp, HOME)).toBe(null);
+  });
+
+  test("refuses the home directory itself", () => {
+    expect(checkSetupLocation(HOME, HOME)).toEqual({ kind: "unsafe-root", dir: HOME });
+  });
+
+  test("refuses the parent of home", () => {
+    expect(checkSetupLocation("/home", HOME)).toEqual({ kind: "unsafe-root", dir: "/home" });
+  });
+
+  test("refuses the filesystem root", () => {
+    expect(checkSetupLocation("/", HOME)).toEqual({ kind: "unsafe-root", dir: "/" });
+  });
+
+  test("allows a directory inside home", () => {
+    expect(checkSetupLocation(tmp, HOME)).toBe(null);
+  });
+
+  test("refuses nesting inside an existing project", () => {
+    mkdirSync(join(tmp, ".agentbridge"));
+    const child = join(tmp, "packages", "web");
+    mkdirSync(child, { recursive: true });
+    expect(checkSetupLocation(child, HOME)).toEqual({
+      kind: "nested",
+      dir: child,
+      existingRoot: tmp,
+    });
+  });
+
+  // Re-initing the project's own root is legal - that is how `abg init`
+  // refreshes an existing project.
+  test("allows re-init at an existing project's own root", () => {
+    mkdirSync(join(tmp, ".agentbridge"));
+    expect(checkSetupLocation(tmp, HOME)).toBe(null);
+  });
+
+  test("normalizes a trailing slash before comparing", () => {
+    expect(checkSetupLocation(`${HOME}/`, HOME)).toEqual({ kind: "unsafe-root", dir: HOME });
   });
 });

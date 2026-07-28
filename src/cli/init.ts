@@ -10,9 +10,8 @@ import {
   CLAUDE_MD_SECTION,
   AGENTS_MD_SECTION,
 } from "../collaboration-content";
-import { computeProjectId, computeProjectPorts, findProjectRoot } from "../project-id";
+import { checkSetupLocation, computeProjectId, computeProjectPorts } from "../project-id";
 import { homedir } from "node:os";
-import { dirname } from "node:path";
 
 const MIN_CLAUDE_VERSION = "2.1.80";
 
@@ -20,14 +19,10 @@ export async function runInit() {
   console.log("AgentBridge Init\n");
 
   // Sanity check the location before doing anything destructive.
-  // Running `abg init` in $HOME or `/` creates an ancestor marker
-  // that would namespace EVERY subdir under it, which is almost
-  // certainly not what the user wants - refuse loudly so they don't
-  // have to debug it later.
   const cwd = process.cwd();
-  const home = homedir();
-  if (cwd === home || cwd === dirname(home) || cwd === "/") {
-    console.error(`Error: refusing to init at "${cwd}".`);
+  const refusal = checkSetupLocation(cwd, homedir());
+  if (refusal?.kind === "unsafe-root") {
+    console.error(`Error: refusing to init at "${refusal.dir}".`);
     console.error("");
     console.error("Initializing AgentBridge at your home directory or filesystem root would");
     console.error("force every project under it into the same AgentBridge namespace and");
@@ -35,15 +30,8 @@ export async function runInit() {
     console.error("directory and run `abg init` there.");
     process.exit(1);
   }
-
-  // Refuse to nest a project marker under an existing one. Picking
-  // the closest ancestor (current findProjectRoot behavior) handles
-  // a stale subdir gracefully, but creating a second .agentbridge/
-  // inside an existing project would split the namespace and is
-  // never useful.
-  const existingAncestor = findProjectRoot(cwd);
-  if (existingAncestor && existingAncestor !== cwd) {
-    console.error(`Error: an AgentBridge project already exists at "${existingAncestor}".`);
+  if (refusal?.kind === "nested") {
+    console.error(`Error: an AgentBridge project already exists at "${refusal.existingRoot}".`);
     console.error("");
     console.error(`If you want to re-init that project, run \`abg init\` from there directly.`);
     console.error(`If you want a fresh project here, first remove the ancestor's .agentbridge/`);
@@ -58,14 +46,35 @@ export async function runInit() {
   checkCodex();
   console.log("");
 
-  // Step 2: Generate project config with per-project derived ports.
-  // The .agentbridge/ directory acts as the project marker for the
-  // CLI's namespace logic (project-id.ts), and the codex ports in
+  performProjectSetup(cwd);
+
+  console.log("Setup complete!\n");
+  printCustomizationSummary(cwd);
+  console.log("");
+  console.log("Next steps:");
+  console.log("  1. If Claude Code is already running, execute /reload-plugins in your session");
+  console.log("  2. Start Claude Code:  abg claude");
+  console.log("  3. Start Codex TUI:    abg codex");
+}
+
+/**
+ * The setup work itself: project config, collaboration sections, plugin
+ * install. Shared by the explicit `abg init` command and the first-run
+ * auto-setup offer, so the two can never drift into producing different
+ * projects.
+ *
+ * Caller is responsible for `checkSetupLocation` and dependency checks —
+ * they differ between the two entry points (init exits, auto-setup
+ * declines silently).
+ */
+export function performProjectSetup(projectRoot: string): void {
+  // Generate project config with per-project derived ports. The
+  // .agentbridge/ directory acts as the project marker for the CLI's
+  // namespace logic (project-id.ts), and the codex ports in
   // config.json must match the per-project derivation so the daemon
   // and the CLI agree on which sockets to use.
   console.log("Generating project config...");
-  const configService = new ConfigService();
-  const projectRoot = process.cwd();
+  const configService = new ConfigService(projectRoot);
   const projectId = computeProjectId(projectRoot);
   const ports = computeProjectPorts(projectId);
 
@@ -86,15 +95,15 @@ export async function runInit() {
   }
   console.log("");
 
-  // Step 3: Write collaboration sections to CLAUDE.md and AGENTS.md
   console.log("Writing collaboration sections...");
-  const collabResults = writeCollaborationSections(projectRoot);
-  for (const result of collabResults) {
+  for (const result of writeCollaborationSections(projectRoot)) {
     console.log(`  ${result}`);
   }
   console.log("");
 
-  // Step 4: Register marketplace + install plugin (best-effort)
+  // Plugin install is best-effort: a project is still usable without
+  // it (the user can run `abg dev` later), so a failure here must not
+  // abort a setup that has already written the config.
   console.log("Installing AgentBridge plugin...");
   try {
     registerMarketplace(findPackageRoot());
@@ -108,13 +117,45 @@ export async function runInit() {
     console.log(`    abg dev   # registers marketplace and installs plugin`);
   }
   console.log("");
+}
 
-  // Step 5: Done
-  console.log("Setup complete!\n");
-  console.log("Next steps:");
-  console.log("  1. If Claude Code is already running, execute /reload-plugins in your session");
-  console.log("  2. Start Claude Code:  agentbridge claude");
-  console.log("  3. Start Codex TUI:    agentbridge codex");
+/**
+ * Tell the user what they can now tune, and where. Printed once at the
+ * end of setup — the moment they have the files in front of them and
+ * before they have formed the belief that none of this is adjustable.
+ */
+export function printCustomizationSummary(projectRoot: string): void {
+  const lines = [
+    `What you can customize (relative to ${projectRoot}):`,
+    "",
+    "  .agentbridge/config.json",
+    "      codex.appPort / codex.proxyPort      the ports this project uses",
+    "      turnCoordination.attentionWindowSeconds",
+    "                                           how long [STATUS] stays quiet",
+    "                                           after a [REPLY] (default 15s)",
+    "      idleShutdownSeconds                  daemon exit delay when no client",
+    "                                           is attached (default 30s)",
+    "",
+    "  CLAUDE.md · AGENTS.md",
+    "      Text between the <!-- AgentBridge:start/end --> markers is",
+    "      regenerated by `abg init`. Anything outside the markers is",
+    "      yours and is never touched.",
+    "",
+    "  Environment variables (override everything above):",
+    "      AGENTBRIDGE_FILTER_MODE=full         forward every Codex message",
+    "                                           instead of routing by marker",
+    "      AGENTBRIDGE_MODE=pull                deliver via get_messages instead",
+    "                                           of push notifications",
+    "      AGENTBRIDGE_ATTENTION_WINDOW_MS, AGENTBRIDGE_IDLE_SHUTDOWN_MS,",
+    "      AGENTBRIDGE_MAX_BUFFERED_MESSAGES, AGENTBRIDGE_STATE_DIR",
+    "      Full list: README.md → Configuration",
+    "",
+    "  Not customizable yet: per-agent roles (Claude = executor, Codex =",
+    "  reviewer) are fixed in this release.",
+    "",
+    "  `abg doctor` checks all of the above for drift.",
+  ];
+  for (const line of lines) console.log(line);
 }
 
 function checkBun() {

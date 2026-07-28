@@ -76,3 +76,59 @@ describe("UserPrefsService - forward compatibility", () => {
     expect(prefs.load()).toEqual({});
   });
 });
+
+describe("UserPrefsService - setup decline list", () => {
+  test("hasDeclinedSetup is false for an unseen directory", () => {
+    expect(prefs.hasDeclinedSetup("/work/repo")).toBe(false);
+  });
+
+  test("recordSetupDeclined persists and rereads", () => {
+    prefs.recordSetupDeclined("/work/repo");
+    const fresh = new UserPrefsService(new StateDirResolver(tmp));
+    expect(fresh.hasDeclinedSetup("/work/repo")).toBe(true);
+  });
+
+  test("declining one directory does not decline another", () => {
+    prefs.recordSetupDeclined("/work/repo");
+    expect(prefs.hasDeclinedSetup("/work/other")).toBe(false);
+  });
+
+  test("recordSetupDeclined is idempotent - no duplicate entries", () => {
+    prefs.recordSetupDeclined("/work/repo");
+    prefs.recordSetupDeclined("/work/repo");
+    expect(prefs.load().setupDeclinedPaths).toEqual(["/work/repo"]);
+  });
+
+  test("multiple declines accumulate", () => {
+    prefs.recordSetupDeclined("/a");
+    prefs.recordSetupDeclined("/b");
+    expect(prefs.load().setupDeclinedPaths).toEqual(["/a", "/b"]);
+  });
+
+  // The decline list must not clobber, or be clobbered by, the intro
+  // flag - both live in one file and are written by separate paths.
+  test("decline list and introAcknowledged coexist", () => {
+    prefs.update({ introAcknowledged: true });
+    prefs.recordSetupDeclined("/work/repo");
+    const fresh = new UserPrefsService(new StateDirResolver(tmp));
+    expect(fresh.hasAcknowledgedIntro()).toBe(true);
+    expect(fresh.hasDeclinedSetup("/work/repo")).toBe(true);
+  });
+
+  // A corrupt entry should cost one re-prompt, not every pref in the
+  // file.
+  test("non-string entries are dropped, valid ones survive", () => {
+    writeFileSync(
+      prefs.filePath,
+      JSON.stringify({ setupDeclinedPaths: ["/good", 42, null, "/also-good"] }),
+      "utf-8",
+    );
+    expect(prefs.load().setupDeclinedPaths).toEqual(["/good", "/also-good"]);
+  });
+
+  test("a non-array setupDeclinedPaths is ignored rather than throwing", () => {
+    writeFileSync(prefs.filePath, JSON.stringify({ setupDeclinedPaths: "nope" }), "utf-8");
+    expect(prefs.load().setupDeclinedPaths).toBeUndefined();
+    expect(prefs.hasDeclinedSetup("/anything")).toBe(false);
+  });
+});
