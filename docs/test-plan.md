@@ -54,9 +54,10 @@ pipeline.
 against fakes: message filtering and markers, project id and port
 derivation, config and state-dir resolution, log rotation, daemon
 lifecycle bookkeeping, the app-server protocol helpers, role file
-seeding and rendering.
+seeding and rendering, the reply outbox, and the `abg log` parsing and
+filtering layer.
 
-Most recent run: **499 pass, 2 fail, 501 tests across 32 files (135s)**.
+Most recent run: **580 pass, 2 fail, 582 tests across 38 files (146s)**.
 
 The two failures are environmental and expected on this host:
 
@@ -78,7 +79,20 @@ status`, `abg doctor`, `abg projects`, `abg roles`, multi-project
 namespacing, and the argument rewriting each launch verb performs.
 
 No daemon and no model calls — the daemon is faked where a launch would
-otherwise start one.
+otherwise start one. Two commands need more than a fake, and get it:
+
+- `status-live.test.ts` stands up a real `/healthz` on an OS-assigned
+  port and asserts what `abg status` reports for each combination of
+  attached / detached / threadless / queued, plus the two ways the
+  daemon can fail to answer. A fake would prove only that the printer
+  works; the claim worth testing is that the command talks to the
+  daemon at all, and to the port it actually bound.
+- `doctor-fix.test.ts` runs `abg doctor --fix` against a real state dir
+  and asserts both halves of the contract: the repairs it performs, and
+  the ones it declines when the evidence goes stale between diagnosis
+  and repair (a pid that came back to life, a lock that is young
+  again). `--fix` deletes files and signals processes, so the declines
+  matter more than the repairs.
 
 ## Tier 2 — full bridge end-to-end
 
@@ -204,6 +218,12 @@ temp directory.
   the obvious next thing to add.
 - Neither live tier asserts on token cost or latency, so a regression
   that makes the bridge slow but correct would pass.
+- The reply outbox is unit-tested as a data structure, and the daemon
+  wiring around it (queue on refusal, drain on `turn/completed`, notice
+  on expiry or loss) is not covered end-to-end. Proving it needs a real
+  mid-turn refusal, which is exactly the Tier 2 shape — reply while the
+  harness holds a turn open, then assert the injection lands after the
+  completion. Worth adding alongside the failure edges above.
 - Tier 4's list shrank by one: terminal save/restore now has unit
   coverage via the injected seam in `src/cli/terminal-restore.ts`. What
   a human still has to confirm is that the *real* escape sequences fix a

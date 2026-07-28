@@ -249,9 +249,13 @@ question.
 - Nothing. Silence is normal and usually correct. Codex turns take minutes and
   polling doesn't speed them up.
 
-**One rule you have to respect:** don't have Claude send a reply while Codex is
-mid-turn. The busy guard rejects it. Wait for the status line to flip back to
-`[CODEX READY]`.
+**You don't have to time your replies.** Sending one while Codex is mid-turn is
+fine: the daemon holds it in a small outbox and injects it the moment the turn
+ends. Claude sees `Reply queued for Codex` and is told not to resend. The outbox
+holds three messages for ten minutes by default
+(`AGENTBRIDGE_REPLY_QUEUE_MAX` / `AGENTBRIDGE_REPLY_QUEUE_TTL_MS`); if anything
+is dropped or expires, AgentBridge tells Claude and echoes the text back, so a
+lost reply is never silent. `abg status` shows how many are held.
 
 ---
 

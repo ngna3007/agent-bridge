@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { resolveRuntimeNamespace } from "../runtime-namespace";
 import { isPidAlive } from "../process-helpers";
+import type { DaemonStatus } from "../control-protocol";
 
 interface DaemonStatusFile {
   proxyUrl?: string;
@@ -11,10 +12,23 @@ interface DaemonStatusFile {
 }
 
 /**
+ * How long to wait for the daemon's /healthz before giving up and
+ * printing the file-derived view alone. Short on purpose: the daemon is
+ * on loopback, so anything slower than this means it is wedged, and a
+ * status command that hangs is worse than one that says less.
+ */
+const LIVE_STATUS_TIMEOUT_MS = 1500;
+
+/**
  * Report what AgentBridge knows about the current project + daemon
- * state. Read-only, no side effects, no network calls - this command
- * is meant to be safe to spam when the user is debugging "why didn't
- * my session attach?".
+ * state. Read-only and safe to spam when the user is debugging "why
+ * didn't my session attach?".
+ *
+ * The daemon is asked directly when it is running. Files on disk only
+ * record what was true at boot, so the file-only version of this
+ * command could not answer the question people actually open it for —
+ * is the *other* agent attached right now? A running daemon has always
+ * known that; it was simply never asked.
  */
 export async function runStatus() {
   // Read-only: we never mutate env here. resolveRuntimeNamespace
@@ -86,6 +100,32 @@ export async function runStatus() {
   }
   console.log("");
 
+  // Live block — only meaningful while a daemon is actually up.
+  const controlPort = resolveControlPort(ns, statusPath);
+  const live = pid && isPidAlive(pid) && controlPort ? await fetchLiveStatus(controlPort) : null;
+
+  if (live) {
+    console.log("Live");
+    console.log(`  claude      ${live.claudeAttached ? "attached" : "not attached"}`);
+    console.log(`  codex tui   ${live.tuiConnected ? "connected" : "not connected"}`);
+    console.log(`  thread      ${live.threadId ?? "none yet (Codex has not started a thread)"}`);
+    console.log(`  bridge      ${live.bridgeReady ? "ready" : "not ready"}`);
+    console.log(`  queued      ${live.queuedMessageCount} Codex message(s) waiting for get_messages`);
+    console.log(`  held        ${live.pendingReplyCount} Claude repl(ies) waiting for Codex's turn to end`);
+    console.log("");
+
+    const hints = liveHints(live);
+    if (hints.length > 0) {
+      for (const hint of hints) console.log(hint);
+      console.log("");
+    }
+  } else if (pid && isPidAlive(pid)) {
+    console.log("Live");
+    console.log("  (daemon did not answer /healthz — it may be starting or wedged)");
+    console.log("  Run `abg doctor` to diagnose, or `abg kill` to restart it.");
+    console.log("");
+  }
+
   // Env block - help when the user has manually overridden anything.
   const overrides = [
     "AGENTBRIDGE_CONTROL_PORT",
@@ -109,5 +149,81 @@ function readIfExists(path: string): string | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Which port to ask. The derived project port is the right answer
+ * almost always, but `status.json` wins when it disagrees: it records
+ * the port the *running* daemon actually bound, and a config edit or a
+ * moved project root can leave the derivation pointing elsewhere. Using
+ * the derived port there would report "not answering" about a daemon
+ * that is perfectly healthy one port over.
+ */
+function resolveControlPort(
+  ns: { project: { ports: { control: number } } | null },
+  statusPath: string,
+): number | null {
+  const statusJson = readIfExists(statusPath);
+  if (statusJson) {
+    try {
+      const parsed = JSON.parse(statusJson) as DaemonStatusFile;
+      if (typeof parsed.controlPort === "number") return parsed.controlPort;
+    } catch {
+      /* fall through to the derived port */
+    }
+  }
+  if (ns.project) return ns.project.ports.control;
+  const fromEnv = process.env.AGENTBRIDGE_CONTROL_PORT;
+  if (fromEnv) {
+    const parsed = parseInt(fromEnv, 10);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return 4502; // single-instance fallback, matches runtime-namespace
+}
+
+/**
+ * Ask the daemon for its own view. Every failure mode — refused,
+ * timed out, non-200, unparseable — collapses to null, because the
+ * caller's job is to fall back to the file view, not to explain HTTP.
+ */
+async function fetchLiveStatus(controlPort: number): Promise<DaemonStatus | null> {
+  try {
+    const res = await fetch(`http://127.0.0.1:${controlPort}/healthz`, {
+      signal: AbortSignal.timeout(LIVE_STATUS_TIMEOUT_MS),
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as DaemonStatus;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Turn the live numbers into the next thing to do.
+ *
+ * A status command that only prints state makes the reader derive the
+ * diagnosis. These are the four states that actually stall a session,
+ * each paired with the command that clears it.
+ */
+function liveHints(live: DaemonStatus): string[] {
+  const hints: string[] = [];
+  if (!live.claudeAttached && !live.tuiConnected) {
+    hints.push("Neither side is attached. Start `abg claude` in one terminal and `abg codex` in another.");
+  } else if (!live.claudeAttached) {
+    hints.push("Codex is connected but Claude is not. Run `abg claude` to attach this project's Claude session.");
+  } else if (!live.tuiConnected) {
+    hints.push("Claude is attached but the Codex TUI is not. Run `abg codex` in another terminal.");
+  } else if (!live.threadId) {
+    hints.push("Both sides are attached but Codex has no thread yet. Send one message in the Codex TUI to start it.");
+  }
+  if (live.pendingReplyCount > 0) {
+    hints.push(
+      `${live.pendingReplyCount} Claude repl${live.pendingReplyCount > 1 ? "ies are" : "y is"} held until Codex's current turn ends. This is normal; no action needed.`,
+    );
+  }
+  if (live.queuedMessageCount > 0) {
+    hints.push(`${live.queuedMessageCount} Codex message(s) are queued for Claude's next get_messages call.`);
+  }
+  return hints;
 }
 

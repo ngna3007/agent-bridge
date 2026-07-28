@@ -1,7 +1,17 @@
 /**
  * `abg doctor` - diagnose stuck or surprising state and suggest the
- * fix. Read-only: never modifies state. Output is a checklist of
- * concrete diagnostics plus, where useful, a copy-pasteable fix.
+ * fix. Read-only by default; `--fix` applies the repairs that are
+ * provably safe. Output is a checklist of concrete diagnostics plus,
+ * where useful, a copy-pasteable fix.
+ *
+ * `--fix` deliberately covers a small set. A finding earns a repair
+ * only when the doctor has already *proved* the bad state rather than
+ * inferred it — the pid it would delete has been checked dead, the
+ * orphan it would signal has been checked parentless. Everything else
+ * (role drift, an out-of-date rendered section, a listening port that
+ * may well belong to something legitimate) stays advice, because
+ * guessing wrong there destroys the user's work rather than tidying up
+ * after a crash.
  *
  * Common scenarios it catches:
  *   - Stale daemon.pid (process died without removing the file).
@@ -18,7 +28,7 @@
  *     or that stopped explaining the routing markers.
  */
 
-import { readFileSync, existsSync, statSync } from "node:fs";
+import { readFileSync, existsSync, statSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { ConfigService } from "../config-service";
 import {
@@ -40,6 +50,12 @@ interface Finding {
   severity: "info" | "warn" | "error";
   message: string;
   fix?: string;
+  /**
+   * Applied by `--fix`. Returns a past-tense line describing what it
+   * did, or throws with a reason. Present only on findings whose bad
+   * state the doctor has verified, never on ones it inferred.
+   */
+  repair?: () => Promise<string>;
 }
 
 /**
@@ -125,7 +141,8 @@ function checkRoles(projectRoot: string): Finding[] {
   return findings;
 }
 
-export async function runDoctor() {
+export async function runDoctor(args: string[] = []) {
+  const applyFixes = args.includes("--fix");
   const findings: Finding[] = [];
 
   // Read-only: resolveRuntimeNamespace gives us the same state dir
@@ -159,6 +176,16 @@ export async function runDoctor() {
               `config.json codex ports drift from project-derived (expected ${expected}, got ${got})`,
             fix:
               `Edit ${cs.configFilePath} to match the derived values, or rerun \`abg init\` after deleting .agentbridge/config.json.`,
+            repair: async () => {
+              // Only the two drifted fields change; every other key the
+              // user may have tuned (attention window, idle shutdown)
+              // is carried through untouched.
+              cs.save({
+                ...cfg,
+                codex: { appPort: project.ports.codexWs, proxyPort: project.ports.codexProxy },
+              });
+              return `rewrote codex ports in ${cs.configFilePath} to ${expected}`;
+            },
           });
         }
       }
@@ -194,10 +221,20 @@ export async function runDoctor() {
     if (pid && isPidAlive(pid)) {
       findings.push({ severity: "info", message: `Daemon running (pid ${pid})` });
     } else if (pid) {
+      const deadPid = pid;
       findings.push({
         severity: "warn",
         message: `Stale daemon.pid (process ${pid} is dead)`,
         fix: `Run \`abg kill\` to clean up. Then \`abg claude\` or \`abg codex\` to restart.`,
+        repair: async () => {
+          // isPidAlive already said no. Re-check anyway: `abg doctor
+          // --fix` can sit on screen while the user starts a daemon in
+          // another terminal, and deleting a live daemon's pid file
+          // strands it — nothing would ever find it to stop it again.
+          if (isPidAlive(deadPid)) throw new Error(`pid ${deadPid} is alive again; left the file alone`);
+          rmSync(pidPath, { force: true });
+          return `removed stale daemon.pid (was ${deadPid})`;
+        },
       });
     }
   } else {
@@ -217,6 +254,16 @@ export async function runDoctor() {
         severity: "warn",
         message: `Stale startup.lock (age ${ageSec}s; daemon launch likely crashed)`,
         fix: `Run \`abg kill\` to remove the lock and reap orphans. Then retry.`,
+        repair: async () => {
+          // Re-read the mtime rather than trusting the one measured
+          // during diagnosis: a launch that started since then would
+          // have refreshed it, and removing a live lock reopens the
+          // double-start race the lock exists to close.
+          const nowAge = Math.round((Date.now() - statSync(lockPath).mtime.getTime()) / 1000);
+          if (nowAge <= 30) throw new Error(`lock is only ${nowAge}s old now; a launch may be in progress`);
+          rmSync(lockPath, { force: true });
+          return `removed stale startup.lock (age ${nowAge}s)`;
+        },
       });
     } else {
       findings.push({
@@ -240,6 +287,25 @@ export async function runDoctor() {
       severity: "warn",
       message: `${orphans.length} orphan bridge-server process(es): ${orphans.join(", ")}`,
       fix: `These are from prior Claude sessions that died without cleanup. Run \`abg kill\` to reap them (now reaps orphans automatically).`,
+      repair: async () => {
+        // Re-classify instead of signalling the list from diagnosis.
+        // `findOrphanBridgeServers` requires a dead-or-reparented
+        // parent, so a pid that has since been re-adopted by a live
+        // Claude session drops out here and is left running.
+        const stillOrphaned = findOrphanBridgeServers(dir);
+        if (stillOrphaned.length === 0) throw new Error("no orphans left to reap");
+        const reaped: number[] = [];
+        for (const orphanPid of stillOrphaned) {
+          try {
+            process.kill(orphanPid, "SIGTERM");
+            reaped.push(orphanPid);
+          } catch {
+            /* already gone, or not ours to signal */
+          }
+        }
+        if (reaped.length === 0) throw new Error("every orphan had already exited");
+        return `sent SIGTERM to orphan bridge-server pid(s) ${reaped.join(", ")}`;
+      },
     });
   }
 
@@ -275,7 +341,8 @@ export async function runDoctor() {
   }
 
   // ---- Report ----
-  console.log("AgentBridge doctor\n");
+  console.log(applyFixes ? "AgentBridge doctor --fix\n" : "AgentBridge doctor\n");
+  const repairable = findings.filter((f) => f.repair);
   for (const f of findings) {
     const tag = f.severity === "error" ? "ERROR" : f.severity === "warn" ? "WARN " : "ok   ";
     console.log(`[${tag}] ${f.message}`);
@@ -284,15 +351,51 @@ export async function runDoctor() {
         console.log(`        ${line}`);
       }
     }
+    if (f.repair && !applyFixes) {
+      console.log(`        \`abg doctor --fix\` can repair this automatically.`);
+    }
   }
+
   const counts = {
     error: findings.filter((f) => f.severity === "error").length,
     warn: findings.filter((f) => f.severity === "warn").length,
   };
+
+  // ---- Repairs ----
+  // Run after the full report so the user can read what state was found
+  // before seeing what changed. Each repair is independent; one failing
+  // must not skip the rest, so failures are collected and printed
+  // rather than thrown.
+  let repaired = 0;
+  let repairFailed = 0;
+  if (applyFixes && repairable.length > 0) {
+    console.log("\nRepairs");
+    for (const f of repairable) {
+      try {
+        console.log(`  fixed   ${await f.repair!()}`);
+        repaired++;
+      } catch (err) {
+        console.log(`  skipped ${f.message}`);
+        console.log(`          ${err instanceof Error ? err.message : String(err)}`);
+        repairFailed++;
+      }
+    }
+  }
+
   console.log("");
   if (counts.error + counts.warn === 0) {
     console.log("All clear.");
-  } else {
-    console.log(`${counts.error} error(s), ${counts.warn} warning(s).`);
+    return;
+  }
+
+  console.log(`${counts.error} error(s), ${counts.warn} warning(s).`);
+  if (applyFixes) {
+    if (repairable.length === 0) {
+      console.log("Nothing here is safely auto-repairable — the fixes above need a human decision.");
+    } else {
+      console.log(`${repaired} repaired, ${repairFailed} skipped. Rerun \`abg doctor\` to confirm.`);
+    }
+  } else if (repairable.length > 0) {
+    console.log(`${repairable.length} of these can be repaired with \`abg doctor --fix\`.`);
   }
 }

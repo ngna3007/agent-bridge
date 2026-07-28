@@ -2057,6 +2057,55 @@ function parsePositiveIntEnv(name, fallback, log = () => {}) {
   return parsed;
 }
 
+// src/reply-outbox.ts
+class ReplyOutbox {
+  entries = [];
+  max;
+  ttlMs;
+  constructor(opts) {
+    this.max = Math.max(1, opts.max);
+    this.ttlMs = opts.ttlMs;
+  }
+  get size() {
+    return this.entries.length;
+  }
+  get capacity() {
+    return this.max;
+  }
+  peek() {
+    return this.entries[0] ?? null;
+  }
+  accept(reply) {
+    this.entries.push(reply);
+    const dropped = [];
+    while (this.entries.length > this.max) {
+      dropped.push(this.entries.shift());
+    }
+    return { depth: this.entries.length, dropped };
+  }
+  takeNext(now) {
+    const expired = [];
+    while (this.entries.length > 0) {
+      const next = this.entries.shift();
+      if (now - next.queuedAt > this.ttlMs) {
+        expired.push(next);
+        continue;
+      }
+      return { reply: next, expired };
+    }
+    return { reply: null, expired };
+  }
+  requeue(reply) {
+    this.entries.unshift(reply);
+    while (this.entries.length > this.max) {
+      this.entries.pop();
+    }
+  }
+  clear() {
+    return this.entries.splice(0, this.entries.length);
+  }
+}
+
 // src/liveness-probe.ts
 var OPEN = 1;
 async function probeLiveness(target, options) {
@@ -2125,6 +2174,10 @@ var lastPinnedContractThreadId = null;
 var LIVENESS_PROBE_TIMEOUT_MS = parsePositiveIntEnv("AGENTBRIDGE_LIVENESS_PROBE_TIMEOUT_MS", 3000, log);
 var LIVENESS_PROBE_POLL_MS = 50;
 var challengeInProgress = false;
+var replyOutbox = new ReplyOutbox({
+  max: parsePositiveIntEnv("AGENTBRIDGE_REPLY_QUEUE_MAX", 3, log),
+  ttlMs: parsePositiveIntEnv("AGENTBRIDGE_REPLY_QUEUE_TTL_MS", 10 * 60000, log)
+});
 var bufferedMessages = [];
 var tuiConnectionState = new TuiConnectionState({
   disconnectGraceMs: TUI_DISCONNECT_GRACE_MS,
@@ -2189,6 +2242,7 @@ codex.on("turnCompleted", () => {
   if (attachedClaude && shouldNotifyCodexClaudeOnline()) {
     notifyCodexClaudeOnline();
   }
+  drainReplyOutbox();
 });
 codex.on("ready", (threadId) => {
   tuiConnectionState.markBridgeReady();
@@ -2223,6 +2277,7 @@ codex.on("exit", (code) => {
   claudeOnlineNoticeSent = false;
   claudeOfflineNoticeShown = false;
   lastPinnedContractThreadId = null;
+  discardOutboxForLostCodex("the Codex app-server exited");
   emitToClaude(systemMessage("system_codex_exit", `\u26A0\uFE0F Codex app-server exited (code ${code ?? "unknown"}). AgentBridge daemon is still running, but the Codex side needs to be restarted.`));
   broadcastStatus();
 });
@@ -2307,46 +2362,116 @@ function handleControlMessage(ws, raw) {
         return;
       }
       const requireReply = !!message.requireReply;
-      const activeThreadId = codex.activeThreadId;
-      const needsContract = PIN_CONTRACT_MODE === "always" || PIN_CONTRACT_MODE === "once" && activeThreadId !== lastPinnedContractThreadId;
-      let contentToSend = message.message.content;
-      if (needsContract) {
-        contentToSend += `
-
-` + BRIDGE_CONTRACT_REMINDER;
-        if (PIN_CONTRACT_MODE === "once" && activeThreadId) {
-          lastPinnedContractThreadId = activeThreadId;
-          log(`Pinned BRIDGE_CONTRACT_REMINDER for thread ${activeThreadId.slice(0, 8)}; subsequent msgs skip the reminder`);
-        }
-      }
-      if (requireReply) {
-        contentToSend += REPLY_REQUIRED_INSTRUCTION;
-        replyRequired = true;
-        replyReceivedDuringTurn = false;
-        log(`Reply required flag set for this message`);
-      }
-      log(`Forwarding Claude \u2192 Codex (${message.message.content.length} chars, requireReply=${requireReply}, pinnedContract=${needsContract})`);
-      const injected = codex.injectMessage(contentToSend);
-      if (!injected) {
-        const reason = codex.turnInProgress ? "Codex is busy executing a turn. Wait for it to finish before sending another message." : "Injection failed: no active thread or WebSocket not connected.";
-        log(`Injection rejected: ${reason}`);
+      const content = message.message.content;
+      if (deliverToCodex(content, requireReply)) {
+        clearAttentionWindow();
         sendProtocolMessage(ws, {
           type: "claude_to_codex_result",
           requestId: message.requestId,
-          success: false,
-          error: reason
+          success: true
         });
         return;
       }
-      clearAttentionWindow();
+      if (codex.turnInProgress) {
+        const { depth, dropped } = replyOutbox.accept({
+          id: message.message.id,
+          content,
+          requireReply,
+          queuedAt: Date.now()
+        });
+        log(`Queued Claude \u2192 Codex reply while turn in progress (depth ${depth}, dropped ${dropped.length})`);
+        let note = depth > 1 ? `Codex is mid-turn. Held for delivery when the turn ends (${depth} replies now queued, sent in order).` : "Codex is mid-turn. Held for delivery when the turn ends.";
+        if (dropped.length > 0) {
+          note += ` ${dropped.length} older queued repl${dropped.length > 1 ? "ies were" : "y was"}` + ` dropped to stay under the ${replyOutbox.capacity}-message limit.`;
+        }
+        sendProtocolMessage(ws, {
+          type: "claude_to_codex_result",
+          requestId: message.requestId,
+          success: true,
+          queued: true,
+          note
+        });
+        return;
+      }
+      const reason = "Injection failed: no active thread or WebSocket not connected.";
+      log(`Injection rejected: ${reason}`);
       sendProtocolMessage(ws, {
         type: "claude_to_codex_result",
         requestId: message.requestId,
-        success: true
+        success: false,
+        error: reason
       });
       return;
     }
   }
+}
+function deliverToCodex(content, requireReply) {
+  const activeThreadId = codex.activeThreadId;
+  const needsContract = PIN_CONTRACT_MODE === "always" || PIN_CONTRACT_MODE === "once" && activeThreadId !== lastPinnedContractThreadId;
+  let contentToSend = content;
+  if (needsContract)
+    contentToSend += `
+
+` + BRIDGE_CONTRACT_REMINDER;
+  if (requireReply)
+    contentToSend += REPLY_REQUIRED_INSTRUCTION;
+  log(`Forwarding Claude \u2192 Codex (${content.length} chars, requireReply=${requireReply}, pinnedContract=${needsContract})`);
+  if (!codex.injectMessage(contentToSend))
+    return false;
+  if (needsContract && PIN_CONTRACT_MODE === "once" && activeThreadId) {
+    lastPinnedContractThreadId = activeThreadId;
+    log(`Pinned BRIDGE_CONTRACT_REMINDER for thread ${activeThreadId.slice(0, 8)}; subsequent msgs skip the reminder`);
+  }
+  if (requireReply) {
+    replyRequired = true;
+    replyReceivedDuringTurn = false;
+    log(`Reply required flag set for this message`);
+  }
+  return true;
+}
+function drainReplyOutbox() {
+  const { reply, expired } = replyOutbox.takeNext(Date.now());
+  for (const stale of expired) {
+    const waitedMin = Math.round((Date.now() - stale.queuedAt) / 60000);
+    log(`Dropping expired queued reply ${stale.id} (waited ~${waitedMin}m)`);
+    emitToClaude(noticeMessage("reply_expired", `\u26A0\uFE0F A reply you sent while Codex was busy waited ~${waitedMin} minutes and was dropped without being delivered. ` + `Codex never saw it. Send it again if it still applies.
+
+Dropped message:
+${truncateForNotice(stale.content)}`));
+  }
+  if (!reply)
+    return;
+  if (deliverToCodex(reply.content, reply.requireReply)) {
+    clearAttentionWindow();
+    log(`Delivered queued reply ${reply.id} after turn completion`);
+    emitToClaude(noticeMessage("reply_delivered", "\uD83D\uDCE4 The reply you sent while Codex was busy has now been delivered \u2014 Codex is starting a turn on it."));
+    return;
+  }
+  if (codex.turnInProgress) {
+    replyOutbox.requeue(reply);
+    log(`Queued reply ${reply.id} still blocked by an in-progress turn; keeping it`);
+    return;
+  }
+  log(`Queued reply ${reply.id} could not be injected (no active thread); dropping`);
+  emitToClaude(noticeMessage("reply_undeliverable", "\u26A0\uFE0F A reply you sent while Codex was busy could not be delivered \u2014 the Codex thread is gone. " + `Reconnect the Codex TUI and send it again.
+
+Undelivered message:
+${truncateForNotice(reply.content)}`));
+  discardOutboxForLostCodex("the Codex thread is gone");
+}
+function discardOutboxForLostCodex(why) {
+  const lost = replyOutbox.clear();
+  if (lost.length === 0)
+    return;
+  log(`Discarding ${lost.length} queued Claude \u2192 Codex repl(ies): ${why}`);
+  emitToClaude(noticeMessage("reply_discarded", `\u26A0\uFE0F ${lost.length} repl${lost.length > 1 ? "ies" : "y"} you sent while Codex was busy ` + `${lost.length > 1 ? "were" : "was"} never delivered \u2014 ${why}. ` + `Resend if still relevant.
+
+` + lost.map((r, i) => `[${i + 1}] ${truncateForNotice(r.content)}`).join(`
+
+`)));
+}
+function truncateForNotice(content, max = 400) {
+  return content.length <= max ? content : `${content.slice(0, max)}\u2026 (${content.length} chars total)`;
 }
 async function attachClaude(ws) {
   const occupant = attachedClaude;
@@ -2585,7 +2710,9 @@ function currentStatus() {
     queuedMessageCount: bufferedMessages.length + statusBuffer.size,
     proxyUrl: codex.proxyUrl,
     appServerUrl: codex.appServerUrl,
-    pid: process.pid
+    pid: process.pid,
+    claudeAttached: attachedClaude !== null && attachedClaude.readyState === WebSocket.OPEN,
+    pendingReplyCount: replyOutbox.size
   };
 }
 function currentWaitingMessage() {
@@ -2622,6 +2749,14 @@ function systemMessage(idPrefix, content) {
     id: `${idPrefix}_${++nextSystemMessageId}`,
     source: "codex",
     content,
+    timestamp: Date.now()
+  };
+}
+function noticeMessage(idPrefix, content) {
+  return {
+    id: `notice_${idPrefix}_${++nextSystemMessageId}`,
+    source: "codex",
+    content: `[AgentBridge] ${content}`,
     timestamp: Date.now()
   };
 }

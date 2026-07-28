@@ -95,7 +95,7 @@ Ports are per-project (see the namespace invariant below), falling back to `4502
 
 - The Codex sandbox cannot write to `.git` — Claude performs all git operations (commit/push/PR).
 - Codex works in the main directory; Claude uses a worktree (`<repo>_wt_<PR number>`).
-- Do not send `reply` during an active Codex turn — the busy guard rejects it. When you see `⏳ Codex is working`, wait for `✅ Codex finished` before replying.
+- Replying during an active Codex turn is safe. The daemon holds the message in a small bounded outbox and injects it when the turn ends; the tool result says `Reply queued for Codex`. That is an acceptance, not a failure — **do not resend it**, or Codex gets two copies. If a queued reply is ever dropped or expires, AgentBridge says so explicitly and echoes the text back.
 - Codex TUI resume has known bugs (GitHub #14470, #12382) — prefer starting a fresh session.
 - Connect the Codex TUI with `abg codex` (installed via `bun link`).
 - **When testing a PR, check out that PR's branch/worktree** — never test it from a different branch.

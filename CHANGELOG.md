@@ -44,6 +44,49 @@ branches still in review. Cutting a release from here means a minor bump
   changes what a real agent actually does. Both spend real model tokens,
   so they run via `bun run test:live:bridge` / `test:live:roles` rather
   than `bun test src`. `docs/test-plan.md` maps the five tiers.
+- **Replies sent during a Codex turn are held, not rejected.** Codex
+  accepts one turn at a time, so `reply` during a running turn used to
+  fail outright and the only recovery was for Claude to notice and
+  resend by hand — which it frequently did not, and which produced
+  duplicates when it did. The daemon now holds the message in a small
+  outbox (`src/reply-outbox.ts`) and injects it the moment the turn
+  ends. The tool result says "queued", not "sent" and not "failed", so
+  Claude can tell the difference without guessing. The outbox is
+  bounded and perishable — three messages and ten minutes by default,
+  tunable with `AGENTBRIDGE_REPLY_QUEUE_MAX` and
+  `AGENTBRIDGE_REPLY_QUEUE_TTL_MS` — and every drop, expiry, or
+  undeliverable message is reported to Claude with the original text
+  echoed back. Nothing is discarded silently.
+- **`abg status` asks the running daemon.** It previously read only
+  files, which record what was true when the daemon booted, so it could
+  not answer the question people actually open it for: is the other
+  agent there right now? It now queries `/healthz` and reports whether
+  Claude is attached, whether the Codex TUI is connected, whether a
+  thread exists yet, and how many messages are queued or held — each
+  with the command that fixes it. The port comes from `status.json`
+  rather than being re-derived, because a config edit or a moved
+  project root would otherwise make a healthy daemon look dead.
+- **`abg doctor --fix` repairs what it diagnoses.** The doctor could
+  spot a stale `daemon.pid`, an abandoned `startup.lock`, an orphaned
+  bridge server, or drifted config ports, and then leave the user to
+  work out the `rm`. `--fix` repairs those four. Each re-verifies its
+  evidence at repair time rather than trusting the diagnosis, since the
+  report can sit on screen while the state changes underneath it, and
+  repairs are attached only to findings whose bad state was *proved* —
+  never to ones that were inferred.
+- **`abg log` shows what crossed the bridge.** There was no way to see
+  the traffic short of tailing the raw log and reading around the
+  startup noise. `abg log` prints a filtered, reformatted tail —
+  forwards, queues, injections, turn boundaries, attach/detach, and
+  every error — with `-f` to follow (rotation-aware), `-n` for depth,
+  `--grep` for a pattern, and `--all` to drop the filter.
+- **Codex sees a launch summary.** The Codex side had no statusbar, no
+  push notifications, and no way to ask the bridge anything from inside
+  the TUI, so a Codex user could not tell whether Claude was even
+  attached. `abg codex` now prints a short banner before the TUI takes
+  the screen: whether Claude is attached, how many messages are waiting,
+  what `[REPLY]` / `[STATUS]` / `[FYI]` do, and which commands answer
+  follow-up questions.
 - **Coverage for terminal restore.** `src/cli/terminal-restore.ts` lifts
   the save/restore out of `abg codex` behind an injected syscall seam,
   with 12 tests. This is the code that rescues a shell after the Codex
@@ -106,6 +149,13 @@ branches still in review. Cutting a release from here means a minor bump
 
 ### Changed
 
+- **"Wait for `✅ Codex finished` before replying" is no longer a rule.**
+  It was a human-enforced workaround for the busy guard, documented in
+  `CLAUDE.md` and in Claude's own instructions, and it depended on an
+  agent watching a statusbar tag it has no reliable way to observe.
+  The outbox enforces the same ordering mechanically, so the guidance
+  is now the opposite: reply when you have something to say, and do
+  *not* resend.
 - Documentation is English-only; README and `CLAUDE.md` refreshed for
   the multi-project model. (#3)
 - Plugin manifests realigned to `package.json`. `plugin.json` and

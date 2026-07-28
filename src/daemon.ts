@@ -22,6 +22,7 @@ import {
   CLOSE_CODE_PROBE_IN_PROGRESS,
 } from "./control-protocol";
 import { parsePositiveIntEnv } from "./env-utils";
+import { ReplyOutbox, type QueuedReply } from "./reply-outbox";
 import type { ControlClientMessage, ControlServerMessage, DaemonStatus } from "./control-protocol";
 import type { BridgeMessage } from "./types";
 import { probeLiveness as probeLivenessImpl } from "./liveness-probe";
@@ -102,6 +103,15 @@ const LIVENESS_PROBE_TIMEOUT_MS = parsePositiveIntEnv(
 );
 const LIVENESS_PROBE_POLL_MS = 50;
 let challengeInProgress = false;
+
+// Claude→Codex replies that arrived while Codex was mid-turn. Codex
+// accepts one turn at a time, so these are held and injected when the
+// turn completes rather than bounced back as an error Claude has to
+// remember to retry. See src/reply-outbox.ts.
+const replyOutbox = new ReplyOutbox({
+  max: parsePositiveIntEnv("AGENTBRIDGE_REPLY_QUEUE_MAX", 3, log),
+  ttlMs: parsePositiveIntEnv("AGENTBRIDGE_REPLY_QUEUE_TTL_MS", 10 * 60_000, log),
+});
 
 const bufferedMessages: BridgeMessage[] = [];
 
@@ -224,6 +234,13 @@ codex.on("turnCompleted", () => {
   if (attachedClaude && shouldNotifyCodexClaudeOnline()) {
     notifyCodexClaudeOnline();
   }
+
+  // Deliver anything Claude sent while this turn was running. Last,
+  // because the online notice is the handshake that explains what
+  // AgentBridge is — a held reply landing before it would arrive with
+  // no context. If the notice claimed this slot the drain simply
+  // re-queues and goes out when *that* turn ends.
+  drainReplyOutbox();
 });
 
 codex.on("ready", (threadId: string) => {
@@ -268,6 +285,7 @@ codex.on("exit", (code: number | null) => {
   claudeOfflineNoticeShown = false;
   // Codex thread is gone; next thread needs the contract pinned again.
   lastPinnedContractThreadId = null;
+  discardOutboxForLostCodex("the Codex app-server exited");
   emitToClaude(
     systemMessage(
       "system_codex_exit",
@@ -366,52 +384,186 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
       }
 
       const requireReply = !!message.requireReply;
-      // Pin contract once per Codex thread. Cuts ~200 tokens per
-      // Claude→Codex msg after the first. Falls back to per-msg append
-      // when AGENTBRIDGE_PIN_CONTRACT=always (legacy mode for users who
-      // see contract drift mid-session).
-      const activeThreadId = codex.activeThreadId;
-      const needsContract =
-        PIN_CONTRACT_MODE === "always" ||
-        (PIN_CONTRACT_MODE === "once" && activeThreadId !== lastPinnedContractThreadId);
-      let contentToSend = message.message.content;
-      if (needsContract) {
-        contentToSend += "\n\n" + BRIDGE_CONTRACT_REMINDER;
-        if (PIN_CONTRACT_MODE === "once" && activeThreadId) {
-          lastPinnedContractThreadId = activeThreadId;
-          log(`Pinned BRIDGE_CONTRACT_REMINDER for thread ${activeThreadId.slice(0, 8)}; subsequent msgs skip the reminder`);
-        }
-      }
-      if (requireReply) {
-        contentToSend += REPLY_REQUIRED_INSTRUCTION;
-        replyRequired = true;
-        replyReceivedDuringTurn = false;
-        log(`Reply required flag set for this message`);
-      }
-      log(`Forwarding Claude → Codex (${message.message.content.length} chars, requireReply=${requireReply}, pinnedContract=${needsContract})`);
-      const injected = codex.injectMessage(contentToSend);
-      if (!injected) {
-        const reason = codex.turnInProgress
-          ? "Codex is busy executing a turn. Wait for it to finish before sending another message."
-          : "Injection failed: no active thread or WebSocket not connected.";
-        log(`Injection rejected: ${reason}`);
+      const content = message.message.content;
+
+      if (deliverToCodex(content, requireReply)) {
+        clearAttentionWindow(); // Claude successfully replied, end attention window
         sendProtocolMessage(ws, {
           type: "claude_to_codex_result",
           requestId: message.requestId,
-          success: false,
-          error: reason,
+          success: true,
         });
         return;
       }
-      clearAttentionWindow(); // Claude successfully replied, end attention window
+
+      // Codex mid-turn is not a failure, it is a wait. Hold the message
+      // and deliver it when the turn completes, so Claude does not have
+      // to notice the rejection and retry by hand — the single most
+      // common way a reply used to get lost.
+      if (codex.turnInProgress) {
+        const { depth, dropped } = replyOutbox.accept({
+          id: message.message.id,
+          content,
+          requireReply,
+          queuedAt: Date.now(),
+        });
+        log(`Queued Claude → Codex reply while turn in progress (depth ${depth}, dropped ${dropped.length})`);
+        let note =
+          depth > 1
+            ? `Codex is mid-turn. Held for delivery when the turn ends (${depth} replies now queued, sent in order).`
+            : "Codex is mid-turn. Held for delivery when the turn ends.";
+        if (dropped.length > 0) {
+          note +=
+            ` ${dropped.length} older queued repl${dropped.length > 1 ? "ies were" : "y was"}` +
+            ` dropped to stay under the ${replyOutbox.capacity}-message limit.`;
+        }
+        sendProtocolMessage(ws, {
+          type: "claude_to_codex_result",
+          requestId: message.requestId,
+          success: true,
+          queued: true,
+          note,
+        });
+        return;
+      }
+
+      const reason = "Injection failed: no active thread or WebSocket not connected.";
+      log(`Injection rejected: ${reason}`);
       sendProtocolMessage(ws, {
         type: "claude_to_codex_result",
         requestId: message.requestId,
-        success: true,
+        success: false,
+        error: reason,
       });
       return;
     }
   }
+}
+
+/**
+ * Decorate a Claude message and inject it as a Codex turn.
+ *
+ * Every state mutation here happens *after* `injectMessage` returns
+ * true. The contract-pin bookkeeping and the require-reply flag used to
+ * be set before the attempt, so a rejected injection left the thread
+ * marked as already-pinned (the contract would then never be sent) and
+ * armed `replyRequired` against Codex's *current* turn — producing a
+ * `system_reply_missing` warning for a message Codex never received.
+ */
+function deliverToCodex(content: string, requireReply: boolean): boolean {
+  // Pin contract once per Codex thread. Cuts ~200 tokens per
+  // Claude→Codex msg after the first. Falls back to per-msg append
+  // when AGENTBRIDGE_PIN_CONTRACT=always (legacy mode for users who
+  // see contract drift mid-session).
+  const activeThreadId = codex.activeThreadId;
+  const needsContract =
+    PIN_CONTRACT_MODE === "always" ||
+    (PIN_CONTRACT_MODE === "once" && activeThreadId !== lastPinnedContractThreadId);
+
+  let contentToSend = content;
+  if (needsContract) contentToSend += "\n\n" + BRIDGE_CONTRACT_REMINDER;
+  if (requireReply) contentToSend += REPLY_REQUIRED_INSTRUCTION;
+
+  log(`Forwarding Claude → Codex (${content.length} chars, requireReply=${requireReply}, pinnedContract=${needsContract})`);
+  if (!codex.injectMessage(contentToSend)) return false;
+
+  if (needsContract && PIN_CONTRACT_MODE === "once" && activeThreadId) {
+    lastPinnedContractThreadId = activeThreadId;
+    log(`Pinned BRIDGE_CONTRACT_REMINDER for thread ${activeThreadId.slice(0, 8)}; subsequent msgs skip the reminder`);
+  }
+  if (requireReply) {
+    replyRequired = true;
+    replyReceivedDuringTurn = false;
+    log(`Reply required flag set for this message`);
+  }
+  return true;
+}
+
+/**
+ * Deliver at most one held reply, called when a Codex turn completes.
+ *
+ * One per completed turn, not a full drain: injecting a second message
+ * would be refused anyway (the first just started a new turn), and
+ * re-queueing it would only churn. Whatever remains waits for the turn
+ * this delivery is about to start.
+ */
+function drainReplyOutbox(): void {
+  const { reply, expired } = replyOutbox.takeNext(Date.now());
+
+  for (const stale of expired) {
+    const waitedMin = Math.round((Date.now() - stale.queuedAt) / 60_000);
+    log(`Dropping expired queued reply ${stale.id} (waited ~${waitedMin}m)`);
+    emitToClaude(
+      noticeMessage(
+        "reply_expired",
+        `⚠️ A reply you sent while Codex was busy waited ~${waitedMin} minutes and was dropped without being delivered. ` +
+          `Codex never saw it. Send it again if it still applies.\n\nDropped message:\n${truncateForNotice(stale.content)}`,
+      ),
+    );
+  }
+
+  if (!reply) return;
+
+  if (deliverToCodex(reply.content, reply.requireReply)) {
+    // Same bookkeeping as a live reply: Claude has answered, so the
+    // attention window opened moments ago by turnCompleted is over.
+    clearAttentionWindow();
+    log(`Delivered queued reply ${reply.id} after turn completion`);
+    emitToClaude(
+      noticeMessage(
+        "reply_delivered",
+        "📤 The reply you sent while Codex was busy has now been delivered — Codex is starting a turn on it.",
+      ),
+    );
+    return;
+  }
+
+  if (codex.turnInProgress) {
+    // A new turn started between the completion event and this call.
+    // Keep the original queuedAt so the TTL still measures Claude's wait.
+    replyOutbox.requeue(reply);
+    log(`Queued reply ${reply.id} still blocked by an in-progress turn; keeping it`);
+    return;
+  }
+
+  log(`Queued reply ${reply.id} could not be injected (no active thread); dropping`);
+  emitToClaude(
+    noticeMessage(
+      "reply_undeliverable",
+      "⚠️ A reply you sent while Codex was busy could not be delivered — the Codex thread is gone. " +
+        `Reconnect the Codex TUI and send it again.\n\nUndelivered message:\n${truncateForNotice(reply.content)}`,
+    ),
+  );
+  // Anything still held is blocked on the same dead thread.
+  discardOutboxForLostCodex("the Codex thread is gone");
+}
+
+/**
+ * Drop everything held for Codex and tell Claude what was lost.
+ *
+ * Called when the Codex side goes away. A message written for a thread
+ * that no longer exists would land in a fresh conversation with no
+ * context, which reads to Codex as a non-sequitur — worse than saying
+ * plainly that it never arrived.
+ */
+function discardOutboxForLostCodex(why: string): void {
+  const lost = replyOutbox.clear();
+  if (lost.length === 0) return;
+  log(`Discarding ${lost.length} queued Claude → Codex repl(ies): ${why}`);
+  emitToClaude(
+    noticeMessage(
+      "reply_discarded",
+      `⚠️ ${lost.length} repl${lost.length > 1 ? "ies" : "y"} you sent while Codex was busy ` +
+        `${lost.length > 1 ? "were" : "was"} never delivered — ${why}. ` +
+        `Resend if still relevant.\n\n` +
+        lost.map((r, i) => `[${i + 1}] ${truncateForNotice(r.content)}`).join("\n\n"),
+    ),
+  );
+}
+
+/** Keep a lost-message echo readable without replaying a whole essay. */
+function truncateForNotice(content: string, max = 400): string {
+  return content.length <= max ? content : `${content.slice(0, max)}… (${content.length} chars total)`;
 }
 
 async function attachClaude(ws: ServerWebSocket<ControlSocketData>) {
@@ -737,6 +889,8 @@ function currentStatus(): DaemonStatus {
     proxyUrl: codex.proxyUrl,
     appServerUrl: codex.appServerUrl,
     pid: process.pid,
+    claudeAttached: attachedClaude !== null && attachedClaude.readyState === WebSocket.OPEN,
+    pendingReplyCount: replyOutbox.size,
   };
 }
 
@@ -780,6 +934,26 @@ function systemMessage(idPrefix: string, content: string): BridgeMessage {
     id: `${idPrefix}_${++nextSystemMessageId}`,
     source: "codex",
     content,
+    timestamp: Date.now(),
+  };
+}
+
+/**
+ * A daemon-authored message that must reach Claude as *content*.
+ *
+ * `systemMessage` ids are deliberately swallowed by the frontend: any
+ * `system_*` prefix is converted to a statusbar tag and never enters
+ * Claude's context, which is what keeps a newly added lifecycle event
+ * from leaking into the chat. The outbox notices are the opposite case
+ * — they carry the text of a message that was delayed or lost, so a
+ * statusbar tag would destroy the only copy. The `notice_` prefix opts
+ * out of that routing.
+ */
+function noticeMessage(idPrefix: string, content: string): BridgeMessage {
+  return {
+    id: `notice_${idPrefix}_${++nextSystemMessageId}`,
+    source: "codex",
+    content: `[AgentBridge] ${content}`,
     timestamp: Date.now(),
   };
 }

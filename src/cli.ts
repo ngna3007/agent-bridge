@@ -9,6 +9,9 @@
  *   agentbridge claude      — Start Claude Code with push channel flags
  *   agentbridge codex       — Start Codex TUI connected to daemon
  *   agentbridge kill        — Force kill all AgentBridge processes
+ *   agentbridge status      — Project, daemon, and live attach state
+ *   agentbridge log         — Tail the bridge's message-flow log
+ *   agentbridge doctor      — Diagnose stuck state; --fix repairs the safe subset
  */
 
 import { resolveRuntimeNamespace } from "./runtime-namespace";
@@ -33,9 +36,9 @@ function maybeApplyProjectNamespace(cmd: string | undefined, justCreatedProject 
   if (!cmd) return;
   // init / dev / --help / --version run in "no project yet" mode -
   // their decisions don't depend on a daemon, so we leave env alone.
-  // status / doctor / projects are read-only diagnostics; they call
-  // resolveRuntimeNamespace themselves with mutateEnv:false to read
-  // the right state dir without affecting downstream code.
+  // status / doctor / projects / log are read-only diagnostics; they
+  // call resolveRuntimeNamespace themselves with mutateEnv:false to
+  // read the right state dir without affecting downstream code.
   // claude / codex / kill all spawn or talk to the daemon, so they
   // need the per-project env vars applied here.
   const namespaced = new Set(["claude", "codex", "kill"]);
@@ -109,7 +112,12 @@ async function main() {
       break;
     case "doctor":
       const { runDoctor } = await import("./cli/doctor");
-      await runDoctor();
+      await runDoctor(restArgs);
+      break;
+    case "log":
+    case "logs":
+      const { runLog } = await import("./cli/log-cmd");
+      await runLog(restArgs);
       break;
     case "roles":
       const { runRoles, printRolesHelp } = await import("./cli/roles-cmd");
@@ -153,9 +161,13 @@ Commands:
                     (or every project when --all is passed)
   roles [sub]       Show or edit what each agent is told it is
                     (list | edit <agent> | apply | reset <agent> | path <agent>)
-  status            Report project info, daemon state, ports (read-only)
+  status            Report project info, ports, and who is attached right now
   projects          List every project state dir + its daemon state
-  doctor            Diagnose stuck or surprising state, suggest fixes
+  doctor [--fix]    Diagnose stuck or surprising state; --fix repairs the
+                    cases it can prove are safe (stale pid/lock, orphans,
+                    drifted config ports)
+  log [opts]        Show what crossed the bridge
+                    (-n <count> | -f follow | --all | --grep <regex>)
 
 Options:
   --help, -h        Show this help message
@@ -185,6 +197,8 @@ Examples:
   abg roles                    # See what each agent is told it is
   abg roles edit codex         # Rewrite Codex's role in \$EDITOR
   abg status                   # See which project + daemon is active here
+  abg log -f                   # Watch messages cross the bridge live
+  abg doctor --fix             # Diagnose, and clean up what is safe to clean
   abg kill                     # Stop the daemon for this project
 `.trim());
 }

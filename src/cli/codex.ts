@@ -119,6 +119,72 @@ export function buildCodexArgs(userArgs: string[], proxyUrl: string): BuildArgsR
   return { fullArgs: [...bridgeFlags, ...userArgs], injectedBridgeFlags: true };
 }
 
+/**
+ * The Codex side is the blind one.
+ *
+ * Claude gets a statusbar tag for every lifecycle event and push
+ * notifications for tagged messages. Codex gets a single injected
+ * "Claude is online" message and, after that, no indication that a
+ * bridge exists at all — messages from Claude arrive looking like the
+ * user typed them, and there is no signal for whether Claude is even
+ * attached. Terminal chrome is not ours to add: `codex` owns the TUI.
+ *
+ * What *is* ours is the moment before the TUI starts. This block is the
+ * one place the Codex user is told what they are connected to, what the
+ * markers do, and how to check the state later without leaving the
+ * terminal. Kept to a handful of lines because the TUI takes the screen
+ * immediately afterwards.
+ */
+export function buildCodexLaunchSummary(live: {
+  claudeAttached: boolean;
+  pendingReplyCount: number;
+} | null): string[] {
+  const lines = ["", "AgentBridge — Codex session"];
+
+  if (live === null) {
+    lines.push("  Claude   unknown (daemon did not answer; run `abg status` after launch)");
+  } else if (live.claudeAttached) {
+    lines.push("  Claude   attached — messages you tag [REPLY] reach it immediately");
+  } else {
+    lines.push("  Claude   not attached — run `abg claude` in another terminal");
+  }
+
+  if (live && live.pendingReplyCount > 0) {
+    lines.push(
+      `  Waiting  ${live.pendingReplyCount} message(s) from Claude will arrive when your current turn ends`,
+    );
+  }
+
+  lines.push(
+    "  Tags     [REPLY] goes straight to Claude · [STATUS] is summarized · [FYI] is dropped",
+    "  Check    `abg status` any time · `abg log -f` to watch traffic",
+    "",
+  );
+  return lines;
+}
+
+/**
+ * Ask the daemon whether Claude is attached. Any failure yields null —
+ * the launch must not be blocked by an informational banner.
+ */
+async function fetchLaunchStatus(
+  controlPort: number,
+): Promise<{ claudeAttached: boolean; pendingReplyCount: number } | null> {
+  try {
+    const res = await fetch(`http://127.0.0.1:${controlPort}/healthz`, {
+      signal: AbortSignal.timeout(1000),
+    });
+    if (!res.ok) return null;
+    const status = (await res.json()) as { claudeAttached?: boolean; pendingReplyCount?: number };
+    return {
+      claudeAttached: status.claudeAttached === true,
+      pendingReplyCount: status.pendingReplyCount ?? 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export async function runCodex(args: string[]) {
   // Check for owned flag conflicts
   checkOwnedFlagConflicts(args, "agentbridge codex", OWNED_FLAGS);
@@ -184,6 +250,14 @@ export async function runCodex(args: string[]) {
   } catch (err: any) {
     console.error(`[agentbridge] ${err.message}`);
     process.exit(1);
+  }
+
+  // Last screen the Codex user sees before the TUI takes over. Skipped
+  // when stdout is not a terminal so scripted launches stay clean.
+  if (process.stdout.isTTY) {
+    for (const line of buildCodexLaunchSummary(await fetchLaunchStatus(controlPort))) {
+      console.log(line);
+    }
   }
 
   // Save terminal state and launch Codex with protection

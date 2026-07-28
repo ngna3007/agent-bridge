@@ -158,14 +158,15 @@ After modifying AgentBridge source code, re-run `abg dev` to sync changes to the
 | `abg codex [args...]` | Start Codex TUI connected to the AgentBridge daemon. Offers [first-run setup](#first-run-setup) in an unconfigured directory. Manages TUI process lifecycle (pid tracking, cleanup). Pass-through args forwarded to `codex` |
 | `abg kill [--all]` | Gracefully stop the daemon + managed Codex TUI **for the current project**, clean up state files, write the killed sentinel. `--all` does it for every project on the machine |
 | `abg roles [sub]` | See or change [what each agent is told it is](#agent-roles). `list` (default), `edit <agent>`, `apply`, `reset <agent>`, `path <agent>` |
-| `abg status` | Read-only: which project the cwd resolves to, its daemon state, and its ports |
+| `abg status` | Read-only: which project the cwd resolves to, its daemon state and ports, and — by asking the running daemon — whether each side is actually attached, whether a Codex thread exists yet, and what is queued or held |
 | `abg projects` | List every project state dir on this machine and each daemon's state |
-| `abg doctor` | Diagnose stuck or surprising state and suggest fixes |
+| `abg doctor [--fix]` | Diagnose stuck or surprising state and suggest fixes. `--fix` repairs the ones it can prove: stale `daemon.pid`, abandoned `startup.lock`, orphaned bridge servers, drifted config ports |
+| `abg log [-f] [-n N] [--grep P] [--all]` | Show what crossed the bridge — forwards, queues, injections, turn boundaries, attach/detach, errors. `-f` follows, `--all` drops the filter |
 | `abg dev` | (Dev only) Register local marketplace + force-sync plugin to cache |
 | `abg --help` | Show help |
 | `abg --version` | Show version |
 
-`init`, `dev`, `--help`, and `--version` deliberately do **not** pick up a project namespace — they must not inherit ports from a stale ancestor `.agentbridge/`. `status`, `projects`, and `doctor` resolve the namespace read-only. Only `claude`, `codex`, and `kill` apply it to the environment.
+`init`, `dev`, `--help`, and `--version` deliberately do **not** pick up a project namespace — they must not inherit ports from a stale ancestor `.agentbridge/`. `status`, `projects`, `doctor`, and `log` resolve the namespace read-only. Only `claude`, `codex`, and `kill` apply it to the environment.
 
 ### Owned flags
 
@@ -331,7 +332,8 @@ agent_bridge/
 │       ├── kill.ts                # abg kill
 │       ├── status.ts              # abg status
 │       ├── projects.ts            # abg projects
-│       ├── doctor.ts              # abg doctor
+│       ├── doctor.ts              # abg doctor (+ --fix repairs)
+│       ├── log-cmd.ts             # abg log
 │       ├── dev.ts                 # abg dev
 │       ├── prompt.ts              # Interactive prompts (onboarding wizard, agent picker)
 │       └── pkg-root.ts            # Locates the installed package root
