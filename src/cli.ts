@@ -9,6 +9,9 @@
  *   agentbridge claude      — Start Claude Code with push channel flags
  *   agentbridge codex       — Start Codex TUI connected to daemon
  *   agentbridge kill        — Force kill all AgentBridge processes
+ *   agentbridge status      — Project, daemon, and live attach state
+ *   agentbridge log         — Tail the bridge's message-flow log
+ *   agentbridge doctor      — Diagnose stuck state; --fix repairs the safe subset
  */
 
 import { resolveRuntimeNamespace } from "./runtime-namespace";
@@ -29,20 +32,33 @@ export const PLUGIN_NAME = "agentbridge";
  * `init`, `dev`, and metadata commands - they should not pick up a
  * project namespace from a stale ancestor `.agentbridge/`.
  */
-function maybeApplyProjectNamespace(cmd: string | undefined): void {
+function maybeApplyProjectNamespace(cmd: string | undefined, justCreatedProject = false): void {
   if (!cmd) return;
   // init / dev / --help / --version run in "no project yet" mode -
   // their decisions don't depend on a daemon, so we leave env alone.
-  // status / doctor / projects are read-only diagnostics; they call
-  // resolveRuntimeNamespace themselves with mutateEnv:false to read
-  // the right state dir without affecting downstream code.
+  // status / doctor / projects / log are read-only diagnostics; they
+  // call resolveRuntimeNamespace themselves with mutateEnv:false to
+  // read the right state dir without affecting downstream code.
   // claude / codex / kill all spawn or talk to the daemon, so they
   // need the per-project env vars applied here.
   const namespaced = new Set(["claude", "codex", "kill"]);
   if (!namespaced.has(cmd)) return;
 
   const ns = resolveRuntimeNamespace({ mutateEnv: true });
-  if (!ns.project) return; // single-instance fallback - historical behavior
+  if (!ns.project) {
+    // Normally this is the historical single-instance fallback and is
+    // fine. But if setup just wrote a `.agentbridge/` marker, the
+    // namespace has to resolve — not resolving means the user answered
+    // "yes" and is silently getting the shared ports anyway, which is
+    // the exact failure the first-run offer exists to prevent.
+    if (justCreatedProject) {
+      process.stderr.write(
+        "[abg] Project was created but its namespace did not resolve — " +
+          "continuing on the shared ports 4500/4501/4502. Run `abg doctor`.\n",
+      );
+    }
+    return;
+  }
 
   // One-line startup banner so the user can see at a glance which
   // project this terminal is talking to. Stays out of automation
@@ -61,9 +77,9 @@ async function main() {
   // otherwise the user answers "yes" and still gets fallback ports for
   // the rest of this session.
   const { maybeOfferSetup } = await import("./cli/auto-setup");
-  await maybeOfferSetup(command);
+  const createdProject = await maybeOfferSetup(command);
 
-  maybeApplyProjectNamespace(command);
+  maybeApplyProjectNamespace(command, createdProject);
 
   switch (command) {
     case "init":
@@ -96,7 +112,20 @@ async function main() {
       break;
     case "doctor":
       const { runDoctor } = await import("./cli/doctor");
-      await runDoctor();
+      await runDoctor(restArgs);
+      break;
+    case "log":
+    case "logs":
+      const { runLog } = await import("./cli/log-cmd");
+      await runLog(restArgs);
+      break;
+    case "roles":
+      const { runRoles, printRolesHelp } = await import("./cli/roles-cmd");
+      if (restArgs[0] === "--help" || restArgs[0] === "-h") {
+        printRolesHelp();
+      } else {
+        await runRoles(restArgs);
+      }
       break;
     case "--help":
     case "-h":
@@ -130,9 +159,15 @@ Commands:
   codex [args...]   Start Codex TUI connected to AgentBridge daemon
   kill [--all]      Stop daemon + managed Codex TUI for the current project
                     (or every project when --all is passed)
-  status            Report project info, daemon state, ports (read-only)
+  roles [sub]       Show or edit what each agent is told it is
+                    (list | edit <agent> | apply | reset <agent> | path <agent>)
+  status            Report project info, ports, and who is attached right now
   projects          List every project state dir + its daemon state
-  doctor            Diagnose stuck or surprising state, suggest fixes
+  doctor [--fix]    Diagnose stuck or surprising state; --fix repairs the
+                    cases it can prove are safe (stale pid/lock, orphans,
+                    drifted config ports)
+  log [opts]        Show what crossed the bridge
+                    (-n <count> | -f follow | --all | --grep <regex>)
 
 Options:
   --help, -h        Show this help message
@@ -146,13 +181,24 @@ Multi-project:
   falls back to the shared single-instance mode (ports 4500/4501/4502).
   Set AGENTBRIDGE_AUTO_SETUP=0 to suppress the offer entirely.
 
+Agent roles:
+  Setup seeds .agentbridge/roles/claude.md and .agentbridge/roles/codex.md
+  with the built-in defaults and never overwrites them again. The file body
+  is the role text — plain prose, no format. Edit one and restart that
+  agent; \`abg claude\` / \`abg codex\` re-render the matching section of
+  CLAUDE.md / AGENTS.md on launch. \`abg roles\` shows the current state.
+
 Examples:
   abg init                     # First-time setup, in this project root
   abg claude                   # Start Claude Code in this project
   abg claude --resume          # ... and resume the last session
   abg codex                    # Start Codex TUI
   abg codex --model o3         # ... with a specific model
+  abg roles                    # See what each agent is told it is
+  abg roles edit codex         # Rewrite Codex's role in \$EDITOR
   abg status                   # See which project + daemon is active here
+  abg log -f                   # Watch messages cross the bridge live
+  abg doctor --fix             # Diagnose, and clean up what is safe to clean
   abg kill                     # Stop the daemon for this project
 `.trim());
 }

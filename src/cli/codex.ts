@@ -1,13 +1,5 @@
-import { spawn, execSync } from "node:child_process";
-import {
-  openSync,
-  writeSync,
-  closeSync,
-  writeFileSync,
-  unlinkSync,
-  existsSync,
-  mkdirSync,
-} from "node:fs";
+import { spawn } from "node:child_process";
+import { writeFileSync, unlinkSync, existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { StateDirResolver } from "../state-dir";
 import { ConfigService } from "../config-service";
@@ -15,6 +7,8 @@ import { DaemonLifecycle } from "../daemon-lifecycle";
 import { StderrRingBuffer } from "../stderr-ring-buffer";
 import { getRotatingLogger } from "../log-rotator";
 import { checkOwnedFlagConflicts } from "./claude";
+import { syncRolesForLaunch } from "./role-sync";
+import { restoreTerminal as restoreTerminalState, saveTerminalState } from "./terminal-restore";
 
 /**
  * Write a timestamped entry to the codex wrapper log.
@@ -125,6 +119,72 @@ export function buildCodexArgs(userArgs: string[], proxyUrl: string): BuildArgsR
   return { fullArgs: [...bridgeFlags, ...userArgs], injectedBridgeFlags: true };
 }
 
+/**
+ * The Codex side is the blind one.
+ *
+ * Claude gets a statusbar tag for every lifecycle event and push
+ * notifications for tagged messages. Codex gets a single injected
+ * "Claude is online" message and, after that, no indication that a
+ * bridge exists at all — messages from Claude arrive looking like the
+ * user typed them, and there is no signal for whether Claude is even
+ * attached. Terminal chrome is not ours to add: `codex` owns the TUI.
+ *
+ * What *is* ours is the moment before the TUI starts. This block is the
+ * one place the Codex user is told what they are connected to, what the
+ * markers do, and how to check the state later without leaving the
+ * terminal. Kept to a handful of lines because the TUI takes the screen
+ * immediately afterwards.
+ */
+export function buildCodexLaunchSummary(live: {
+  claudeAttached: boolean;
+  pendingReplyCount: number;
+} | null): string[] {
+  const lines = ["", "AgentBridge — Codex session"];
+
+  if (live === null) {
+    lines.push("  Claude   unknown (daemon did not answer; run `abg status` after launch)");
+  } else if (live.claudeAttached) {
+    lines.push("  Claude   attached — messages you tag [REPLY] reach it immediately");
+  } else {
+    lines.push("  Claude   not attached — run `abg claude` in another terminal");
+  }
+
+  if (live && live.pendingReplyCount > 0) {
+    lines.push(
+      `  Waiting  ${live.pendingReplyCount} message(s) from Claude will arrive when your current turn ends`,
+    );
+  }
+
+  lines.push(
+    "  Tags     [REPLY] goes straight to Claude · [STATUS] is summarized · [FYI] is dropped",
+    "  Check    `abg status` any time · `abg log -f` to watch traffic",
+    "",
+  );
+  return lines;
+}
+
+/**
+ * Ask the daemon whether Claude is attached. Any failure yields null —
+ * the launch must not be blocked by an informational banner.
+ */
+async function fetchLaunchStatus(
+  controlPort: number,
+): Promise<{ claudeAttached: boolean; pendingReplyCount: number } | null> {
+  try {
+    const res = await fetch(`http://127.0.0.1:${controlPort}/healthz`, {
+      signal: AbortSignal.timeout(1000),
+    });
+    if (!res.ok) return null;
+    const status = (await res.json()) as { claudeAttached?: boolean; pendingReplyCount?: number };
+    return {
+      claudeAttached: status.claudeAttached === true,
+      pendingReplyCount: status.pendingReplyCount ?? 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export async function runCodex(args: string[]) {
   // Check for owned flag conflicts
   checkOwnedFlagConflicts(args, "agentbridge codex", OWNED_FLAGS);
@@ -146,6 +206,11 @@ export async function runCodex(args: string[]) {
       process.exit(1);
     }
   }
+
+  // Re-render AGENTS.md's marked section from .agentbridge/roles/codex.md.
+  // Before the daemon starts: an unusable role file should abort the
+  // launch without leaving a daemon behind.
+  syncRolesForLaunch("codex");
 
   const stateDir = new StateDirResolver();
   const configService = new ConfigService();
@@ -187,58 +252,22 @@ export async function runCodex(args: string[]) {
     process.exit(1);
   }
 
+  // Last screen the Codex user sees before the TUI takes over. Skipped
+  // when stdout is not a terminal so scripted launches stay clean.
+  if (process.stdout.isTTY) {
+    for (const line of buildCodexLaunchSummary(await fetchLaunchStatus(controlPort))) {
+      console.log(line);
+    }
+  }
+
   // Save terminal state and launch Codex with protection
   console.log(`Connecting Codex TUI to AgentBridge at ${proxyUrl}...`);
 
-  // Save terminal state
-  let savedStty: string | null = null;
-  if (process.stdin.isTTY) {
-    try {
-      savedStty = execSync("stty -g", { encoding: "utf-8", stdio: ["inherit", "pipe", "pipe"] }).trim();
-    } catch {}
-  }
-
-  function restoreTerminal() {
-    // Restore saved terminal settings
-    if (savedStty && process.stdin.isTTY) {
-      try {
-        execSync(`stty ${savedStty}`, { stdio: ["inherit", "ignore", "ignore"] });
-      } catch {
-        try {
-          execSync("stty sane", { stdio: ["inherit", "ignore", "ignore"] });
-        } catch {}
-      }
-    }
-
-    // Write escape sequences to /dev/tty if available
-    let ttyFd: number | null = null;
-    try {
-      ttyFd = openSync("/dev/tty", "w");
-    } catch {
-      if (process.stdout.isTTY) {
-        ttyFd = 1; // stdout
-      }
-    }
-
-    if (ttyFd !== null) {
-      const sequences = [
-        "\x1b[<u",       // Disable keyboard enhancement
-        "\x1b[?2004l",   // Disable bracketed paste
-        "\x1b[?1004l",   // Disable focus tracking
-        "\x1b[?1049l",   // Leave alternate screen
-        "\x1b[?25h",     // Show cursor
-        "\x1b[0m",       // Reset character attributes
-      ];
-      for (const seq of sequences) {
-        try {
-          writeSync(ttyFd, seq);
-        } catch {}
-      }
-      if (ttyFd !== 1) {
-        try { closeSync(ttyFd); } catch {}
-      }
-    }
-  }
+  // Capture the terminal before the TUI takes it over, so every exit
+  // path below can hand it back. See src/cli/terminal-restore.ts for
+  // why this lives in its own module.
+  const savedStty = saveTerminalState();
+  const restoreTerminal = () => restoreTerminalState(savedStty);
 
   const { fullArgs } = buildCodexArgs(args, proxyUrl);
 

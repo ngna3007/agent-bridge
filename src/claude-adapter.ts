@@ -23,8 +23,9 @@ import { randomUUID } from "node:crypto";
 import { StateDirResolver } from "./state-dir";
 import { getRotatingLogger } from "./log-rotator";
 import type { BridgeMessage } from "./types";
+import type { ReplyOutcome } from "./control-protocol";
 
-export type ReplySender = (msg: BridgeMessage, requireReply?: boolean) => Promise<{ success: boolean; error?: string }>;
+export type ReplySender = (msg: BridgeMessage, requireReply?: boolean) => Promise<ReplyOutcome>;
 export type DeliveryMode = "push" | "pull" | "auto";
 
 export const CLAUDE_INSTRUCTIONS = [
@@ -65,9 +66,11 @@ export const CLAUDE_INSTRUCTIONS = [
   "- It is fine to skip replying entirely. Not every message needs a response.",
   "",
   "## Turn coordination",
-  "- When you see '⏳ Codex is working', do NOT call the reply tool. Wait for '✅ Codex finished'.",
-  "- After Codex finishes a turn, you have an attention window before new pushes arrive - good time to send a reply if you have one.",
-  "- If reply returns a busy error, Codex is still executing - wait and retry later.",
+  "- '⏳ Codex is working' means a turn is running. Replying anyway is safe: the bridge holds the message and injects it the moment that turn ends.",
+  "- 'Reply queued for Codex' means accepted, not failed. Do NOT resend it - a resend arrives as a second copy.",
+  "- After '✅ Codex finished', you have an attention window before new pushes arrive - good time to send a reply if you have one.",
+  "- The queue is small and messages in it expire. If a reply is genuinely urgent, send one message rather than several.",
+  "- If a queued reply is later dropped or undeliverable, AgentBridge tells you explicitly and echoes the text back. Nothing is lost silently.",
   "",
   "## Collaboration roles",
   "- Claude (you): Executor. You write the code, run the tools, drive the implementation, and handle git. The work flows through you.",
@@ -389,7 +392,12 @@ export class ClaudeAdapter extends EventEmitter {
 
     // Include pending message hint
     const pending = this.pendingMessages.length;
-    let responseText = "Reply sent to Codex.";
+    // A queued reply is a success with a delay, not an error. Saying
+    // "sent" would be a lie Claude cannot detect, and returning an
+    // error would provoke the manual retry the outbox exists to remove.
+    let responseText = result.queued
+      ? `Reply queued for Codex. ${result.note ?? "Codex is mid-turn; it will be delivered when the turn ends."} You do not need to resend it.`
+      : "Reply sent to Codex.";
     if (pending > 0) {
       responseText += ` Note: ${pending} unread Codex message${pending > 1 ? "s" : ""} already waiting \u2014 call get_messages to read them.`;
     }

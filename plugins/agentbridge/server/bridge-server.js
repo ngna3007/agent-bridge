@@ -13839,9 +13839,11 @@ var CLAUDE_INSTRUCTIONS = [
   "- It is fine to skip replying entirely. Not every message needs a response.",
   "",
   "## Turn coordination",
-  "- When you see '\u23F3 Codex is working', do NOT call the reply tool. Wait for '\u2705 Codex finished'.",
-  "- After Codex finishes a turn, you have an attention window before new pushes arrive - good time to send a reply if you have one.",
-  "- If reply returns a busy error, Codex is still executing - wait and retry later.",
+  "- '\u23F3 Codex is working' means a turn is running. Replying anyway is safe: the bridge holds the message and injects it the moment that turn ends.",
+  "- 'Reply queued for Codex' means accepted, not failed. Do NOT resend it - a resend arrives as a second copy.",
+  "- After '\u2705 Codex finished', you have an attention window before new pushes arrive - good time to send a reply if you have one.",
+  "- The queue is small and messages in it expire. If a reply is genuinely urgent, send one message rather than several.",
+  "- If a queued reply is later dropped or undeliverable, AgentBridge tells you explicitly and echoes the text back. Nothing is lost silently.",
   "",
   "## Collaboration roles",
   "- Claude (you): Executor. You write the code, run the tools, drive the implementation, and handle git. The work flows through you.",
@@ -14108,7 +14110,7 @@ ${formatted}`
       };
     }
     const pending = this.pendingMessages.length;
-    let responseText = "Reply sent to Codex.";
+    let responseText = result.queued ? `Reply queued for Codex. ${result.note ?? "Codex is mid-turn; it will be delivered when the turn ends."} You do not need to resend it.` : "Reply sent to Codex.";
     if (pending > 0) {
       responseText += ` Note: ${pending} unread Codex message${pending > 1 ? "s" : ""} already waiting \u2014 call get_messages to read them.`;
     }
@@ -14276,7 +14278,12 @@ class DaemonClient extends EventEmitter2 {
             return;
           clearTimeout(pending.timer);
           this.pendingReplies.delete(message.requestId);
-          pending.resolve({ success: message.success, error: message.error });
+          pending.resolve({
+            success: message.success,
+            error: message.error,
+            queued: message.queued,
+            note: message.note
+          });
           return;
         }
         case "status":

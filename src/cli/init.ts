@@ -1,15 +1,15 @@
 import { execSync, execFileSync } from "node:child_process";
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { basename, relative } from "node:path";
 import { ConfigService, DEFAULT_CONFIG } from "../config-service";
 import { MARKETPLACE_NAME, PLUGIN_NAME } from "../cli";
 import { findPackageRoot, registerMarketplace } from "./pkg-root";
-import { upsertMarkedSection } from "../marker-section";
 import {
-  MARKER_ID,
-  CLAUDE_MD_SECTION,
-  AGENTS_MD_SECTION,
-} from "../collaboration-content";
+  ROLE_AGENTS,
+  RoleFileError,
+  instructionFilePath,
+  seedRoleFiles,
+  syncRoleSections,
+} from "../roles";
 import { checkSetupLocation, computeProjectId, computeProjectPorts } from "../project-id";
 import { homedir } from "node:os";
 
@@ -46,7 +46,21 @@ export async function runInit() {
   checkCodex();
   console.log("");
 
-  performProjectSetup(cwd);
+  const { unrendered } = performProjectSetup(cwd);
+
+  if (unrendered.length > 0) {
+    // The project exists and is usable, but an agent is missing its
+    // instructions. Exit non-zero so a scripted setup notices, and say
+    // which file to fix rather than reporting a clean "Setup complete!".
+    console.log("Setup finished with problems.\n");
+    for (const line of unrendered) console.log(`  ${line}`);
+    console.log("");
+    console.log("The project is configured, but the section above never reached its file,");
+    console.log("so that agent will launch without its role. Fix the role file and rerun");
+    console.log("`abg roles apply` — `abg roles` shows the current state of both.");
+    process.exitCode = 1;
+    return;
+  }
 
   console.log("Setup complete!\n");
   printCustomizationSummary(cwd);
@@ -55,6 +69,7 @@ export async function runInit() {
   console.log("  1. If Claude Code is already running, execute /reload-plugins in your session");
   console.log("  2. Start Claude Code:  abg claude");
   console.log("  3. Start Codex TUI:    abg codex");
+  console.log("  4. Optional, anytime:  abg roles     # make each agent yours");
 }
 
 /**
@@ -66,8 +81,13 @@ export async function runInit() {
  * Caller is responsible for `checkSetupLocation` and dependency checks —
  * they differ between the two entry points (init exits, auto-setup
  * declines silently).
+ *
+ * Returns the collaboration sections that did not render. The project
+ * is still set up when that list is non-empty — config.json, the role
+ * files, and the plugin are all in place — but the agent whose section
+ * is missing will not see its instructions, so callers have to say so.
  */
-export function performProjectSetup(projectRoot: string): void {
+export function performProjectSetup(projectRoot: string): { unrendered: string[] } {
   // Generate project config with per-project derived ports. The
   // .agentbridge/ directory acts as the project marker for the CLI's
   // namespace logic (project-id.ts), and the codex ports in
@@ -95,9 +115,20 @@ export function performProjectSetup(projectRoot: string): void {
   }
   console.log("");
 
-  console.log("Writing collaboration sections...");
-  for (const result of writeCollaborationSections(projectRoot)) {
-    console.log(`  ${result}`);
+  // Role files first: they are the source the sections render from.
+  // Seeding never overwrites, so re-running setup after the user has
+  // customized a role leaves their text alone.
+  console.log("Writing role files...");
+  for (const outcome of seedRoleFiles(projectRoot)) {
+    const shown = relative(projectRoot, outcome.path);
+    console.log(`  ${shown}: ${outcome.created ? "created with default role" : "already exists, left untouched"}`);
+  }
+  console.log("");
+
+  console.log("Rendering collaboration sections...");
+  const sections = writeCollaborationSections(projectRoot);
+  for (const result of sections) {
+    console.log(`  ${result.line}`);
   }
   console.log("");
 
@@ -117,6 +148,8 @@ export function performProjectSetup(projectRoot: string): void {
     console.log(`    abg dev   # registers marketplace and installs plugin`);
   }
   console.log("");
+
+  return { unrendered: sections.filter((s) => !s.ok).map((s) => s.line) };
 }
 
 /**
@@ -128,6 +161,17 @@ export function printCustomizationSummary(projectRoot: string): void {
   const lines = [
     `What you can customize (relative to ${projectRoot}):`,
     "",
+    "  .agentbridge/roles/claude.md         what Claude is told it is",
+    "  .agentbridge/roles/codex.md          what Codex is told it is",
+    "      Role, workflow, review discipline, message style — all of it is",
+    "      plain prose and all of it is yours. The file body IS the role",
+    "      text; there is no format to get right.",
+    "        abg roles              see what each agent is running on",
+    "        abg roles edit codex   rewrite Codex's role in $EDITOR",
+    "      Edit a file and restart that agent; `abg claude` / `abg codex`",
+    "      re-render the matching section of CLAUDE.md / AGENTS.md on every",
+    "      launch. Delete a file to get the built-in default back.",
+    "",
     "  .agentbridge/config.json",
     "      codex.appPort / codex.proxyPort      the ports this project uses",
     "      turnCoordination.attentionWindowSeconds",
@@ -138,8 +182,9 @@ export function printCustomizationSummary(projectRoot: string): void {
     "",
     "  CLAUDE.md · AGENTS.md",
     "      Text between the <!-- AgentBridge:start/end --> markers is",
-    "      regenerated by `abg init`. Anything outside the markers is",
-    "      yours and is never touched.",
+    "      RENDERED OUTPUT — edit the role files above instead, or your",
+    "      changes are overwritten on the next launch. Anything outside",
+    "      the markers is yours and is never touched.",
     "",
     "  Environment variables (override everything above):",
     "      AGENTBRIDGE_FILTER_MODE=full         forward every Codex message",
@@ -149,9 +194,6 @@ export function printCustomizationSummary(projectRoot: string): void {
     "      AGENTBRIDGE_ATTENTION_WINDOW_MS, AGENTBRIDGE_IDLE_SHUTDOWN_MS,",
     "      AGENTBRIDGE_MAX_BUFFERED_MESSAGES, AGENTBRIDGE_STATE_DIR",
     "      Full list: README.md → Configuration",
-    "",
-    "  Not customizable yet: per-agent roles (Claude = executor, Codex =",
-    "  reviewer) are fixed in this release.",
     "",
     "  `abg doctor` checks all of the above for drift.",
   ];
@@ -217,51 +259,58 @@ function compareVersions(a: string, b: string): number {
   return 0;
 }
 
+/** One rendered instruction file: what happened, and whether it worked. */
+export interface CollaborationSectionResult {
+  /** Human-readable status line, already prefixed with the file name. */
+  line: string;
+  /** False when the section did not make it into the file. */
+  ok: boolean;
+}
+
 /**
- * Write or update AgentBridge collaboration sections in CLAUDE.md and AGENTS.md.
- * Returns human-readable status lines for each file.
+ * Render the per-agent role files into CLAUDE.md / AGENTS.md and
+ * return one status line per file.
+ *
+ * The section content comes from `.agentbridge/roles/<agent>.md`, not
+ * from a constant — see `src/roles.ts`. Callers that have not seeded
+ * those files yet still get the built-in defaults, so this stays safe
+ * to call on a project created by an older version.
+ *
+ * Renders one agent at a time and reports a bad role file as a result
+ * rather than throwing. Setup has already written config.json by the
+ * time this runs, so an exception here would leave a half-made project
+ * behind — and one unusable role file is no reason to skip the other
+ * agent's section or the plugin install.
  */
-export function writeCollaborationSections(projectRoot: string): string[] {
-  const results: string[] = [];
-
-  const files: Array<{ name: string; path: string; section: string }> = [
-    { name: "CLAUDE.md", path: join(projectRoot, "CLAUDE.md"), section: CLAUDE_MD_SECTION },
-    { name: "AGENTS.md", path: join(projectRoot, "AGENTS.md"), section: AGENTS_MD_SECTION },
-  ];
-
-  for (const { name, path, section } of files) {
-    let existing = "";
+export function writeCollaborationSections(projectRoot: string): CollaborationSectionResult[] {
+  return ROLE_AGENTS.map((agent) => {
+    const name = basename(instructionFilePath(projectRoot, agent));
+    let outcome;
     try {
-      existing = readFileSync(path, "utf-8");
-    } catch {
-      // File doesn't exist — will be created
-    }
-
-    let updated: string;
-    try {
-      updated = upsertMarkedSection(existing, MARKER_ID, section);
+      [outcome] = syncRoleSections(projectRoot, { agents: [agent] });
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      results.push(`${name}: skipped — ${msg}`);
-      continue;
+      const reason =
+        err instanceof RoleFileError
+          ? err.message.split("\n")[0]
+          : err instanceof Error
+            ? err.message
+            : String(err);
+      return { line: `${name}: skipped — ${reason}`, ok: false };
     }
 
-    if (updated === existing) {
-      results.push(`${name}: unchanged (section already up to date)`);
-      continue;
+    switch (outcome!.status) {
+      case "skipped":
+        return { line: `${name}: skipped — ${outcome!.detail}`, ok: false };
+      case "unchanged":
+        return { line: `${name}: unchanged (section already up to date)`, ok: true };
+      case "created":
+        return { line: `${name}: created with collaboration section`, ok: true };
+      case "updated":
+        return { line: `${name}: updated collaboration section`, ok: true };
+      case "appended":
+        return { line: `${name}: appended collaboration section`, ok: true };
     }
-
-    writeFileSync(path, updated, "utf-8");
-    if (existing === "") {
-      results.push(`${name}: created with collaboration section`);
-    } else if (existing.includes(`<!-- ${MARKER_ID}:start -->`)) {
-      results.push(`${name}: updated collaboration section`);
-    } else {
-      results.push(`${name}: appended collaboration section`);
-    }
-  }
-
-  return results;
+  });
 }
 
 export { compareVersions };

@@ -1,5 +1,5 @@
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { writeCollaborationSections } from "../cli/init";
@@ -23,8 +23,8 @@ describe("writeCollaborationSections", () => {
     const results = writeCollaborationSections(tempDir);
 
     expect(results).toHaveLength(2);
-    expect(results[0]).toContain("CLAUDE.md: created");
-    expect(results[1]).toContain("AGENTS.md: created");
+    expect(results[0].line).toContain("CLAUDE.md: created");
+    expect(results[1].line).toContain("AGENTS.md: created");
 
     const claude = readFileSync(join(tempDir, "CLAUDE.md"), "utf-8");
     expect(claude).toContain(START);
@@ -45,7 +45,7 @@ describe("writeCollaborationSections", () => {
 
     const results = writeCollaborationSections(tempDir);
 
-    expect(results[0]).toContain("CLAUDE.md: appended");
+    expect(results[0].line).toContain("CLAUDE.md: appended");
 
     const claude = readFileSync(join(tempDir, "CLAUDE.md"), "utf-8");
     // Original content preserved
@@ -64,7 +64,7 @@ describe("writeCollaborationSections", () => {
 
     // Second run (idempotent replace)
     const results = writeCollaborationSections(tempDir);
-    expect(results[0]).toContain("unchanged");
+    expect(results[0].line).toContain("unchanged");
 
     const secondRun = readFileSync(join(tempDir, "CLAUDE.md"), "utf-8");
     expect(secondRun).toBe(firstRun);
@@ -101,14 +101,33 @@ describe("writeCollaborationSections", () => {
 
     const results = writeCollaborationSections(tempDir);
 
-    expect(results[0]).toContain("CLAUDE.md: skipped");
-    expect(results[0]).toContain("Malformed");
+    expect(results[0].line).toContain("CLAUDE.md: skipped");
+    expect(results[0].line).toContain("Malformed");
+    expect(results[0].ok).toBe(false);
     // AGENTS.md didn't exist → should still be created.
-    expect(results[1]).toContain("AGENTS.md: created");
+    expect(results[1].line).toContain("AGENTS.md: created");
+    expect(results[1].ok).toBe(true);
 
     // Critically: CLAUDE.md content is untouched.
     const unchanged = readFileSync(join(tempDir, "CLAUDE.md"), "utf-8");
     expect(unchanged).toBe(orphaned);
+  });
+
+  test("an unusable role file is reported, not thrown", () => {
+    // `abg init` calls this after writing config.json. Throwing here
+    // would abandon the setup half-made and skip the other agent's
+    // section for a problem that has nothing to do with it.
+    mkdirSync(join(tempDir, ".agentbridge", "roles"), { recursive: true });
+    writeFileSync(join(tempDir, ".agentbridge", "roles", "claude.md"), "   \n", "utf-8");
+
+    const results = writeCollaborationSections(tempDir);
+
+    expect(results[0].ok).toBe(false);
+    expect(results[0].line).toContain("CLAUDE.md: skipped");
+    expect(results[0].line).toContain("Role file is empty");
+    // The other agent is unaffected.
+    expect(results[1].ok).toBe(true);
+    expect(readFileSync(join(tempDir, "AGENTS.md"), "utf-8")).toContain(START);
   });
 
   test("updates when section content changes between versions", () => {
@@ -117,7 +136,7 @@ describe("writeCollaborationSections", () => {
     writeFileSync(join(tempDir, "CLAUDE.md"), oldContent, "utf-8");
 
     const results = writeCollaborationSections(tempDir);
-    expect(results[0]).toContain("CLAUDE.md: updated");
+    expect(results[0].line).toContain("CLAUDE.md: updated");
 
     const updated = readFileSync(join(tempDir, "CLAUDE.md"), "utf-8");
     expect(updated).not.toContain("OLD COLLABORATION CONTENT");

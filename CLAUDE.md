@@ -14,6 +14,8 @@ Runtime is **Bun** — do not change the local Bun version.
 | Run a single test file | `bun test src/unit-test/<name>.test.ts` |
 | Run a single test by name | `bun test src -t "<test name pattern>"` |
 | Full pre-commit check | `bun run check` (typecheck + tests + plugin sync + plugin versions) |
+| Live bridge E2E (real tokens) | `bun run test:live:bridge` (Tier 2 — see `docs/test-plan.md`) |
+| Live roles E2E (real tokens) | `bun run test:live:roles` (Tier 3) |
 | Build CLI binary | `bun run build:cli` → `dist/cli.js` |
 | Build plugin bundle | `bun run build:plugin` → `plugins/agentbridge/server/{bridge-server,daemon}.js` |
 | Verify plugin sync | `bun run verify:plugin-sync` |
@@ -52,10 +54,12 @@ Ports are per-project (see the namespace invariant below), falling back to `4502
 - **`src/daemon-lifecycle.ts`** — shared `ensureRunning` / `kill` / startup-lock logic; both the CLI and `bridge.ts` call into this.
 - **`src/daemon-client.ts`** — typed WS client used by `bridge.ts` to talk to the daemon control port.
 - **`src/config-service.ts`** + **`src/state-dir.ts`** — read/write `.agentbridge/config.json` and resolve the platform state dir (`daemon.pid`, `status.json`, `agentbridge.log`, `killed` sentinel, `startup.lock`).
-- **`src/cli.ts` + `src/cli/*.ts`** — `abg` / `agentbridge` command router (`init`, `claude`, `codex`, `kill`, `status`, `projects`, `doctor`, `dev`).
+- **`src/cli.ts` + `src/cli/*.ts`** — `abg` / `agentbridge` command router (`init`, `claude`, `codex`, `kill`, `roles`, `status`, `projects`, `doctor`, `dev`).
 - **`src/project-id.ts` + `src/runtime-namespace.ts`** — project discovery, id hashing, port-triple derivation, and namespace application. Everything multi-project keys off these two.
 - **`src/cli/auto-setup.ts`** — first-run offer to turn an unconfigured directory into a project. `decideSetupOffer` is pure (injected lookups) and holds every skip rule; `maybeOfferSetup` runs the prompt and delegates the actual work to `performProjectSetup` in `src/cli/init.ts`, so the offer and `abg init` can never build different projects.
-- **`src/marker-section.ts` + `src/collaboration-content.ts`** — idempotent marker-based injection of the `<!-- AgentBridge:start/end -->` block into `CLAUDE.md` / `AGENTS.md` / `GEMINI.md` / `.cursorrules` / `.windsurfrules` / `.kiro/` / `.cursor/` etc. during `abg init`.
+- **`src/marker-section.ts` + `src/collaboration-content.ts`** — idempotent marker-based injection of the `<!-- AgentBridge:start/end -->` block into `CLAUDE.md` / `AGENTS.md` / `GEMINI.md` / `.cursorrules` / `.windsurfrules` / `.kiro/` / `.cursor/` etc. during `abg init`. `collaboration-content.ts` is now the **default template only** — the live text comes from the role files.
+- **`src/cli/roles-cmd.ts`** — `abg roles` (`list` / `edit` / `apply` / `reset` / `path`). Pure convenience over the role files; everything it does is also doable with `$EDITOR` and `rm`, and nothing else in the codebase depends on it.
+- **`src/roles.ts` + `src/cli/role-sync.ts`** — per-agent role files (`.agentbridge/roles/<agent>.md`) are the editable source of truth for what each agent is told it is; the marked block in `CLAUDE.md` / `AGENTS.md` is rendered output. `seedRoleFiles` writes the defaults once and never overwrites; `syncRoleSections` renders (idempotently, `dryRun` for `abg doctor`); `syncRolesForLaunch` is the CLI-layer wrapper called from `runClaude` / `runCodex`. Deliberately no file format — the body *is* the role text, so there is no parser and no malformed-role failure mode.
 - **`src/bridge-disabled-state.ts` + `src/tui-connection-state.ts`** — disabled-reason and TUI-connect state machines used by the kickoff + reconnect UX.
 
 ### Data flow invariants
@@ -65,6 +69,7 @@ Ports are per-project (see the namespace invariant below), falling back to `4502
 - Filter mode is env-controlled by `AGENTBRIDGE_FILTER_MODE` (`filtered` routes by marker, `full` forwards everything). This is orthogonal to `AGENTBRIDGE_MODE`: filter mode decides *routing*, delivery mode decides *transport*. `classifyMessage` always reports the real parsed marker, including in `full` mode — callers key off marker identity, not mode.
 - **Ports and state are per-project.** `src/project-id.ts` walks up from the cwd to the first ancestor holding a `.agentbridge/` marker, hashes the absolute path (`sha256`, first 8 hex) into a `projectId`, and derives `slot = projectId mod 1000` → ports `14500 + slot × 3` = `(CODEX_WS_PORT, CODEX_PROXY_PORT, AGENTBRIDGE_CONTROL_PORT)` in `14500–17499`. `src/runtime-namespace.ts` applies that namespace. With no marker, it falls back to single-instance mode on `4500/4501/4502`.
 - **`maybeOfferSetup` must run before `maybeApplyProjectNamespace` in `cli.ts main()`.** The namespace is resolved exactly once at startup, so a project created after that point would not take effect until the next launch — the user answers "yes" and still gets fallback ports for the whole session. The offer fires only for `claude` / `codex`, only on a TTY, only outside an existing project, and never at `$HOME` or `/`; a decline is remembered per directory in the user prefs file.
+- **Role files are the source; the marked block is output.** `abg claude` / `abg codex` call `syncRolesForLaunch` before starting the agent, so the only supported way to change a role is to edit `.agentbridge/roles/<agent>.md` and restart. Each launcher renders **only its own** agent's file — a broken codex role must not block a Claude launch. A missing role file falls back to the built-in default; an empty one is a hard error (exit 1), because silently substituting the default would leave the user believing their role text is live. `role:` is a label the agent reads — nothing in the bridge parses it, and routing stays `[REPLY]` / `[STATUS]` / `[FYI]` only. `missingRoutingMarkers` warns (never blocks) when a rewritten role drops a marker its own built-in default explained; the baseline is per-agent so an untouched project never fires it.
 - `maybeApplyProjectNamespace` mutates the environment only for `claude`, `codex`, and `kill`. `status`, `projects`, and `doctor` resolve read-only (`mutateEnv: false`). `init`, `dev`, `--help`, and `--version` skip resolution entirely so they cannot inherit ports from a stale ancestor marker.
 - All state lives in the platform state dir (`AGENTBRIDGE_STATE_DIR`, default `~/Library/Application Support/AgentBridge/` on macOS, `$XDG_STATE_HOME/agentbridge/` on Linux), nested one level deeper under `<base>/<projectId>/` when a project is resolved. An explicit `AGENTBRIDGE_STATE_DIR` is used verbatim and is not nested. The daemon uses `startup.lock` + `killed` sentinel to coordinate startup and explicit-kill-don't-restart semantics.
 
@@ -74,6 +79,8 @@ Ports are per-project (see the namespace invariant below), falling back to `4502
 - CLI integration: `src/e2e-cli.test.ts` + `src/unit-test/cli.test.ts`.
 - Reconnect E2E: `src/unit-test/e2e-reconnect.test.ts` and `src/unit-test/e2e/`.
 - `dual-mode.test.ts` covers push vs. pull delivery.
+- Live tests: `src/live-test/` — not in `bun test src`, because they spend real model tokens. `tier2-bridge-e2e.ts` drives the whole stack headlessly by having the harness speak the Codex TUI handshake itself (the adapter only needs the `thread/start` traffic to go past, not a real terminal); `tier3-roles.sh` proves an edited role file changes what a real agent does.
+- `docs/test-plan.md` is the tier map — what each level proves, what is headless, and what is still terminal-only.
 - Every PR must ship both unit tests and an E2E test plan before merge.
 
 ## Git Workflow
@@ -88,7 +95,7 @@ Ports are per-project (see the namespace invariant below), falling back to `4502
 
 - The Codex sandbox cannot write to `.git` — Claude performs all git operations (commit/push/PR).
 - Codex works in the main directory; Claude uses a worktree (`<repo>_wt_<PR number>`).
-- Do not send `reply` during an active Codex turn — the busy guard rejects it. When you see `⏳ Codex is working`, wait for `✅ Codex finished` before replying.
+- Replying during an active Codex turn is safe. The daemon holds the message in a small bounded outbox and injects it when the turn ends; the tool result says `Reply queued for Codex`. That is an acceptance, not a failure — **do not resend it**, or Codex gets two copies. If a queued reply is ever dropped or expires, AgentBridge says so explicitly and echoes the text back.
 - Codex TUI resume has known bugs (GitHub #14470, #12382) — prefer starting a fresh session.
 - Connect the Codex TUI with `abg codex` (installed via `bun link`).
 - **When testing a PR, check out that PR's branch/worktree** — never test it from a different branch.

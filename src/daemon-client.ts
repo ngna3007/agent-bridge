@@ -10,6 +10,7 @@ import type {
   ControlClientMessage,
   ControlServerMessage,
   DaemonStatus,
+  ReplyOutcome,
 } from "./control-protocol";
 
 interface DaemonClientEvents {
@@ -35,7 +36,7 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
   private pendingReplies = new Map<
     string,
     {
-      resolve: (value: { success: boolean; error?: string }) => void;
+      resolve: (value: ReplyOutcome) => void;
       timer: ReturnType<typeof setTimeout>;
     }
   >();
@@ -152,7 +153,7 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
     this.rejectPendingReplies("Daemon connection closed");
   }
 
-  async sendReply(message: BridgeMessage, requireReply?: boolean): Promise<{ success: boolean; error?: string }> {
+  async sendReply(message: BridgeMessage, requireReply?: boolean): Promise<ReplyOutcome> {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       return { success: false, error: "AgentBridge daemon is not connected." };
     }
@@ -194,7 +195,12 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
           if (!pending) return;
           clearTimeout(pending.timer);
           this.pendingReplies.delete(message.requestId);
-          pending.resolve({ success: message.success, error: message.error });
+          pending.resolve({
+            success: message.success,
+            error: message.error,
+            queued: message.queued,
+            note: message.note,
+          });
           return;
         }
         case "status":

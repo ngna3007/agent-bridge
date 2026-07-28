@@ -5,6 +5,7 @@ import { StateDirResolver } from "../state-dir";
 import { UserPrefsService } from "../user-prefs";
 import { arrowPicker } from "./prompt";
 import { wireStatusLine } from "../settings-wire";
+import { syncRolesForLaunch } from "./role-sync";
 
 /** Flags that AgentBridge owns and will inject automatically. */
 const OWNED_FLAGS = ["--channels", "--dangerously-load-development-channels"];
@@ -37,6 +38,10 @@ export async function runClaude(args: string[]) {
   // the next time they run `abg claude` -- no need to re-trigger
   // the intro screen.
   wireStatusLine({ statusFilePath: `${stateDir.dir}/status.line` });
+
+  // Re-render CLAUDE.md's marked section from .agentbridge/roles/claude.md
+  // so an edited role takes effect on the next launch and nothing else.
+  syncRolesForLaunch("claude");
 
   // Channel entry format: "server:<mcp-server-name>" for MCP-based channels,
   // or "plugin:<plugin>@<marketplace>" for plugin-based channels.

@@ -15,7 +15,16 @@ describe("role-aware collaboration guidance", () => {
   test("claude instructions include turn coordination guidance", () => {
     expect(CLAUDE_INSTRUCTIONS).toContain("Codex is working");
     expect(CLAUDE_INSTRUCTIONS).toContain("Codex finished");
-    expect(CLAUDE_INSTRUCTIONS).toContain("busy error");
+  });
+
+  test("claude instructions describe queueing, not busy-error retry", () => {
+    // The daemon holds a mid-turn reply and delivers it when the turn
+    // ends. Telling Claude to retry by hand would produce duplicates,
+    // so the old "busy error → wait and retry" wording must stay gone.
+    expect(CLAUDE_INSTRUCTIONS).toContain("Reply queued for Codex");
+    expect(CLAUDE_INSTRUCTIONS).toContain("Do NOT resend");
+    expect(CLAUDE_INSTRUCTIONS).not.toContain("busy error");
+    expect(CLAUDE_INSTRUCTIONS).not.toContain("wait and retry");
   });
 
   test("bridge contract reminder includes codex advisor-role guidance", () => {
