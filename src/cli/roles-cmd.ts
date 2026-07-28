@@ -13,6 +13,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { relative } from "node:path";
 import { createInterface } from "node:readline";
 import { findProjectRoot } from "../project-id";
+import { warnOnMissingRoutingMarkers } from "./role-sync";
 import {
   ROLE_AGENTS,
   RoleFileError,
@@ -158,7 +159,13 @@ async function editRole(projectRoot: string, agent: RoleAgent): Promise<void> {
     return;
   }
 
-  const result = spawnSync(editor, [path], { stdio: "inherit", shell: true });
+  // `shell: true` is required because $EDITOR is conventionally a
+  // command line ("code --wait", "emacsclient -nw"), not a bare
+  // binary. That means the path is pasted into a shell command rather
+  // than passed as argv, so it has to be quoted: project roots with
+  // spaces are ordinary, and unquoted the editor would open two files
+  // it cannot find instead of the role.
+  const result = spawnSync(`${editor} ${shellQuote(path)}`, { stdio: "inherit", shell: true });
   if (result.status !== 0) {
     console.error(`Editor exited with status ${result.status ?? "unknown"} — leaving the file as-is.`);
     process.exit(1);
@@ -192,6 +199,7 @@ function applyRoles(projectRoot: string, agents: readonly RoleAgent[] = ROLE_AGE
         console.log(`${rel}: ${outcome.status} from ${source}`);
       }
     }
+    warnOnMissingRoutingMarkers(projectRoot, agent);
   }
 }
 
@@ -217,6 +225,14 @@ async function resetRole(projectRoot: string, agent: RoleAgent, force: boolean):
   console.log(`${rel}: restored to the built-in default.`);
   applyRoles(projectRoot, [agent]);
   console.log(`Restart ${agent} (\`abg ${agent}\`) for the change to take effect.`);
+}
+
+/**
+ * POSIX single-quote escaping. Everything inside '…' is literal except
+ * a single quote itself, which is closed, escaped, and reopened.
+ */
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'\\''`)}'`;
 }
 
 function confirm(question: string): Promise<boolean> {

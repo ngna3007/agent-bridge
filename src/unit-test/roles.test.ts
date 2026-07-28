@@ -266,5 +266,19 @@ describe("roles", () => {
       expect(() => syncRoleSections(root, { agents: ["claude"] })).not.toThrow();
       expect(() => syncRoleSections(root, { agents: ["codex"] })).toThrow(RoleFileError);
     });
+
+    test("an unreadable instruction file is skipped, not overwritten", () => {
+      seedRoleFiles(root);
+      // A directory where CLAUDE.md should be makes readFileSync fail
+      // with EISDIR — a stand-in for any non-ENOENT read failure
+      // (EACCES, EIO). The old bare catch treated all of them as
+      // "file is empty" and wrote the block over the top.
+      mkdirSync(instructionFilePath(root, "claude"), { recursive: true });
+
+      const outcomes = syncRoleSections(root, { agents: ["claude"] });
+
+      expect(outcomes[0].status).toBe("skipped");
+      expect(outcomes[0].detail).toContain("cannot read");
+    });
   });
 });

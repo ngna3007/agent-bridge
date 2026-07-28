@@ -64,8 +64,12 @@ export function syncRolesForLaunch(agent: RoleAgent, cwd = process.cwd()): void 
  * the marker protocol. Warn anyway: an agent that stops tagging its
  * messages looks like a broken bridge, not like a role edit, and the
  * two are hours apart in a user's memory by the time it shows up.
+ *
+ * Shared with `abg roles apply` so the warning lands at the moment of
+ * the edit as well as at the next launch — by launch time the user has
+ * usually stopped connecting the two.
  */
-function warnOnMissingRoutingMarkers(projectRoot: string, agent: RoleAgent): void {
+export function warnOnMissingRoutingMarkers(projectRoot: string, agent: RoleAgent): void {
   let text: string;
   try {
     const role = readRoleText(projectRoot, agent);

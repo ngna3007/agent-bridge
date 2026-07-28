@@ -156,6 +156,12 @@ Most recent run: **14 passed, 0 failed** — `ZEBRA-7 / 2+2=4.`, then
 Claude. T3.6 exited 1 with `Role file is empty` and did not touch
 `AGENTS.md`; T3.7 fell back to a default still carrying `[REPLY]`.
 
+T3.6's "left alone" assertion checks that the *previous* role text is
+still in `AGENTS.md`, not that the abandoned `ZEBRA-7` is absent. The
+absence version passed unconditionally — T3.4 had already replaced that
+token — which is the failure mode worth watching for when adding steps
+here: an assertion that cannot fail reads exactly like one that passed.
+
 Uses `codex exec` and `claude -p`, both of which are genuinely headless.
 No daemon is involved — this tier is about instruction plumbing, not
 transport.
@@ -191,11 +197,6 @@ temp directory.
 
 ## Known gaps
 
-- `bun run check` currently exits 1 on a pre-existing version mismatch:
-  `plugins/agentbridge/.claude-plugin/plugin.json` and
-  `.claude-plugin/marketplace.json` say `0.1.6` while `package.json` says
-  `0.6.8`. Unrelated to the test tiers, but it means `check` is not
-  currently a clean gate.
 - Tier 2 covers the happy path and the missing-thread rejection. The
   failure edges — app-server crash mid-turn, Claude session swap,
   daemon crash recovery — are still Tier 4 only. They are reachable from

@@ -107,7 +107,10 @@ if [ "$rc" -ne 0 ]; then
 else
   echo "  FAIL  exit was 0"; fail=$((fail+1))
 fi
-refute "AGENTS.md left alone" AGENTS.md "ZEBRA-7"
+# Assert on what the block SHOULD still contain (the T3.4 role), not on
+# the absence of ZEBRA-7 — that token was already replaced in T3.4, so
+# refuting it here would pass no matter what this step did.
+check "AGENTS.md left alone" AGENTS.md "QUASAR-9"
 
 echo
 echo "== T3.7 deleting the role file restores the built-in default =="

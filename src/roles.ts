@@ -239,8 +239,21 @@ export function syncRoleSections(
     let existing = "";
     try {
       existing = readFileSync(file, "utf-8");
-    } catch {
-      // Missing instruction file — upsert creates it from scratch.
+    } catch (err) {
+      // A missing instruction file is the normal case on a fresh
+      // project — upsert creates it from scratch. Any *other* read
+      // failure is not a green light to write: treating an unreadable
+      // but present CLAUDE.md as empty would replace the user's whole
+      // file with nothing but our block.
+      if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
+        return {
+          agent,
+          file,
+          status: "skipped",
+          detail: `cannot read ${file}: ${err instanceof Error ? err.message : String(err)}`,
+          usedDefault: fromDefault,
+        };
+      }
     }
 
     let updated: string;
