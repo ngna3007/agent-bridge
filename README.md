@@ -209,6 +209,8 @@ With no `.agentbridge/` marker in the cwd or any ancestor, `abg` falls back to *
 
 `abg status` shows the resolution for the current directory; `abg projects` lists every project on the machine.
 
+**Slot collisions.** There are 1000 slots and they are assigned by hash, not sequentially, so two projects can derive the same port triple. It is uncommon but not negligible: by the birthday bound, roughly 4% at ten projects on one machine and 17% at twenty. `abg doctor` reports a collision by name, and a daemon that finds another project's Codex app-server on its port now refuses to start rather than reclaiming the port. Pin `CODEX_WS_PORT` / `CODEX_PROXY_PORT` / `AGENTBRIDGE_CONTROL_PORT` for one of the two projects to resolve it.
+
 ### First-run setup
 
 Single-instance mode works, which is the problem: without a marker there is nothing to tell you a better mode exists, and the second project you launch quietly takes the daemon slot from the first. So `abg claude` and `abg codex` ask, once, in any directory that is not yet a project:

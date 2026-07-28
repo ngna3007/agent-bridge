@@ -9,9 +9,10 @@
  * disconnect), because TUI rapidly reconnects between bootstrap phases.
  */
 
-import { spawn, execSync, type ChildProcess } from "node:child_process";
+import { spawn, execSync, execFileSync, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
 import { EventEmitter } from "node:events";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { StateDirResolver } from "./state-dir";
 import { getRotatingLogger } from "./log-rotator";
 import type { BridgeMessage } from "./types";
@@ -76,6 +77,8 @@ export class CodexAdapter extends EventEmitter {
   private appPort: number;
   private proxyPort: number;
   private readonly logFile: string;
+  /** Where this project records the pid of the app-server it spawned. */
+  private readonly appServerPidFile: string;
   private tuiConnId = 0; // tracks which TUI connection is "current" (primary)
   private connIdCounter = 0; // monotonically increasing counter for unique conn IDs
   // Secondary (picker) connections: each gets its own dedicated app-server WS
@@ -140,11 +143,17 @@ export class CodexAdapter extends EventEmitter {
   }>();
   private static readonly SESSION_REPLAY_TIMEOUT_MS = 5000;
 
-  constructor(appPort = 4500, proxyPort = 4501, logFile = new StateDirResolver().logFile) {
+  constructor(
+    appPort = 4500,
+    proxyPort = 4501,
+    logFile = new StateDirResolver().logFile,
+    appServerPidFile = new StateDirResolver().codexAppServerPidFile,
+  ) {
     super();
     this.appPort = appPort;
     this.proxyPort = proxyPort;
     this.logFile = logFile;
+    this.appServerPidFile = appServerPidFile;
   }
 
   get appServerUrl() { return `ws://127.0.0.1:${this.appPort}`; }
@@ -160,9 +169,13 @@ export class CodexAdapter extends EventEmitter {
     this.proc = spawn("codex", ["app-server", "--listen", this.appServerUrl], {
       stdio: ["pipe", "pipe", "pipe"],
     });
+    this.recordAppServerPid(this.proc.pid ?? null);
 
     this.proc.on("error", (err) => this.emit("error", err));
-    this.proc.on("exit", (code) => this.emit("exit", code));
+    this.proc.on("exit", (code) => {
+      this.clearAppServerPid();
+      this.emit("exit", code);
+    });
 
     const stderrRl = createInterface({ input: this.proc.stderr! });
     stderrRl.on("line", (l) => this.log(`[codex-server] ${l}`));
@@ -1570,12 +1583,66 @@ export class CodexAdapter extends EventEmitter {
     return `lsof -ti tcp:${port} -sTCP:LISTEN`;
   }
 
+  /** Remember the app-server we just spawned so cleanup can recognize it later. */
+  private recordAppServerPid(pid: number | null): void {
+    if (pid === null) return;
+    try {
+      writeFileSync(this.appServerPidFile, `${pid}\n`);
+    } catch (err: any) {
+      // Not fatal: the only cost is that a future cleanup will refuse
+      // to kill this process instead of reclaiming its port.
+      this.log(`Could not record app-server pid: ${err?.message ?? err}`);
+    }
+  }
+
+  private clearAppServerPid(): void {
+    try {
+      rmSync(this.appServerPidFile, { force: true });
+    } catch {
+      // Best effort. A leftover file names a dead pid, which matches nothing.
+    }
+  }
+
+  /** The app-server pid this project last spawned, if any. */
+  private readRecordedAppServerPid(): number | null {
+    try {
+      const pid = parseInt(readFileSync(this.appServerPidFile, "utf-8").trim(), 10);
+      return Number.isFinite(pid) && pid > 0 ? pid : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Classify one process holding a port we want.
+   *
+   * `ours` is the narrowest of the three and is the only one we will
+   * kill. It requires the pid to match what we recorded when we
+   * spawned an app-server — a `codex app-server` command line is NOT
+   * enough. Two projects whose ids hash to the same port slot run
+   * byte-identical command lines (`codex app-server --listen
+   * ws://127.0.0.1:<same port>`), so a shape test cannot tell our
+   * orphan from their live session, and guessing wrong kills a
+   * working session in another terminal with no message on either
+   * side.
+   */
+  static classifyPortHolder(
+    pid: number,
+    cmdline: string,
+    recordedPid: number | null,
+  ): "ours" | "foreign-codex" | "foreign" {
+    const isCodexAppServer = cmdline.includes("codex") && cmdline.includes("app-server");
+    if (!isCodexAppServer) return "foreign";
+    return recordedPid !== null && pid === recordedPid ? "ours" : "foreign-codex";
+  }
+
   /**
    * Clean up stale ports before starting.
-   * Only kills `codex app-server` processes (our own spawns). If the port is
-   * occupied by something else, throws with a clear message.
+   * Only kills the `codex app-server` this project spawned itself. Anything
+   * else holding the port is reported, never killed.
    */
   private async checkPorts() {
+    const recordedPid = this.readRecordedAppServerPid();
     for (const port of [this.appPort, this.proxyPort]) {
       try {
         const pids = execSync(CodexAdapter.buildPortListenLsofCommand(port), {
@@ -1583,21 +1650,26 @@ export class CodexAdapter extends EventEmitter {
         }).trim();
         if (!pids) continue;
 
-        // Check if the occupying process is a codex app-server (our own stale spawn)
         const pidList = pids.split("\n").map((p) => p.trim()).filter(Boolean);
-        const staleCodexPids: string[] = [];
-        const foreignPids: string[] = [];
+        const staleCodexPids: number[] = [];
+        const foreignCodexPids: number[] = [];
+        const foreignPids: number[] = [];
 
-        for (const pid of pidList) {
+        for (const raw of pidList) {
+          // Anything that is not a plain pid did not come from lsof and
+          // has no business being interpolated into a command.
+          const pid = parseInt(raw, 10);
+          if (!Number.isFinite(pid) || pid <= 0) continue;
+          let cmdline: string;
           try {
-            const cmdline = execSync(`ps -p ${pid} -o args=`, { encoding: "utf-8" }).trim();
-            if (cmdline.includes("codex") && cmdline.includes("app-server")) {
-              staleCodexPids.push(pid);
-            } else {
-              foreignPids.push(pid);
-            }
+            cmdline = execFileSync("ps", ["-p", String(pid), "-o", "args="], { encoding: "utf-8" }).trim();
           } catch {
-            // Process already gone
+            continue; // Process already gone
+          }
+          switch (CodexAdapter.classifyPortHolder(pid, cmdline, recordedPid)) {
+            case "ours": staleCodexPids.push(pid); break;
+            case "foreign-codex": foreignCodexPids.push(pid); break;
+            default: foreignPids.push(pid); break;
           }
         }
 
@@ -1605,9 +1677,21 @@ export class CodexAdapter extends EventEmitter {
         if (staleCodexPids.length > 0) {
           this.log(`Cleaning up stale codex app-server on port ${port}: PID(s) ${staleCodexPids.join(", ")}`);
           for (const pid of staleCodexPids) {
-            try { execSync(`kill ${pid}`, { encoding: "utf-8" }); } catch {}
+            try { process.kill(pid); } catch {}
           }
+          this.clearAppServerPid();
           await new Promise((r) => setTimeout(r, 500));
+        }
+
+        // A codex app-server we did not spawn. Almost always another
+        // project whose id hashes to the same port slot as ours.
+        if (foreignCodexPids.length > 0) {
+          throw new Error(
+            `Port ${port} is already in use by a codex app-server this project did not start: ` +
+            `PID(s) ${foreignCodexPids.join(", ")}. This usually means another AgentBridge project ` +
+            `derives the same ports as this one. Run \`abg doctor\` to confirm, or set ` +
+            `${port === this.appPort ? "CODEX_WS_PORT" : "CODEX_PROXY_PORT"} to move this project off the collision.`
+          );
         }
 
         // If foreign processes still occupy the port, fail with a clear message

@@ -2,9 +2,10 @@
 // @bun
 
 // src/codex-adapter.ts
-import { spawn, execSync } from "child_process";
+import { spawn, execSync, execFileSync } from "child_process";
 import { createInterface } from "readline";
 import { EventEmitter } from "events";
+import { readFileSync, rmSync, writeFileSync } from "fs";
 
 // src/state-dir.ts
 import { mkdirSync, existsSync } from "fs";
@@ -37,6 +38,9 @@ class StateDirResolver {
   }
   get tuiPidFile() {
     return join(this.stateDir, "codex-tui.pid");
+  }
+  get codexAppServerPidFile() {
+    return join(this.stateDir, "codex-app-server.pid");
   }
   get lockFile() {
     return join(this.stateDir, "daemon.lock");
@@ -201,6 +205,7 @@ class CodexAdapter extends EventEmitter {
   appPort;
   proxyPort;
   logFile;
+  appServerPidFile;
   tuiConnId = 0;
   connIdCounter = 0;
   secondaryConnections = new Map;
@@ -229,11 +234,12 @@ class CodexAdapter extends EventEmitter {
   sessionRestoreInProgress = false;
   replayPending = new Map;
   static SESSION_REPLAY_TIMEOUT_MS = 5000;
-  constructor(appPort = 4500, proxyPort = 4501, logFile = new StateDirResolver().logFile) {
+  constructor(appPort = 4500, proxyPort = 4501, logFile = new StateDirResolver().logFile, appServerPidFile = new StateDirResolver().codexAppServerPidFile) {
     super();
     this.appPort = appPort;
     this.proxyPort = proxyPort;
     this.logFile = logFile;
+    this.appServerPidFile = appServerPidFile;
   }
   get appServerUrl() {
     return `ws://127.0.0.1:${this.appPort}`;
@@ -251,8 +257,12 @@ class CodexAdapter extends EventEmitter {
     this.proc = spawn("codex", ["app-server", "--listen", this.appServerUrl], {
       stdio: ["pipe", "pipe", "pipe"]
     });
+    this.recordAppServerPid(this.proc.pid ?? null);
     this.proc.on("error", (err) => this.emit("error", err));
-    this.proc.on("exit", (code) => this.emit("exit", code));
+    this.proc.on("exit", (code) => {
+      this.clearAppServerPid();
+      this.emit("exit", code);
+    });
     const stderrRl = createInterface({ input: this.proc.stderr });
     stderrRl.on("line", (l) => this.log(`[codex-server] ${l}`));
     const stdoutRl = createInterface({ input: this.proc.stdout });
@@ -1305,7 +1315,37 @@ class CodexAdapter extends EventEmitter {
   static buildPortListenLsofCommand(port) {
     return `lsof -ti tcp:${port} -sTCP:LISTEN`;
   }
+  recordAppServerPid(pid) {
+    if (pid === null)
+      return;
+    try {
+      writeFileSync(this.appServerPidFile, `${pid}
+`);
+    } catch (err) {
+      this.log(`Could not record app-server pid: ${err?.message ?? err}`);
+    }
+  }
+  clearAppServerPid() {
+    try {
+      rmSync(this.appServerPidFile, { force: true });
+    } catch {}
+  }
+  readRecordedAppServerPid() {
+    try {
+      const pid = parseInt(readFileSync(this.appServerPidFile, "utf-8").trim(), 10);
+      return Number.isFinite(pid) && pid > 0 ? pid : null;
+    } catch {
+      return null;
+    }
+  }
+  static classifyPortHolder(pid, cmdline, recordedPid) {
+    const isCodexAppServer = cmdline.includes("codex") && cmdline.includes("app-server");
+    if (!isCodexAppServer)
+      return "foreign";
+    return recordedPid !== null && pid === recordedPid ? "ours" : "foreign-codex";
+  }
   async checkPorts() {
+    const recordedPid = this.readRecordedAppServerPid();
     for (const port of [this.appPort, this.proxyPort]) {
       try {
         const pids = execSync(CodexAdapter.buildPortListenLsofCommand(port), {
@@ -1316,25 +1356,42 @@ class CodexAdapter extends EventEmitter {
         const pidList = pids.split(`
 `).map((p) => p.trim()).filter(Boolean);
         const staleCodexPids = [];
+        const foreignCodexPids = [];
         const foreignPids = [];
-        for (const pid of pidList) {
+        for (const raw of pidList) {
+          const pid = parseInt(raw, 10);
+          if (!Number.isFinite(pid) || pid <= 0)
+            continue;
+          let cmdline;
           try {
-            const cmdline = execSync(`ps -p ${pid} -o args=`, { encoding: "utf-8" }).trim();
-            if (cmdline.includes("codex") && cmdline.includes("app-server")) {
+            cmdline = execFileSync("ps", ["-p", String(pid), "-o", "args="], { encoding: "utf-8" }).trim();
+          } catch {
+            continue;
+          }
+          switch (CodexAdapter.classifyPortHolder(pid, cmdline, recordedPid)) {
+            case "ours":
               staleCodexPids.push(pid);
-            } else {
+              break;
+            case "foreign-codex":
+              foreignCodexPids.push(pid);
+              break;
+            default:
               foreignPids.push(pid);
-            }
-          } catch {}
+              break;
+          }
         }
         if (staleCodexPids.length > 0) {
           this.log(`Cleaning up stale codex app-server on port ${port}: PID(s) ${staleCodexPids.join(", ")}`);
           for (const pid of staleCodexPids) {
             try {
-              execSync(`kill ${pid}`, { encoding: "utf-8" });
+              process.kill(pid);
             } catch {}
           }
+          this.clearAppServerPid();
           await new Promise((r) => setTimeout(r, 500));
+        }
+        if (foreignCodexPids.length > 0) {
+          throw new Error(`Port ${port} is already in use by a codex app-server this project did not start: ` + `PID(s) ${foreignCodexPids.join(", ")}. This usually means another AgentBridge project ` + `derives the same ports as this one. Run \`abg doctor\` to confirm, or set ` + `${port === this.appPort ? "CODEX_WS_PORT" : "CODEX_PROXY_PORT"} to move this project off the collision.`);
         }
         if (foreignPids.length > 0) {
           throw new Error(`Port ${port} is already in use by non-Codex process(es): PID(s) ${foreignPids.join(", ")}. ` + `Please stop the process or set a different port via ${port === this.appPort ? "CODEX_WS_PORT" : "CODEX_PROXY_PORT"} env var.`);
@@ -1365,7 +1422,7 @@ class CodexAdapter extends EventEmitter {
 }
 
 // src/status-line-writer.ts
-import { writeFileSync, mkdirSync as mkdirSync2, existsSync as existsSync2 } from "fs";
+import { writeFileSync as writeFileSync2, mkdirSync as mkdirSync2, existsSync as existsSync2 } from "fs";
 import { dirname, join as join2 } from "path";
 class StatusLineWriter {
   path;
@@ -1380,14 +1437,14 @@ class StatusLineWriter {
     try {
       this.ensureDir();
       const oneLine = tag.replace(/[\r\n]+/g, " ").trim();
-      writeFileSync(this.path, `${oneLine}
+      writeFileSync2(this.path, `${oneLine}
 `, "utf-8");
     } catch {}
   }
   clear() {
     try {
       this.ensureDir();
-      writeFileSync(this.path, "", "utf-8");
+      writeFileSync2(this.path, "", "utf-8");
     } catch {}
   }
   ensureDir() {
@@ -1669,8 +1726,8 @@ class TuiConnectionState {
 }
 
 // src/daemon-lifecycle.ts
-import { spawn as spawn2, execFileSync } from "child_process";
-import { existsSync as existsSync3, readFileSync, unlinkSync as unlinkSync2, writeFileSync as writeFileSync2, openSync, closeSync, constants } from "fs";
+import { spawn as spawn2, execFileSync as execFileSync2 } from "child_process";
+import { existsSync as existsSync3, readFileSync as readFileSync2, unlinkSync as unlinkSync2, writeFileSync as writeFileSync3, openSync, closeSync, constants } from "fs";
 import { fileURLToPath } from "url";
 function resolveDaemonPath() {
   if (process.env.AGENTBRIDGE_DAEMON_ENTRY) {
@@ -1775,7 +1832,7 @@ class DaemonLifecycle {
   }
   readStatus() {
     try {
-      const raw = readFileSync(this.stateDir.statusFile, "utf-8");
+      const raw = readFileSync2(this.stateDir.statusFile, "utf-8");
       return JSON.parse(raw);
     } catch {
       return null;
@@ -1783,12 +1840,12 @@ class DaemonLifecycle {
   }
   writeStatus(status) {
     this.stateDir.ensure();
-    writeFileSync2(this.stateDir.statusFile, JSON.stringify(status, null, 2) + `
+    writeFileSync3(this.stateDir.statusFile, JSON.stringify(status, null, 2) + `
 `, "utf-8");
   }
   readPid() {
     try {
-      const raw = readFileSync(this.stateDir.pidFile, "utf-8").trim();
+      const raw = readFileSync2(this.stateDir.pidFile, "utf-8").trim();
       if (!raw)
         return null;
       const pid = Number.parseInt(raw, 10);
@@ -1799,7 +1856,7 @@ class DaemonLifecycle {
   }
   writePid(pid) {
     this.stateDir.ensure();
-    writeFileSync2(this.stateDir.pidFile, `${pid ?? process.pid}
+    writeFileSync3(this.stateDir.pidFile, `${pid ?? process.pid}
 `, "utf-8");
   }
   removePidFile() {
@@ -1814,7 +1871,7 @@ class DaemonLifecycle {
   }
   markKilled() {
     this.stateDir.ensure();
-    writeFileSync2(this.stateDir.killedFile, `${Date.now()}
+    writeFileSync3(this.stateDir.killedFile, `${Date.now()}
 `, "utf-8");
   }
   clearKilled() {
@@ -1852,14 +1909,14 @@ class DaemonLifecycle {
     this.stateDir.ensure();
     try {
       const fd = openSync(this.stateDir.lockFile, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY);
-      writeFileSync2(fd, `${process.pid}
+      writeFileSync3(fd, `${process.pid}
 `);
       closeSync(fd);
       return true;
     } catch (err) {
       if (err.code === "EEXIST") {
         try {
-          const holderPid = Number.parseInt(readFileSync(this.stateDir.lockFile, "utf-8").trim(), 10);
+          const holderPid = Number.parseInt(readFileSync2(this.stateDir.lockFile, "utf-8").trim(), 10);
           if (Number.isFinite(holderPid) && !isProcessAlive(holderPid)) {
             this.log(`Stale lock file from dead process ${holderPid}, removing`);
             this.releaseLock();
@@ -1923,7 +1980,7 @@ class DaemonLifecycle {
   }
   isDaemonProcess(pid) {
     try {
-      const cmd = execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf-8" }).trim();
+      const cmd = execFileSync2("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf-8" }).trim();
       return cmd.includes("daemon") && (cmd.includes("agentbridge") || cmd.includes("agent_bridge"));
     } catch {
       return false;
@@ -1945,7 +2002,7 @@ function isProcessAlive(pid) {
 }
 
 // src/config-service.ts
-import { readFileSync as readFileSync2, writeFileSync as writeFileSync3, mkdirSync as mkdirSync3, existsSync as existsSync4 } from "fs";
+import { readFileSync as readFileSync3, writeFileSync as writeFileSync4, mkdirSync as mkdirSync3, existsSync as existsSync4 } from "fs";
 import { join as join3 } from "path";
 var DEFAULT_CONFIG = {
   version: "1.0",
@@ -2006,7 +2063,7 @@ class ConfigService {
   }
   load() {
     try {
-      const raw = readFileSync2(this.configPath, "utf-8");
+      const raw = readFileSync3(this.configPath, "utf-8");
       return normalizeConfig(JSON.parse(raw));
     } catch {
       return null;
@@ -2017,7 +2074,7 @@ class ConfigService {
   }
   save(config) {
     this.ensureConfigDir();
-    writeFileSync3(this.configPath, JSON.stringify(config, null, 2) + `
+    writeFileSync4(this.configPath, JSON.stringify(config, null, 2) + `
 `, "utf-8");
   }
   initDefaults() {

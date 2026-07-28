@@ -29,14 +29,17 @@
  */
 
 import { readFileSync, existsSync, statSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { ConfigService } from "../config-service";
 import {
+  enumerateStateDirs,
   findPidsByListenPort,
   findOrphanBridgeServers,
   isPidAlive,
 } from "../process-helpers";
+import { findSlotCollisions } from "../project-id";
 import { resolveRuntimeNamespace } from "../runtime-namespace";
+import { StateDirResolver } from "../state-dir";
 import {
   ROLE_AGENTS,
   RoleFileError,
@@ -141,6 +144,60 @@ function checkRoles(projectRoot: string): Finding[] {
   return findings;
 }
 
+/**
+ * Report other projects that derive the same ports as this one.
+ *
+ * Worth its own check because the symptom is unhelpful: whichever
+ * project starts second finds the port taken, and before the pid
+ * check in `CodexAdapter.classifyPortHolder` it would kill the other
+ * project's live app-server instead. Nothing in either terminal said
+ * why.
+ *
+ * Only projects that have run at least once are visible here — the
+ * evidence is their state directories — so this can under-report and
+ * never over-reports.
+ */
+function checkSlotCollision(selfId: string): Finding[] {
+  // Enumerate under the platform default root regardless of any env
+  // override, since that is where every project's state dir lives.
+  const prev = process.env.AGENTBRIDGE_STATE_DIR;
+  delete process.env.AGENTBRIDGE_STATE_DIR;
+  let root: string;
+  try {
+    root = new StateDirResolver().dir;
+  } finally {
+    if (prev !== undefined) process.env.AGENTBRIDGE_STATE_DIR = prev;
+  }
+
+  const candidateIds = enumerateStateDirs(root)
+    .map((d) => basename(d))
+    .filter((name) => /^[0-9a-f]{8}$/.test(name));
+
+  const collisions = findSlotCollisions(selfId, candidateIds);
+  if (collisions.length === 0) return [];
+
+  const live = collisions.filter((id) => {
+    const pidPath = join(root, id, "daemon.pid");
+    if (!existsSync(pidPath)) return false;
+    try {
+      return isPidAlive(parseInt(readFileSync(pidPath, "utf-8").trim(), 10));
+    } catch {
+      return false;
+    }
+  });
+
+  return [{
+    severity: live.length > 0 ? "error" : "warn",
+    message:
+      `Port slot collision: project(s) ${collisions.join(", ")} derive the same ports as this one` +
+      (live.length > 0 ? ` (${live.join(", ")} currently running)` : ""),
+    fix:
+      "Two projects cannot share a port triple. Set CODEX_WS_PORT, CODEX_PROXY_PORT and " +
+      "AGENTBRIDGE_CONTROL_PORT for one of them, or move one project so its path hashes " +
+      "elsewhere. `abg projects` shows every project on this machine.",
+  }];
+}
+
 export async function runDoctor(args: string[] = []) {
   const applyFixes = args.includes("--fix");
   const findings: Finding[] = [];
@@ -193,6 +250,7 @@ export async function runDoctor(args: string[] = []) {
       /* ignore */
     }
 
+    findings.push(...checkSlotCollision(project.projectId));
     findings.push(...checkRoles(project.rootPath));
   } else {
     findings.push({
