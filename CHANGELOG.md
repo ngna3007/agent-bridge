@@ -7,13 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 > **Publishing note.** The latest version on npm is `0.6.3`. Versions
 > `0.6.4` through `0.6.8` were developed and tagged in the repository but
-> never published, so the next publish will carry all of them at once.
+> never published, so `0.7.0` carries all of them at once.
 
 ## [Unreleased]
 
-Work merged to `master` after the `0.6.8` version bump, plus two feature
-branches still in review. Cutting a release from here means a minor bump
-(`0.7.0`) because of the two features.
+## [0.7.0]
+
+Everything below landed on `master` after the `0.6.8` version bump. A
+minor bump because of the features; `0.6.4`–`0.6.8` ride along, having
+never been published.
 
 ### Added
 

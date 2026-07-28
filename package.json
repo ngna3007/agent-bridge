@@ -1,6 +1,6 @@
 {
   "name": "@rowanng/agentbridge",
-  "version": "0.6.8",
+  "version": "0.7.0",
   "description": "Bridge between Claude Code and Codex — bidirectional agent communication via MCP Channel + JSON-RPC",
   "type": "module",
   "bin": {
