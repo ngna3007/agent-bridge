@@ -46,6 +46,19 @@ export class StateDirResolver {
     return join(this.stateDir, "codex-tui.pid");
   }
 
+  /**
+   * PID of the `codex app-server` this project's daemon spawned.
+   *
+   * Recorded so port cleanup can tell *our* orphan from someone
+   * else's live process. Both look identical to `ps` — same binary,
+   * same `--listen` argument, because a port collision between two
+   * projects means the port number matches too — so the pid is the
+   * only thing that distinguishes them.
+   */
+  get codexAppServerPidFile(): string {
+    return join(this.stateDir, "codex-app-server.pid");
+  }
+
   get lockFile(): string {
     return join(this.stateDir, "daemon.lock");
   }

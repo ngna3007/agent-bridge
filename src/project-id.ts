@@ -125,6 +125,26 @@ export function computeProjectPorts(projectId: string): ProjectPorts {
 }
 
 /**
+ * Which of `candidateIds` land on the same port slot as `selfId`.
+ *
+ * The slot is `projectId mod 1000`, so distinct projects can share
+ * one. It is not rare enough to ignore: by the birthday bound, ten
+ * projects on a machine collide about 4% of the time and twenty about
+ * 17%. A collision is invisible until both projects run at once, at
+ * which point the second one's daemon finds the first one's
+ * app-server sitting on its port.
+ *
+ * Pure so the check is testable without a filesystem; the caller
+ * supplies the candidate ids from wherever it knows about projects.
+ */
+export function findSlotCollisions(selfId: string, candidateIds: string[]): string[] {
+  const selfPort = computeProjectPorts(selfId).control;
+  return candidateIds.filter(
+    (id) => id !== selfId && computeProjectPorts(id).control === selfPort,
+  );
+}
+
+/**
  * Discover the project (if any) for the given cwd and return its
  * full info object. Returns null when no project marker is found.
  */

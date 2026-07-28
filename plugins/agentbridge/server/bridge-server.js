@@ -13692,6 +13692,9 @@ class StateDirResolver {
   get tuiPidFile() {
     return join(this.stateDir, "codex-tui.pid");
   }
+  get codexAppServerPidFile() {
+    return join(this.stateDir, "codex-app-server.pid");
+  }
   get lockFile() {
     return join(this.stateDir, "daemon.lock");
   }

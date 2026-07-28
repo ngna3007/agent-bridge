@@ -101,6 +101,22 @@ branches still in review. Cutting a release from here means a minor bump
 
 ### Fixed
 
+- **A port-slot collision between two projects killed one of their
+  Codex sessions.** Project ids are hashed into 1000 port slots, so two
+  projects can derive the same triple — about 4% likely at ten projects
+  on a machine, 17% at twenty. When that happened, the second daemon to
+  start ran its stale-port cleanup, found the *other* project's live
+  `codex app-server`, matched it with a command-line test
+  (`includes("codex") && includes("app-server")`), classified it as its
+  own orphan, and killed it. The test could not have worked: a
+  collision means the port matches too, so both processes have
+  byte-identical command lines. The daemon now records the pid of the
+  app-server it spawns and kills only that pid; anything else on the
+  port is reported and left alone, with an error naming the likely
+  collision. `abg doctor` reports colliding projects directly, as an
+  error when the other daemon is live. `ps` and `kill` in that path
+  moved off the shell to `execFileSync` / `process.kill` with a
+  validated numeric pid.
 - `[REPLY]` marker identity is preserved in `full` filter mode.
   `classifyMessage()` hard-coded `marker: "untagged"` there, discarding
   what `parseMarker()` had already resolved, so a correctly-tagged Codex
