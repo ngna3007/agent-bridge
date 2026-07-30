@@ -14132,6 +14132,121 @@ ${formatted}`
 // src/daemon-client.ts
 import { EventEmitter as EventEmitter2 } from "events";
 
+// src/frontend-registry.ts
+var FRONTEND_AGENTS = ["claude", "grok"];
+var DEFAULT_FRONTEND_AGENT = "claude";
+function parseFrontendAgent(raw) {
+  if (raw === undefined || raw === null)
+    return DEFAULT_FRONTEND_AGENT;
+  return FRONTEND_AGENTS.includes(raw) ? raw : null;
+}
+
+class FrontendRegistry {
+  opts;
+  slots = new Map;
+  buffers = new Map;
+  known = new Set([DEFAULT_FRONTEND_AGENT]);
+  probing = new Set;
+  constructor(opts) {
+    this.opts = opts;
+  }
+  occupant(agent) {
+    return this.slots.get(agent) ?? null;
+  }
+  isAttached(agent) {
+    const socket = this.slots.get(agent);
+    return socket !== undefined && this.opts.isOpen(socket);
+  }
+  attachedAgents() {
+    return [...this.slots.keys()];
+  }
+  get size() {
+    return this.slots.size;
+  }
+  knownAgents() {
+    return [...this.known];
+  }
+  isProbing(agent) {
+    return this.probing.has(agent);
+  }
+  beginProbe(agent) {
+    this.probing.add(agent);
+  }
+  endProbe(agent) {
+    this.probing.delete(agent);
+  }
+  contestedBy(agent, socket) {
+    const occupant = this.slots.get(agent);
+    if (!occupant || occupant === socket)
+      return null;
+    return this.opts.isClosed(occupant) ? null : occupant;
+  }
+  claim(agent, socket) {
+    this.slots.set(agent, socket);
+    this.known.add(agent);
+  }
+  release(agent, socket) {
+    if (this.slots.get(agent) !== socket)
+      return false;
+    this.slots.delete(agent);
+    return true;
+  }
+  releaseSocket(socket) {
+    for (const [agent, held] of this.slots) {
+      if (held === socket) {
+        this.slots.delete(agent);
+        return agent;
+      }
+    }
+    return null;
+  }
+  recipients(source) {
+    const out = [];
+    for (const [agent, socket] of this.slots) {
+      if (agent === source)
+        continue;
+      if (!this.opts.isOpen(socket))
+        continue;
+      out.push({ agent, socket });
+    }
+    return out;
+  }
+  buffer(agent, message) {
+    const queue = this.buffers.get(agent) ?? [];
+    queue.push(message);
+    let dropped = 0;
+    if (queue.length > this.opts.maxBufferedMessages) {
+      dropped = queue.length - this.opts.maxBufferedMessages;
+      queue.splice(0, dropped);
+    }
+    this.buffers.set(agent, queue);
+    this.known.add(agent);
+    return { dropped };
+  }
+  takeBuffered(agent) {
+    const queue = this.buffers.get(agent);
+    if (!queue || queue.length === 0)
+      return [];
+    this.buffers.set(agent, []);
+    return queue;
+  }
+  requeue(agent, messages) {
+    if (messages.length === 0)
+      return;
+    const queue = this.buffers.get(agent) ?? [];
+    queue.unshift(...messages);
+    this.buffers.set(agent, queue);
+  }
+  bufferedCount(agent) {
+    if (agent)
+      return this.buffers.get(agent)?.length ?? 0;
+    let total = 0;
+    for (const queue of this.buffers.values())
+      total += queue.length;
+    return total;
+  }
+}
+
 // src/control-protocol.ts
 var CLOSE_CODE_REPLACED = 4001;
 var CLOSE_CODE_EVICTED_STALE = 4002;
@@ -14140,6 +14255,9 @@ var CLOSE_CODE_PROBE_IN_PROGRESS = 4003;
 // src/daemon-client.ts
 var nextSocketId = 0;
 var CONNECT_TIMEOUT_MS = 5000;
+function frontendAgentFromEnv() {
+  return parseFrontendAgent(process.env.AGENTBRIDGE_AGENT) ?? DEFAULT_FRONTEND_AGENT;
+}
 
 class DaemonClient extends EventEmitter2 {
   url;
@@ -14204,7 +14322,11 @@ class DaemonClient extends EventEmitter2 {
     });
   }
   attachClaude() {
-    this.send({ type: "claude_connect", projectId: process.env.AGENTBRIDGE_PROJECT_ID ?? null });
+    this.send({
+      type: "claude_connect",
+      projectId: process.env.AGENTBRIDGE_PROJECT_ID ?? null,
+      agent: frontendAgentFromEnv()
+    });
   }
   async attachClaudeAndWaitForStatus(timeoutMs = 1000) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {

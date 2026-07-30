@@ -28,11 +28,31 @@ import { ReplyOutbox, type QueuedReply } from "./reply-outbox";
 import type { ControlClientMessage, ControlServerMessage, DaemonStatus } from "./control-protocol";
 import type { BridgeMessage } from "./types";
 import { probeLiveness as probeLivenessImpl } from "./liveness-probe";
+import {
+  DEFAULT_FRONTEND_AGENT,
+  FRONTEND_AGENTS,
+  FrontendRegistry,
+  parseFrontendAgent,
+} from "./frontend-registry";
+import type { FrontendAgent } from "./frontend-registry";
+
+const FRONTEND_AGENT_LIST = FRONTEND_AGENTS.join(", ");
 
 interface ControlSocketData {
   clientId: number;
+  /**
+   * Which agent this socket declared itself to be, from `claude_connect`.
+   *
+   * Defaulted at upgrade rather than left unset, because a socket that
+   * sends a `claude_to_codex` before its connect has to be attributed to
+   * *something*, and Claude is what every frontend was until 0.8.
+   */
+  agent: FrontendAgent;
   attached: boolean;
+  /** When the last pong landed. Diagnostics only — the probe reads `pongCount`. */
   lastPongAt: number;
+  /** Pong frames seen on this socket, never reset. See `ProbeTarget.pongCount`. */
+  pongCount: number;
   /** Set when the frontend was refused for belonging to another project. */
   rejected?: boolean;
 }
@@ -73,7 +93,33 @@ const codex = new CodexAdapter(CODEX_APP_PORT, CODEX_PROXY_PORT, stateDir.logFil
 const attachCmd = `codex --enable tui_app_server --remote ${codex.proxyUrl}`;
 
 let controlServer: ReturnType<typeof Bun.serve> | null = null;
-let attachedClaude: ServerWebSocket<ControlSocketData> | null = null;
+
+/**
+ * One frontend slot per agent identity.
+ *
+ * Was a single `attachedClaude` variable until Grok Build turned out to
+ * load Claude Code's plugin registry, launch this same MCP server, and
+ * land in Claude's slot — see `src/frontend-registry.ts` and
+ * `docs/scaling-plan.md` §4.1b.
+ */
+const frontends = new FrontendRegistry<ServerWebSocket<ControlSocketData>, BridgeMessage>({
+  maxBufferedMessages: MAX_BUFFERED_MESSAGES,
+  isOpen: (ws) => ws.readyState === WebSocket.OPEN,
+  isClosed: (ws) => ws.readyState === WebSocket.CLOSED,
+});
+
+/**
+ * The socket holding Claude's slot, or null.
+ *
+ * Claude keeps a named accessor because a handful of behaviors are
+ * genuinely Claude-specific rather than per-frontend: every Codex-facing
+ * notice names Claude, and Codex's own instructions were written about
+ * Claude. Generalizing those is product copy, not bookkeeping, and is
+ * deliberately not part of this change.
+ */
+function claudeSocket(): ServerWebSocket<ControlSocketData> | null {
+  return frontends.occupant(DEFAULT_FRONTEND_AGENT);
+}
 let nextControlClientId = 0;
 let nextSystemMessageId = 0;
 let codexBootstrapped = false;
@@ -114,7 +160,6 @@ const LIVENESS_PROBE_TIMEOUT_MS = parsePositiveIntEnv(
   log,
 );
 const LIVENESS_PROBE_POLL_MS = 50;
-let challengeInProgress = false;
 
 // Claude→Codex replies that arrived while Codex was mid-turn. Codex
 // accepts one turn at a time, so these are held and injected when the
@@ -125,13 +170,11 @@ const replyOutbox = new ReplyOutbox({
   ttlMs: parsePositiveIntEnv("AGENTBRIDGE_REPLY_QUEUE_TTL_MS", 10 * 60_000, log),
 });
 
-const bufferedMessages: BridgeMessage[] = [];
-
 const tuiConnectionState = new TuiConnectionState({
   disconnectGraceMs: TUI_DISCONNECT_GRACE_MS,
   log,
   onDisconnectPersisted: (connId) => {
-    emitToClaude(
+    emitToFrontends(
       systemMessage(
         "system_tui_disconnected",
         `⚠️ Codex TUI disconnected (conn #${connId}). Codex is still running in the background — reconnect the TUI to resume.`,
@@ -139,7 +182,7 @@ const tuiConnectionState = new TuiConnectionState({
     );
   },
   onReconnectAfterNotice: (connId) => {
-    emitToClaude(
+    emitToFrontends(
       systemMessage(
         "system_tui_reconnected",
         `✅ Codex TUI reconnected (conn #${connId}). Bridge restored, communication can continue.`,
@@ -153,11 +196,11 @@ const tuiConnectionState = new TuiConnectionState({
 // instead of pushing it on the MCP channel. Same reasoning as
 // untagged Codex output: routine progress should not auto-bloat
 // Claude's context. Claude can drain via get_messages if curious.
-const statusBuffer = new StatusBuffer((summary) => emitToClaude(summary, "queue"));
+const statusBuffer = new StatusBuffer((summary) => emitToFrontends(summary, "queue"));
 
 codex.on("turnStarted", () => {
   log("Codex turn started");
-  emitToClaude(
+  emitToFrontends(
     systemMessage(
       "system_turn_started",
       "⏳ Codex is working on the current task. Wait for completion before sending a reply.",
@@ -196,7 +239,7 @@ codex.on("agentMessage", (msg: BridgeMessage) => {
       if (result.marker === "reply" && statusBuffer.size > 0) {
         statusBuffer.flush("reply message arrived");
       }
-      emitToClaude(msg);
+      emitToFrontends(msg);
       // [REPLY] message — give Claude an attention window to respond
       if (result.marker === "reply") {
         startAttentionWindow();
@@ -205,7 +248,7 @@ codex.on("agentMessage", (msg: BridgeMessage) => {
     case "queue":
       // Untagged Codex output: deliver to Claude's pull queue, not the
       // MCP channel. Claude only sees it when get_messages is called.
-      emitToClaude(msg, "queue");
+      emitToFrontends(msg, "queue");
       break;
     case "buffer":
       statusBuffer.add(msg);
@@ -222,7 +265,7 @@ codex.on("turnCompleted", () => {
   // Check if reply was required but Codex didn't send any agentMessage
   if (replyRequired && !replyReceivedDuringTurn) {
     log("⚠️ Reply was required but Codex did not send any agentMessage");
-    emitToClaude(
+    emitToFrontends(
       systemMessage(
         "system_reply_missing",
         "⚠️ Codex completed the turn without sending a reply (require_reply was set). Codex may not have generated an agentMessage. You may want to retry or rephrase.",
@@ -234,7 +277,7 @@ codex.on("turnCompleted", () => {
   replyRequired = false;
   replyReceivedDuringTurn = false;
 
-  emitToClaude(
+  emitToFrontends(
     systemMessage(
       "system_turn_completed",
       "✅ Codex finished the current turn. You can reply now if needed.",
@@ -243,7 +286,7 @@ codex.on("turnCompleted", () => {
   startAttentionWindow();
 
   // Retry Claude-online notice if it was deferred while the turn was in progress.
-  if (attachedClaude && shouldNotifyCodexClaudeOnline()) {
+  if (claudeSocket() && shouldNotifyCodexClaudeOnline()) {
     notifyCodexClaudeOnline();
   }
 
@@ -260,11 +303,11 @@ codex.on("ready", (threadId: string) => {
   log(`Codex ready — thread ${threadId}`);
   log("Bridge fully operational");
 
-  emitToClaude(
+  emitToFrontends(
     systemMessage("system_ready", currentReadyMessage()),
   );
 
-  if (attachedClaude && shouldNotifyCodexClaudeOnline()) {
+  if (claudeSocket() && shouldNotifyCodexClaudeOnline()) {
     notifyCodexClaudeOnline();
   }
 });
@@ -298,7 +341,7 @@ codex.on("exit", (code: number | null) => {
   // Codex thread is gone; next thread needs the contract pinned again.
   lastPinnedContractThreadId = null;
   discardOutboxForLostCodex("the Codex app-server exited");
-  emitToClaude(
+  emitToFrontends(
     systemMessage(
       "system_codex_exit",
       `⚠️ Codex app-server exited (code ${code ?? "unknown"}). AgentBridge daemon is still running, but the Codex side needs to be restarted.`,
@@ -322,7 +365,18 @@ function startControlServer() {
         return Response.json(currentStatus(), { status: codexBootstrapped ? 200 : 503 });
       }
 
-      if (url.pathname === "/ws" && server.upgrade(req, { data: { clientId: 0, attached: false, lastPongAt: Date.now() } })) {
+      if (
+        url.pathname === "/ws" &&
+        server.upgrade(req, {
+          data: {
+            clientId: 0,
+            agent: DEFAULT_FRONTEND_AGENT,
+            attached: false,
+            lastPongAt: Date.now(),
+            pongCount: 0,
+          },
+        })
+      ) {
         return undefined;
       }
 
@@ -334,19 +388,19 @@ function startControlServer() {
       open: (ws: ServerWebSocket<ControlSocketData>) => {
         ws.data.clientId = ++nextControlClientId;
         ws.data.lastPongAt = Date.now();
+        ws.data.pongCount = 0;
         log(`Frontend socket opened (#${ws.data.clientId})`);
       },
       close: (ws: ServerWebSocket<ControlSocketData>, code: number, reason: string) => {
-        log(`Frontend socket closed (#${ws.data.clientId}, code=${code}, reason=${reason || "none"}, wasAttached=${attachedClaude === ws})`);
-        if (attachedClaude === ws) {
-          detachClaude(ws, "frontend socket closed");
-        }
+        log(`Frontend socket closed (#${ws.data.clientId}, code=${code}, reason=${reason || "none"}, wasAttached=${ws.data.attached})`);
+        detachFrontend(ws, "frontend socket closed");
       },
       message: (ws: ServerWebSocket<ControlSocketData>, raw) => {
         handleControlMessage(ws, raw);
       },
       pong: (ws: ServerWebSocket<ControlSocketData>) => {
         ws.data.lastPongAt = Date.now();
+        ws.data.pongCount++;
       },
     },
   });
@@ -405,18 +459,39 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
         );
         return;
       }
-      attachClaude(ws).catch((err) => {
-        log(`attachClaude threw for #${ws.data.clientId}: ${err?.message ?? err}`);
-      });
+      {
+        // An agent we do not know cannot be given a slot: the only
+        // alternatives are coercing it into Claude's (the exact
+        // collision this keying exists to stop) or inventing a slot
+        // nothing routes to. Refusing says so where the user can read it.
+        const agent = parseFrontendAgent(message.agent);
+        if (agent === null) {
+          log(`Refusing claude_connect from #${ws.data.clientId} — unknown agent ${JSON.stringify(message.agent)}`);
+          ws.data.rejected = true;
+          ws.close(
+            CLOSE_CODE_PROJECT_MISMATCH,
+            `Unknown frontend agent ${JSON.stringify(message.agent)} — this daemon serves ${FRONTEND_AGENT_LIST}.`,
+          );
+          return;
+        }
+        ws.data.agent = agent;
+        attachFrontend(ws, agent).catch((err) => {
+          log(`attachFrontend threw for #${ws.data.clientId}: ${err?.message ?? err}`);
+        });
+      }
       return;
     case "claude_disconnect":
-      detachClaude(ws, "frontend requested disconnect");
+      detachFrontend(ws, "frontend requested disconnect");
       return;
     case "status":
       sendStatus(ws);
       return;
     case "claude_to_codex": {
-      if (message.message.source !== "claude") {
+      // The source must be the agent this socket declared itself to be.
+      // Checking against the declaration rather than the literal
+      // `"claude"` keeps the guard meaningful now that more than one
+      // agent can hold a slot: a frontend cannot send as its neighbour.
+      if (message.message.source !== ws.data.agent) {
         sendProtocolMessage(ws, {
           type: "claude_to_codex_result",
           requestId: message.requestId,
@@ -546,7 +621,7 @@ function drainReplyOutbox(): void {
   for (const stale of expired) {
     const waitedMin = Math.round((Date.now() - stale.queuedAt) / 60_000);
     log(`Dropping expired queued reply ${stale.id} (waited ~${waitedMin}m)`);
-    emitToClaude(
+    emitToFrontends(
       noticeMessage(
         "reply_expired",
         `⚠️ A reply you sent while Codex was busy waited ~${waitedMin} minutes and was dropped without being delivered. ` +
@@ -562,7 +637,7 @@ function drainReplyOutbox(): void {
     // attention window opened moments ago by turnCompleted is over.
     clearAttentionWindow();
     log(`Delivered queued reply ${reply.id} after turn completion`);
-    emitToClaude(
+    emitToFrontends(
       noticeMessage(
         "reply_delivered",
         "📤 The reply you sent while Codex was busy has now been delivered — Codex is starting a turn on it.",
@@ -580,7 +655,7 @@ function drainReplyOutbox(): void {
   }
 
   log(`Queued reply ${reply.id} could not be injected (no active thread); dropping`);
-  emitToClaude(
+  emitToFrontends(
     noticeMessage(
       "reply_undeliverable",
       "⚠️ A reply you sent while Codex was busy could not be delivered — the Codex thread is gone. " +
@@ -603,7 +678,7 @@ function discardOutboxForLostCodex(why: string): void {
   const lost = replyOutbox.clear();
   if (lost.length === 0) return;
   log(`Discarding ${lost.length} queued Claude → Codex repl(ies): ${why}`);
-  emitToClaude(
+  emitToFrontends(
     noticeMessage(
       "reply_discarded",
       `⚠️ ${lost.length} repl${lost.length > 1 ? "ies" : "y"} you sent while Codex was busy ` +
@@ -619,21 +694,29 @@ function truncateForNotice(content: string, max = 400): string {
   return content.length <= max ? content : `${content.slice(0, max)}… (${content.length} chars total)`;
 }
 
-async function attachClaude(ws: ServerWebSocket<ControlSocketData>) {
-  const occupant = attachedClaude;
-  if (occupant && occupant !== ws && occupant.readyState !== WebSocket.CLOSED) {
+/**
+ * Give `agent`'s slot to `ws`, contesting the incumbent if there is one.
+ *
+ * Contention is per-agent: a Grok frontend arriving while Claude holds
+ * its slot is not a contest at all, it is a second tenant. Only another
+ * frontend claiming the *same* identity has to win a liveness probe.
+ */
+async function attachFrontend(ws: ServerWebSocket<ControlSocketData>, agent: FrontendAgent) {
+  const label = `${agent} frontend`;
+  const occupant = frontends.contestedBy(agent, ws);
+  if (occupant) {
     // Slot is occupied by another socket that hasn't yet shown us FIN.
     // Issue #68: OS may never surface a FIN for a crashed peer, so readyState
     // stays OPEN forever. Probe the incumbent with a ping before rejecting.
     const msSincePong = Date.now() - occupant.data.lastPongAt;
     log(
-      `Claude frontend contest: new=#${ws.data.clientId}, incumbent=#${occupant.data.clientId} ` +
+      `${label} contest: new=#${ws.data.clientId}, incumbent=#${occupant.data.clientId} ` +
       `(readyState=${occupant.readyState}, msSincePong=${msSincePong})`,
     );
 
-    if (challengeInProgress) {
+    if (frontends.isProbing(agent)) {
       log(
-        `Rejecting Claude frontend #${ws.data.clientId} — another liveness probe already in flight`,
+        `Rejecting ${label} #${ws.data.clientId} — another liveness probe already in flight`,
       );
       ws.close(
         CLOSE_CODE_PROBE_IN_PROGRESS,
@@ -642,12 +725,12 @@ async function attachClaude(ws: ServerWebSocket<ControlSocketData>) {
       return;
     }
 
-    challengeInProgress = true;
+    frontends.beginProbe(agent);
     let incumbentAlive = false;
     try {
       incumbentAlive = await probeLiveness(occupant, LIVENESS_PROBE_TIMEOUT_MS);
     } finally {
-      challengeInProgress = false;
+      frontends.endProbe(agent);
     }
 
     // Slot may have cleared during the probe (real close fired, or the new ws
@@ -662,9 +745,9 @@ async function attachClaude(ws: ServerWebSocket<ControlSocketData>) {
 
     if (incumbentAlive) {
       log(
-        `Rejecting Claude frontend #${ws.data.clientId} — incumbent #${occupant.data.clientId} responded to liveness probe`,
+        `Rejecting ${label} #${ws.data.clientId} — incumbent #${occupant.data.clientId} responded to liveness probe`,
       );
-      ws.close(CLOSE_CODE_REPLACED, "another Claude session is already connected");
+      ws.close(CLOSE_CODE_REPLACED, `another ${agent} session is already connected`);
       return;
     }
 
@@ -672,29 +755,32 @@ async function attachClaude(ws: ServerWebSocket<ControlSocketData>) {
     // Fall through to accept path below.
   }
 
-  if (attachedClaude && attachedClaude !== ws && attachedClaude.readyState !== WebSocket.CLOSED) {
+  const raced = frontends.contestedBy(agent, ws);
+  if (raced) {
     // Another contestant may have raced in between the probe and here. Reject.
     log(
-      `Rejecting Claude frontend #${ws.data.clientId} — slot re-acquired by #${attachedClaude.data.clientId} after probe`,
+      `Rejecting ${label} #${ws.data.clientId} — slot re-acquired by #${raced.data.clientId} after probe`,
     );
-    ws.close(CLOSE_CODE_REPLACED, "another Claude session is already connected");
+    ws.close(CLOSE_CODE_REPLACED, `another ${agent} session is already connected`);
     return;
   }
 
-  clearPendingClaudeDisconnect("Claude frontend attached");
-  attachedClaude = ws;
+  if (agent === DEFAULT_FRONTEND_AGENT) {
+    clearPendingClaudeDisconnect("Claude frontend attached");
+  }
+  frontends.claim(agent, ws);
   ws.data.attached = true;
   cancelIdleShutdown();
-  log(`Claude frontend attached (#${ws.data.clientId})`);
+  log(`${label} attached (#${ws.data.clientId})`);
 
-  statusBuffer.flush("claude reconnected");
+  statusBuffer.flush(`${agent} reconnected`);
   sendStatus(ws);
 
   const now = Date.now();
   const isRapidReattach = now - lastAttachStatusSentTs < ATTACH_STATUS_COOLDOWN_MS;
 
-  if (bufferedMessages.length > 0) {
-    flushBufferedMessages(ws);
+  if (frontends.bufferedCount(agent) > 0) {
+    flushBufferedMessages(agent, ws);
   } else if (!isRapidReattach) {
     // Only send status messages if this is not a rapid reattach (avoid flooding Claude)
     if (tuiConnectionState.canReply()) {
@@ -706,19 +792,32 @@ async function attachClaude(ws: ServerWebSocket<ControlSocketData>) {
 
   lastAttachStatusSentTs = now;
 
-  if (tuiConnectionState.canReply() && shouldNotifyCodexClaudeOnline()) {
+  // Codex-facing notices stay keyed to Claude on purpose. Every one of
+  // them names Claude to Codex, and Codex's own role text was written
+  // about Claude; announcing a second agent under that copy would be a
+  // product decision, not bookkeeping.
+  if (agent === DEFAULT_FRONTEND_AGENT && tuiConnectionState.canReply() && shouldNotifyCodexClaudeOnline()) {
     notifyCodexClaudeOnline();
   }
 }
 
-function detachClaude(ws: ServerWebSocket<ControlSocketData>, reason: string) {
-  if (attachedClaude !== ws) return;
+/**
+ * Release whichever slot `ws` holds.
+ *
+ * No-op for a socket that holds none — including one already superseded
+ * by a replacement, which must not be able to evict its successor by
+ * closing late.
+ */
+function detachFrontend(ws: ServerWebSocket<ControlSocketData>, reason: string) {
+  const agent = frontends.releaseSocket(ws);
+  if (agent === null) return;
 
-  attachedClaude = null;
   ws.data.attached = false;
-  log(`Claude frontend detached (#${ws.data.clientId}, ${reason})`);
+  log(`${agent} frontend detached (#${ws.data.clientId}, ${reason})`);
 
-  scheduleClaudeDisconnectNotification(ws.data.clientId);
+  if (agent === DEFAULT_FRONTEND_AGENT) {
+    scheduleClaudeDisconnectNotification(ws.data.clientId);
+  }
 
   scheduleIdleShutdown();
 }
@@ -730,7 +829,7 @@ async function probeLiveness(
   return probeLivenessImpl(
     {
       get readyState() { return ws.readyState; },
-      get lastPongAt() { return ws.data.lastPongAt; },
+      get pongCount() { return ws.data.pongCount; },
       ping: () => { ws.ping(); },
     },
     { timeoutMs, pollMs: LIVENESS_PROBE_POLL_MS },
@@ -751,10 +850,8 @@ async function probeLiveness(
  * behavior: Codex genuinely has no Claude attached.
  */
 function evictStale(ws: ServerWebSocket<ControlSocketData>, reason: string) {
-  log(`Evicting stale Claude frontend #${ws.data.clientId}: ${reason}`);
-  if (attachedClaude === ws) {
-    detachClaude(ws, `evicted: ${reason}`);
-  }
+  log(`Evicting stale ${ws.data.agent} frontend #${ws.data.clientId}: ${reason}`);
+  detachFrontend(ws, `evicted: ${reason}`);
   try {
     ws.close(CLOSE_CODE_EVICTED_STALE, "stale frontend evicted by newer session");
   } catch (err: any) {
@@ -788,7 +885,7 @@ function clearAttentionWindow() {
 
 function scheduleIdleShutdown() {
   cancelIdleShutdown();
-  if (attachedClaude) return; // still has a client
+  if (frontends.size > 0) return; // still has a client
 
   const snapshot = tuiConnectionState.snapshot();
   if (snapshot.tuiConnected) return; // TUI still connected
@@ -796,7 +893,7 @@ function scheduleIdleShutdown() {
   log(`No clients connected. Daemon will shut down in ${IDLE_SHUTDOWN_MS}ms if no one reconnects.`);
   idleShutdownTimer = setTimeout(() => {
     // Re-check before shutting down
-    if (attachedClaude || tuiConnectionState.snapshot().tuiConnected) {
+    if (frontends.size > 0 || tuiConnectionState.snapshot().tuiConnected) {
       log("Idle shutdown cancelled: client reconnected during grace period");
       return;
     }
@@ -825,7 +922,7 @@ function scheduleClaudeDisconnectNotification(clientId: number) {
   claudeDisconnectTimer = setTimeout(() => {
     claudeDisconnectTimer = null;
 
-    if (attachedClaude) {
+    if (claudeSocket()) {
       log(
         `Skipping Claude disconnect notification for client #${clientId} because Claude already reconnected`,
       );
@@ -855,11 +952,23 @@ function scheduleClaudeDisconnectNotification(clientId: number) {
   }, CLAUDE_DISCONNECT_GRACE_MS);
 }
 
-function emitToClaude(message: BridgeMessage, deliveryHint?: "push" | "queue") {
-  if (attachedClaude && attachedClaude.readyState === WebSocket.OPEN) {
-    if (trySendBridgeMessage(attachedClaude, message, deliveryHint)) return;
+/**
+ * Deliver a message to every frontend except the one that wrote it.
+ *
+ * Each agent that misses it — not attached, or a send that failed —
+ * keeps its own buffer, so a Grok session that never launched cannot
+ * make Claude's reconnect replay Grok's backlog, and neither one's
+ * overflow discards the other's messages.
+ */
+function emitToFrontends(message: BridgeMessage, deliveryHint?: "push" | "queue") {
+  const delivered = new Set<FrontendAgent>();
+  for (const { agent, socket } of frontends.recipients(message.source)) {
+    if (trySendBridgeMessage(socket, message, deliveryHint)) {
+      delivered.add(agent);
+      continue;
+    }
     // Send failed — fall through to buffer
-    log("Send to Claude failed, buffering message for retry on reconnect");
+    log(`Send to ${agent} failed, buffering message for retry on reconnect`);
   }
 
   // Buffered messages preserve their delivery hint via an attached
@@ -869,11 +978,13 @@ function emitToClaude(message: BridgeMessage, deliveryHint?: "push" | "queue") {
   if (deliveryHint) {
     (message as BridgeMessage & { __deliveryHint?: "push" | "queue" }).__deliveryHint = deliveryHint;
   }
-  bufferedMessages.push(message);
-  if (bufferedMessages.length > MAX_BUFFERED_MESSAGES) {
-    const dropped = bufferedMessages.length - MAX_BUFFERED_MESSAGES;
-    bufferedMessages.splice(0, dropped);
-    log(`Message buffer overflow: dropped ${dropped} oldest message(s), ${MAX_BUFFERED_MESSAGES} remaining`);
+
+  for (const agent of frontends.knownAgents()) {
+    if (delivered.has(agent) || agent === message.source) continue;
+    const { dropped } = frontends.buffer(agent, message);
+    if (dropped > 0) {
+      log(`Message buffer overflow for ${agent}: dropped ${dropped} oldest message(s), ${MAX_BUFFERED_MESSAGES} remaining`);
+    }
   }
 }
 
@@ -894,8 +1005,8 @@ function trySendBridgeMessage(ws: ServerWebSocket<ControlSocketData>, message: B
   }
 }
 
-function flushBufferedMessages(ws: ServerWebSocket<ControlSocketData>) {
-  const messages = bufferedMessages.splice(0, bufferedMessages.length);
+function flushBufferedMessages(agent: FrontendAgent, ws: ServerWebSocket<ControlSocketData>) {
+  const messages = frontends.takeBuffered(agent);
   for (const message of messages) {
     // Recover the delivery hint we stashed on the message when it
     // was buffered, so a queued message stays queued after replay.
@@ -904,7 +1015,7 @@ function flushBufferedMessages(ws: ServerWebSocket<ControlSocketData>) {
       // Re-buffer this and all remaining messages on failure
       const failedIndex = messages.indexOf(message);
       const remaining = messages.slice(failedIndex);
-      bufferedMessages.unshift(...remaining);
+      frontends.requeue(agent, remaining);
       log(`Flush interrupted: re-buffered ${remaining.length} message(s) after send failure`);
       return;
     }
@@ -920,8 +1031,9 @@ function sendStatus(ws: ServerWebSocket<ControlSocketData>) {
 }
 
 function broadcastStatus() {
-  if (!attachedClaude) return;
-  sendStatus(attachedClaude);
+  for (const { socket } of frontends.recipients()) {
+    sendStatus(socket);
+  }
 }
 
 function sendProtocolMessage(ws: ServerWebSocket<ControlSocketData>, message: ControlServerMessage) {
@@ -938,11 +1050,12 @@ function currentStatus(): DaemonStatus {
     bridgeReady: tuiConnectionState.canReply(),
     tuiConnected: snapshot.tuiConnected,
     threadId: codex.activeThreadId,
-    queuedMessageCount: bufferedMessages.length + statusBuffer.size,
+    queuedMessageCount: frontends.bufferedCount() + statusBuffer.size,
     proxyUrl: codex.proxyUrl,
     appServerUrl: codex.appServerUrl,
     pid: process.pid,
-    claudeAttached: attachedClaude !== null && attachedClaude.readyState === WebSocket.OPEN,
+    claudeAttached: frontends.isAttached(DEFAULT_FRONTEND_AGENT),
+    attachedAgents: frontends.attachedAgents(),
     pendingReplyCount: replyOutbox.size,
     projectId: DAEMON_PROJECT_ID,
   };
@@ -1044,11 +1157,11 @@ async function bootCodex() {
     codexBootstrapped = true;
     writeStatusFile();
 
-    emitToClaude(systemMessage("system_waiting", currentWaitingMessage()));
+    emitToFrontends(systemMessage("system_waiting", currentWaitingMessage()));
     broadcastStatus();
   } catch (err: any) {
     log(`Failed to start Codex: ${err.message}`);
-    emitToClaude(
+    emitToFrontends(
       systemMessage(
         "system_codex_start_failed",
         `❌ AgentBridge failed to start Codex app-server: ${err.message}`,

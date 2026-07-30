@@ -32,6 +32,7 @@ const BASE_STATUS: DaemonStatus = {
   appServerUrl: "ws://127.0.0.1:17035",
   pid: 4242,
   claudeAttached: true,
+  attachedAgents: ["claude"],
   pendingReplyCount: 0,
   projectId: null,
 };
@@ -116,6 +117,22 @@ describe("abg status - live daemon view", () => {
     expect(output()).toContain("claude      attached");
     expect(output()).toContain("codex tui   connected");
     expect(output()).toContain("thread      thread_abc123");
+  });
+
+  test("names a second frontend, and stays quiet when there is only one", async () => {
+    serveStatus({ attachedAgents: ["claude", "grok"] });
+    await runStatus();
+
+    expect(output()).toContain("also        grok attached");
+  });
+
+  test("says nothing about other agents in a single-agent session", async () => {
+    // The common case has to read exactly as it did before frontends
+    // were keyed by identity.
+    serveStatus({});
+    await runStatus();
+
+    expect(output()).not.toContain("also  ");
   });
 
   test("names the missing side and the command that fixes it", async () => {

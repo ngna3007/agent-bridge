@@ -107,6 +107,13 @@ export async function runStatus() {
   if (live) {
     console.log("Live");
     console.log(`  claude      ${live.claudeAttached ? "attached" : "not attached"}`);
+    // Only shown when there is one, so a single-agent session reads
+    // exactly as it did before frontends were keyed by identity. `?? []`
+    // covers a pre-0.8 daemon still running under a newer CLI.
+    const others = (live.attachedAgents ?? []).filter((agent) => agent !== "claude");
+    if (others.length > 0) {
+      console.log(`  also        ${others.join(", ")} attached`);
+    }
     console.log(`  codex tui   ${live.tuiConnected ? "connected" : "not connected"}`);
     console.log(`  thread      ${live.threadId ?? "none yet (Codex has not started a thread)"}`);
     console.log(`  bridge      ${live.bridgeReady ? "ready" : "not ready"}`);
