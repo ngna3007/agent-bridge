@@ -564,16 +564,41 @@ separate ACP client.
    not found` on the agent's ACP surface, despite appearing in the binary — they
    are not part of the client-facing protocol. `$GROK_HOME/active_sessions.json`
    holds `{session_id, pid, cwd}` per live session and is what the attach path
-   should read.
+   should read. `x.ai/session/interjection` in particular is not a method an
+   adapter may call: the only place it appears is
+   `xai-grok-pager/src/app/acp_handler/` — it travels **agent → client**, as a
+   notification the TUI renders, which is why calling it inbound is a method-not-
+   found.
 3. **Unix socket path limit.** The leader socket is `$GROK_HOME/leader.sock`
    under `SUN_LEN` (~108 chars). A long `GROK_HOME` fails with
    `path must be shorter than SUN_LEN` and then `Timeout waiting for IPC socket
    to be created` — hit during this experiment. Any temp-dir test harness must
    use a short path.
-4. **No turn-busy semantics established.** Injection was tested against an idle
-   session. Whether a prompt arriving mid-turn queues, interleaves, or errors is
-   untested — and it is exactly the case AgentBridge's outbox exists for on the
-   Codex side. Test before building.
+4. **Turn-busy is handled by the leader, not by us** (measured 2026-07-31, same
+   build). A owns the session and starts a 25-item turn; 3.6 s in, B — still
+   uninvited — `session/prompt`s the same `sessionId`. The leader **serialises**:
+
+   | event | at |
+   |---|---|
+   | B's prompt sent | +3.6 s |
+   | A's long turn returns `end_turn` | +6.9 s |
+   | B's injected text appears in A's stream | +6.9 s |
+   | B's prompt returns `end_turn` | +9.1 s |
+
+   No busy error, no interleaving, no lost turn — the second prompt simply waits
+   for the turn boundary and then runs, and both clients see both turns. **This
+   is the outbox, implemented server-side.** A Grok adapter does not need the
+   queueing machinery `src/codex-adapter.ts` carries; it needs the opposite —
+   a `session/prompt` call with a timeout long enough to survive an arbitrarily
+   long turn in front of it, because the request stays pending the whole time.
+
+**On mid-turn interjection:** the grok-build source at HEAD registers
+`x.ai/interject` (`xai-grok-shell/src/extensions/interject.rs`) — it queues text
+into the session's pending-interjection buffer, drained "at the next safe point
+in `process_conversation_turn`", and returns `"queued"`. That is *true* mid-turn
+steering, stronger than the queue-at-boundary above. It does not exist in
+0.2.114: the string is absent from the binary and the call returns `-32601`.
+Treat it as a capability to feature-detect later, not one to build on now.
 
 A cheap outbound-only option still exists regardless: Grok `[hooks]` firing on
 message events with `$GROK_MESSAGE` / `$GROK_SESSION_ID`.

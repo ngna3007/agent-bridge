@@ -208,13 +208,19 @@ Two `grok agent --leader stdio` clients share a leader; B prompts A's
 session with no `session/load` and both watch what arrives. The
 load-bearing assertion is that **A still receives the stream for a turn
 it did not start** — if only B saw it, attaching would blank the human's
-screen. Also pins `x.ai/sessions/list` and `x.ai/session/interjection` as
-absent from the ACP surface, so no adapter gets written against methods
-that only exist in the binary's strings. Runs in an isolated `GROK_HOME`
-with `[cli] use_leader = true`, so the user's own Grok config is never
-touched; skips cleanly when `~/.grok/auth.json` is missing. Spends a
-small number of real xAI tokens. Most recent run: **12 passed, 0
-failed** (grok 0.2.114). Background in `docs/scaling-plan.md` §4.1a.
+screen. It then answers the question that decides how much machinery a
+Grok adapter needs: B prompts again **while A's turn is still running**,
+and the leader queues it to the turn boundary rather than erroring or
+interleaving — so the outbox the Codex adapter carries has no Grok
+equivalent to build. Also pins `x.ai/sessions/list`,
+`x.ai/session/interjection` and `x.ai/interject` as absent from the ACP
+surface, so no adapter gets written against methods that only exist in
+the binary's strings or in a newer grok-build than the one installed.
+Runs in an isolated `GROK_HOME` with `[cli] use_leader = true`, so the
+user's own Grok config is never touched; skips cleanly when
+`~/.grok/auth.json` is missing. Spends a small number of real xAI
+tokens. Most recent run: **17 passed, 0 failed** (grok 0.2.114).
+Background in `docs/scaling-plan.md` §4.1a.
 
 ## Tier 3 — role files change real agent behavior
 

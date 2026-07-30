@@ -632,11 +632,21 @@ deadlocks before the TUI ever starts.
 | TUI launched with stock config | Default TUI is unreachable — the precondition is real | "No leader candidates found" against a TUI up 1h35m |
 | Inject into the live TUI's session, then read `sessions/<cwd>/<id>/chat_history.jsonl` | The turn is in the *human's* transcript, not a side channel | `user: <user_query>…` + assistant reply |
 | `$GROK_HOME/active_sessions.json` | Discovery surface holds `{session_id, pid, cwd}` | confirmed |
-| `x.ai/sessions/list`, `x.ai/session/list`, `x.ai/session/interjection` | Stay unavailable — the harness must not regress onto them | `-32601 Method not found` on all three |
-| **Untested, build the case first:** inject while the TUI is mid-turn | Queue / interleave / error — decides whether Grok needs the Codex outbox | — |
+| `x.ai/sessions/list`, `x.ai/session/list`, `x.ai/session/interjection`, `x.ai/interject` | Stay unavailable — the harness must not regress onto them | `-32601 Method not found` on all four |
+| Inject while the session is **mid-turn** (added 2026-07-31) | Queue / interleave / error — decides whether Grok needs the Codex outbox | **Queued to the turn boundary**: sent +3.6 s, running turn ends +6.9 s, injected turn ends +9.1 s, both clients see both |
 
-The mid-turn case is the one that changes the design, and it is exactly the
-scenario the Codex-side outbox exists for. Run it before writing an adapter.
+The mid-turn answer removes work rather than adding it. Grok's leader serialises
+turns per session, so the bounded outbox `src/codex-adapter.ts` maintains has no
+Grok counterpart to build — an adapter just calls `session/prompt` and waits.
+The one requirement it creates is a long client-side timeout, because that call
+stays pending for however long the turn ahead of it runs.
+
+True mid-turn steering does exist in grok-build at HEAD — `x.ai/interject`
+(`xai-grok-shell/src/extensions/interject.rs`) queues into the session's pending
+interjection buffer, drained at the next safe point in
+`process_conversation_turn`, returning `"queued"`. It is absent from 0.2.114
+(not in the binary, `-32601` on the wire). Feature-detect it later; do not
+design around it.
 
 **Screen rendering stays Tier 3.** Capturing a pty proves the TUI *ran* the
 injected turn (title bar cycles Waiting→Responding) but not what it drew;
