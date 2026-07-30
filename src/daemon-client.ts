@@ -1,4 +1,6 @@
 import { EventEmitter } from "node:events";
+import { DEFAULT_FRONTEND_AGENT, parseFrontendAgent } from "./frontend-registry";
+import type { FrontendAgent } from "./frontend-registry";
 import type { BridgeMessage } from "./types";
 import {
   CLOSE_CODE_REPLACED,
@@ -31,6 +33,18 @@ let nextSocketId = 0;
 
 /** How long to wait for the daemon to accept a control connection. */
 const CONNECT_TIMEOUT_MS = 5000;
+
+/**
+ * Which agent is running this frontend, from `AGENTBRIDGE_AGENT`.
+ *
+ * One MCP server binary serves every agent, so the launcher is the only
+ * thing that knows which one started it. An unset or unrecognized value
+ * means Claude: the variable is new, every existing launch omits it,
+ * and a typo must not silently create a frontend nothing routes to.
+ */
+export function frontendAgentFromEnv(): FrontendAgent {
+  return parseFrontendAgent(process.env.AGENTBRIDGE_AGENT) ?? DEFAULT_FRONTEND_AGENT;
+}
 
 export class DaemonClient extends EventEmitter<DaemonClientEvents> {
   private ws: WebSocket | null = null;
@@ -112,9 +126,15 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
   }
 
   attachClaude() {
-    // Declare who we are: the daemon refuses a frontend from another
-    // project rather than wiring it to the wrong Codex.
-    this.send({ type: "claude_connect", projectId: process.env.AGENTBRIDGE_PROJECT_ID ?? null });
+    // Declare who we are, on both axes: the daemon refuses a frontend
+    // from another project rather than wiring it to the wrong Codex,
+    // and it keys the frontend slot by agent so a second agent running
+    // this same server does not evict the first.
+    this.send({
+      type: "claude_connect",
+      projectId: process.env.AGENTBRIDGE_PROJECT_ID ?? null,
+      agent: frontendAgentFromEnv(),
+    });
   }
 
   async attachClaudeAndWaitForStatus(timeoutMs = 1000): Promise<boolean> {

@@ -1,3 +1,4 @@
+import type { FrontendAgent } from "./frontend-registry";
 import type { BridgeMessage } from "./types";
 
 export interface DaemonStatus {
@@ -9,12 +10,23 @@ export interface DaemonStatus {
   appServerUrl: string;
   pid: number;
   /**
-   * Whether a Claude frontend currently holds the single Claude slot.
-   * The daemon has always known this; it was not reported, so `abg
-   * status` could not answer the first question anyone asks when the
-   * bridge feels stuck — is the other side actually there?
+   * Whether a Claude frontend currently holds Claude's slot. The daemon
+   * has always known this; it was not reported, so `abg status` could
+   * not answer the first question anyone asks when the bridge feels
+   * stuck — is the other side actually there?
+   *
+   * Kept as its own field rather than derived from `attachedAgents` at
+   * every call site, because "is Claude there" drives Codex-facing
+   * behavior that no other frontend shares.
    */
   claudeAttached: boolean;
+  /**
+   * Every agent identity currently holding a frontend slot.
+   *
+   * There is one slot per agent, so Claude and Grok attach at the same
+   * time instead of evicting each other (`docs/scaling-plan.md` §4.1b).
+   */
+  attachedAgents: FrontendAgent[];
   /** Claude→Codex replies deferred because Codex was mid-turn. */
   pendingReplyCount: number;
   /**
@@ -48,13 +60,19 @@ export interface ReplyOutcome {
 
 export type ControlClientMessage =
   /**
-   * `projectId` is the frontend declaring who it is, so the daemon can
-   * refuse a Claude that reached it through a port-slot collision
-   * rather than quietly wiring it to another project's Codex. Optional:
-   * a pre-0.7 frontend does not send it, and single-instance mode has
-   * nothing to send.
+   * `projectId` is the frontend declaring *which project* it belongs
+   * to, so the daemon can refuse a frontend that reached it through a
+   * port-slot collision rather than quietly wiring it to another
+   * project's Codex. Optional: a pre-0.7 frontend does not send it, and
+   * single-instance mode has nothing to send.
+   *
+   * `agent` is the frontend declaring *which agent* it is. Absent means
+   * Claude, which is what every pre-0.8 frontend sends and what the
+   * daemon assumed unconditionally before Grok turned out to attach
+   * through the same MCP surface. The message keeps its `claude_`
+   * name for wire compatibility with frontends that predate the field.
    */
-  | { type: "claude_connect"; projectId?: string | null }
+  | { type: "claude_connect"; projectId?: string | null; agent?: FrontendAgent }
   | { type: "claude_disconnect" }
   | { type: "claude_to_codex"; requestId: string; message: BridgeMessage; requireReply?: boolean }
   | { type: "status" };

@@ -1,6 +1,16 @@
 // ===== Bridge Core Types =====
 
-export type MessageSource = "claude" | "codex";
+import type { FrontendAgent } from "./frontend-registry";
+
+/**
+ * Who wrote a message.
+ *
+ * Frontends are the agents that attach to the daemon over the control
+ * socket; Codex is the one that sits behind the proxy instead. Widened
+ * past `"claude" | "codex"` when Grok turned out to attach through the
+ * same MCP surface Claude uses (`docs/scaling-plan.md` §4.1b).
+ */
+export type MessageSource = FrontendAgent | "codex";
 
 export interface BridgeMessage {
   id: string;
