@@ -603,6 +603,53 @@ Treat it as a capability to feature-detect later, not one to build on now.
 A cheap outbound-only option still exists regardless: Grok `[hooks]` firing on
 message events with `$GROK_MESSAGE` / `$GROK_SESSION_ID`.
 
+### 4.1b Grok already loads our MCP server (2026-07-31, grok 0.2.114)
+
+Found while probing Q8, and it moves the Grok design more than §4.1a does.
+Asked whether it had `reply` / `get_messages`, Grok in this repo answered that
+**"the AgentBridge MCP server failed to connect (handshake / broken pipe)"** —
+it was not reasoning about our tools from the instruction files, it had *tried
+to launch them*. `grok inspect` shows why: Grok reads Claude Code's plugin
+registry, and lists `agentbridge (user, enabled) — hooks, 1 MCPs` among the
+plugins it loads. `grok mcp list` says "No MCP servers configured", so this
+arrives entirely through the Claude plugin surface, not Grok's own config.
+
+The handshake failed for a reason we put there: `bridge.ts` exits silently
+unless `AGENTBRIDGE_ACTIVE=1`, the gate that stops a stray `claude` from taking
+the daemon's Claude slot. Grok is launched outside `abg`, so it never inherits
+it. Re-run with the variable set, in a scratch project:
+
+- Grok's tool search resolved **`agentbridge__get_messages`** — the MCP
+  handshake completed and our tools are addressable by name.
+- The daemon log shows the full chain: `ClaudeAdapter created` →
+  `MCP server connected (mode: push)` → `ensuring AgentBridge daemon` →
+  **`Claude frontend attached (#2)`**.
+
+So the outbound half of a Grok integration — Grok sending into the bus — needs
+no adapter at all. It needs an env var and an identity.
+
+**The blocker is the identity, not the transport.** Grok attaches *as Claude*:
+`attachedClaude` in `src/daemon.ts` is one slot, and a second frontend is
+rejected with `another Claude session is already connected` unless the incumbent
+fails a liveness probe (asserted in `src/unit-test/daemon-client.test.ts`). Run
+Claude and Grok together today and they fight over that slot. A third agent on
+the MCP path therefore needs the daemon to key frontends by agent identity
+rather than by the single Claude slot — a real change to `daemon.ts` and
+`control-protocol.ts`, and the thing to design before writing any Grok code.
+
+**Which leaves two paths, and they are complementary rather than rival:**
+
+| Direction | Mechanism | State |
+|---|---|---|
+| Grok → bus | our own MCP server, via the Claude plugin registry | works today with `AGENTBRIDGE_ACTIVE=1`; blocked only by the single Claude slot |
+| bus → Grok | leader socket `session/prompt` (§4.1a) | verified, queues at the turn boundary, needs `[cli] use_leader = true` |
+
+MCP cannot carry the inbound direction — it has no server-push wake-up (see the
+standards note below), and the Channels notification Claude receives is
+Claude-specific. So the leader work in §4.1a is not made redundant by this
+finding; it becomes the inbound half of a two-mechanism design where the
+outbound half is nearly free.
+
 **Standards landscape:**
 
 - **ACP has won** for terminal coding agents. SDKs in TS/Rust/Python/Go/Kotlin;
@@ -634,7 +681,7 @@ message events with `$GROK_MESSAGE` / `$GROK_SESSION_ID`.
 | CLI | Reality |
 |---|---|
 | opencode | Strongest — TUI *is* a client of a server. `--port`, `/tui/append-prompt`, `/tui/submit-prompt`, `GET /event` SSE, OpenAPI at `/doc`, `OPENCODE_SERVER_PASSWORD` |
-| Grok Build | **Verified 2026-07-30** — inject into a live TUI's session over the leader socket, with fan-out to every client (§4.1a). Needs `[cli] use_leader = true` |
+| Grok Build | **Verified** — inbound: inject into a live TUI's session over the leader socket, fan-out to every client, queued at the turn boundary (§4.1a); needs `[cli] use_leader = true`. Outbound: Grok already loads our MCP server via the Claude plugin registry and needs only `AGENTBRIDGE_ACTIVE=1` plus a daemon frontend slot of its own (§4.1b) |
 | Codex | `tui_app_server` — what we already have |
 | Qwen Code | `qwen serve` exists, but TUI co-hosting is "Stage 1.5", unshipped |
 | Copilot CLI | `copilot --acp --port <N>` — real listener, but spawn-your-own, not attach; auth undocumented |

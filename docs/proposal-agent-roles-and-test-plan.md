@@ -496,15 +496,33 @@ effective runtime capability happens **at launch**, not init (§3).
 - **Q7.** Does the rendered envelope declare "a session-scoped role may specialize
   this"? Required for §1's future override; costs a sentence in every envelope for
   a feature that does not exist yet.
-- **Q8 (new, opened by Q6's answer).** Grok reads Claude's *and* Codex's
-  instruction files, so in an AgentBridge project it inherits both role blocks
-  and is told it is two different agents. Options: (a) write Grok's role only to
-  `.grok/rules/agentbridge.md` and accept that the `CLAUDE.md` / `AGENTS.md`
-  blocks still leak in; (b) frame every rendered block by addressee ("If you are
-  Claude Code, you are the Executor…") so a third reader can discard what is not
-  addressed to it; (c) both. (b) costs tokens in every envelope for every agent,
-  including the two-agent case that does not need it. Unresolved — decide before
-  writing a Grok role.
+Closed: **Q8** — **option (a)**: write Grok's role only to
+`.grok/rules/agentbridge.md` and let the `CLAUDE.md` / `AGENTS.md` blocks leak
+in. The question assumed a third reader would be confused by inheriting two
+role blocks addressed to other agents. Tested against grok 0.2.114 in this
+repo, which carries both:
+
+- *"What is your identity and which role applies to you?"* → **"Grok 4.5 (xAI)
+  … AgentBridge assigns Claude = Executor and Codex = Advisor/Reviewer. Those
+  map to Claude Code / Codex sessions, not to me. As Grok I am neither."**
+- *"Do you have the MCP tools `reply` and `get_messages` right now?"* → **"No"**,
+  with the reason, and an explicit refusal to call them. No hallucinated
+  capability, which was the failure mode actually worth fearing.
+
+The leak is legible, not confusing, because the default role text already names
+its addressee inline ("You (Claude) are the Executor") — a weak form of option
+(b) we get for free. So (b)'s per-envelope token cost buys nothing measurable,
+and (c) inherits that cost. Revisit only if a future role text drops the inline
+addressee, or if a fourth agent reads the same files and does worse.
+
+The second probe found something larger than Q8 itself: Grok was not reasoning
+about `reply` / `get_messages` from the instruction files, it had **tried to
+launch our MCP server** and failed the handshake. Grok loads Claude Code's
+plugin registry, AgentBridge is in it, and with `AGENTBRIDGE_ACTIVE=1` the whole
+chain completes and Grok addresses `agentbridge__get_messages` by name — but it
+attaches as *the Claude frontend*, into a single slot. Recorded in
+`docs/scaling-plan.md` §4.1b; it is the design fork to settle before any Grok
+adapter work, and it is about identity in `daemon.ts`, not about transport.
 
 Closed: **Q5** — roles are **init-time only**; a mid-session edit does nothing
 until restart, and making it live would need per-message injection. The CLI must
@@ -674,7 +692,7 @@ Staged:
 | **2** | Full-mode `require_reply` bug — marker identity vs routing | **Open**, verified, [#2](https://github.com/ngna3007/agent-bridge/pull/2) |
 | **3** | `MARKER_SPEC` (§2 three layers) | Next. Self-contained: runtime + renderers, no new user surface |
 | **4** | `roles.md`, presets, custom prose, Markdown renderers, migration (§6), coordinator (§4) | The role feature proper |
-| **later** | Non-Markdown target adapters; launch capability diagnostics (§3) | Deferred. Q6 is now answered — Grok needs no new format, only a placement decision (Q8) |
+| **later** | Non-Markdown target adapters; launch capability diagnostics (§3) | Deferred. Q6 and Q8 are both answered — Grok needs no new format and no new placement; its role goes to `.grok/rules/agentbridge.md` |
 
 v4 listed the bug fix and the `MARKER_SPEC` refactor as one PR. Split, per
 round-5 Q1: the fix is 4 files and reviewable in one sitting, and landing it
@@ -722,8 +740,15 @@ Rounds 1–4 findings all accepted; §§1–11 are the rewrite. Round 5 asks:
    slip through as prose?
 6. **Fresh eyes.** Ignoring all framing: what is still the wrong shape?
 
-Known open, do not re-derive: Q4, Q7, Q8 (§10); `docs/manual-test-plan.md` still
-unreconciled with Part B. Q6 is closed — Grok reads `CLAUDE.md` *and* `AGENTS.md`,
-which answers the format question and opens Q8 (a third agent inheriting both
-role blocks). The full-mode `require_reply` bug is no longer open —
-fixed in [#2](https://github.com/ngna3007/agent-bridge/pull/2).
+Known open, do not re-derive: Q4, Q7 (§10); `docs/manual-test-plan.md` still
+unreconciled with Part B. Q6 and Q8 are both closed — Grok reads `CLAUDE.md`
+*and* `AGENTS.md`, needs no new format, and measurably does **not** mistake the
+inherited role blocks for its own, so its role goes to
+`.grok/rules/agentbridge.md` and nothing else changes. The full-mode
+`require_reply` bug is no longer open — fixed in
+[#2](https://github.com/ngna3007/agent-bridge/pull/2).
+
+What replaced Q8 as the open Grok question is not about roles at all: Grok
+already loads our MCP server through Claude Code's plugin registry and attaches
+as *the Claude frontend*, so the daemon's single `attachedClaude` slot — not the
+transport — is what a third agent blocks on. `docs/scaling-plan.md` §4.1b.
