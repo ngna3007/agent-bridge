@@ -109,6 +109,7 @@ class CliE2EHarness {
     );
     writeExecutable(join(binDir, "claude"), buildShimScript("claude"));
     writeExecutable(join(binDir, "codex"), buildShimScript("codex"));
+    writeExecutable(join(binDir, "grok"), buildShimScript("grok"));
 
     const configProxyPort = options.configProxyPort ?? 45991;
     mkdirSync(join(projectDir, ".agentbridge"), { recursive: true });
@@ -246,7 +247,9 @@ class CliE2EHarness {
     );
   }
 
-  readShimCalls(command: "claude" | "codex"): Array<{ args: string[]; cwd: string }> {
+  readShimCalls(
+    command: ShimCommand,
+  ): Array<{ args: string[]; cwd: string; env: { active: string | null; agent: string | null } }> {
     const logPath = join(this.shimLogDir, `${command}.jsonl`);
     return readJsonLines(logPath);
   }
@@ -417,6 +420,51 @@ describe("E2E: CLI surface", () => {
 
       expect(result.code).toBe(0);
       expect(existsSync(join(harness.stateDir, "killed"))).toBe(false);
+    });
+  });
+
+  test("agentbridge grok hands Grok its own identity", async () => {
+    // Grok loads our MCP server through Claude Code's plugin registry
+    // without any help from us, so the launcher's entire contribution is
+    // these two variables and the arguments passing through untouched.
+    // AGENTBRIDGE_AGENT is what keeps Grok out of Claude's slot; without
+    // it the two evict each other, since Claude is what every frontend
+    // was before 0.8.
+    await withHarness(async (harness) => {
+      const result = await harness.runCli(["grok", "--model", "grok-code"]);
+
+      expect(result.code).toBe(0);
+
+      const invocations = harness.readShimCalls("grok");
+      expect(invocations.length).toBe(1);
+      expect(invocations[0]?.args).toEqual(["--model", "grok-code"]);
+      expect(invocations[0]?.env).toEqual({ active: "1", agent: "grok" });
+    });
+  });
+
+  test("agentbridge grok clears the killed sentinel before launching", async () => {
+    await withHarness(async (harness) => {
+      writeFileSync(join(harness.stateDir, "killed"), `${Date.now()}\n`, "utf-8");
+
+      const result = await harness.runCli(["grok"]);
+
+      expect(result.code).toBe(0);
+      expect(existsSync(join(harness.stateDir, "killed"))).toBe(false);
+    });
+  });
+
+  test("agentbridge claude does not declare an agent, so it stays Claude", async () => {
+    // The compatibility contract: every frontend that predates per-agent
+    // slots sends no `agent` at all and has to keep landing in Claude's.
+    // The launcher must not start setting it "for symmetry".
+    await withHarness(async (harness) => {
+      const result = await harness.runCli(["claude"]);
+
+      expect(result.code).toBe(0);
+      const launch = harness
+        .readShimCalls("claude")
+        .filter((entry) => entry.args[0] !== "--version" && entry.args[0] !== "plugin");
+      expect(launch[0]?.env).toEqual({ active: "1", agent: null });
     });
   });
 
@@ -786,8 +834,16 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
-function buildShimScript(commandName: "claude" | "codex"): string {
-  const versionOutput = commandName === "claude" ? "claude v2.1.80" : "codex 0.1.0";
+type ShimCommand = "claude" | "codex" | "grok";
+
+const SHIM_VERSION_OUTPUT: Record<ShimCommand, string> = {
+  claude: "claude v2.1.80",
+  codex: "codex 0.1.0",
+  grok: "grok 0.2.114",
+};
+
+function buildShimScript(commandName: ShimCommand): string {
+  const versionOutput = SHIM_VERSION_OUTPUT[commandName];
   return `#!/usr/bin/env bun
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -804,7 +860,16 @@ mkdirSync(dirname(logPath), { recursive: true });
 const args = process.argv.slice(2);
 appendFileSync(
   logPath,
-  JSON.stringify({ args, cwd: process.cwd() }) + "\\n",
+  JSON.stringify({
+    args,
+    cwd: process.cwd(),
+    // The launcher's whole job is handing the agent these two. They
+    // are what tells bridge.ts to attach at all, and which slot to take.
+    env: {
+      active: process.env.AGENTBRIDGE_ACTIVE ?? null,
+      agent: process.env.AGENTBRIDGE_AGENT ?? null,
+    },
+  }) + "\\n",
   "utf-8",
 );
 

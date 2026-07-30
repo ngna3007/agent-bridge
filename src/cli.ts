@@ -8,6 +8,7 @@
  *   agentbridge dev         — Register local marketplace + install plugin for local dev
  *   agentbridge claude      — Start Claude Code with push channel flags
  *   agentbridge codex       — Start Codex TUI connected to daemon
+ *   agentbridge grok        — Start Grok Build attached to the bridge
  *   agentbridge kill        — Force kill all AgentBridge processes
  *   agentbridge status      — Project, daemon, and live attach state
  *   agentbridge log         — Tail the bridge's message-flow log
@@ -40,9 +41,9 @@ function maybeApplyProjectNamespace(cmd: string | undefined, justCreatedProject 
   // status / doctor / projects / log are read-only diagnostics; they
   // call resolveRuntimeNamespace themselves with mutateEnv:false to
   // read the right state dir without affecting downstream code.
-  // claude / codex / kill all spawn or talk to the daemon, so they
-  // need the per-project env vars applied here.
-  const namespaced = new Set(["claude", "codex", "kill"]);
+  // claude / codex / grok / kill all spawn or talk to the daemon, so
+  // they need the per-project env vars applied here.
+  const namespaced = new Set(["claude", "codex", "grok", "kill"]);
   if (!namespaced.has(cmd)) return;
 
   const ns = resolveRuntimeNamespace({ mutateEnv: true });
@@ -109,6 +110,10 @@ async function main() {
       const { runCodex } = await import("./cli/codex");
       await runCodex(restArgs);
       break;
+    case "grok":
+      const { runGrok } = await import("./cli/grok");
+      await runGrok(restArgs);
+      break;
     case "kill":
       const { runKill } = await import("./cli/kill");
       await runKill(restArgs);
@@ -168,6 +173,8 @@ Commands:
   dev               Register local marketplace + install plugin (for local dev)
   claude [args...]  Start Claude Code with push channel enabled
   codex [args...]   Start Codex TUI connected to AgentBridge daemon
+  grok [args...]    Start Grok Build attached to the bridge (sends and reads;
+                    waking a live Grok TUI is not wired yet)
   kill [--all]      Stop daemon + managed Codex TUI for the current project
                     (or every project when --all is passed)
   roles [sub]       Show or edit what each agent is told it is
@@ -205,6 +212,7 @@ Examples:
   abg claude --resume          # ... and resume the last session
   abg codex                    # Start Codex TUI
   abg codex --model o3         # ... with a specific model
+  abg grok                     # Start Grok Build on this project's bus
   abg roles                    # See what each agent is told it is
   abg roles edit codex         # Rewrite Codex's role in \$EDITOR
   abg status                   # See which project + daemon is active here

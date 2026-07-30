@@ -36,7 +36,7 @@ describe("decideSetupOffer", () => {
     }
   });
 
-  test.each(["claude", "codex"])("offers for `%s`", (command) => {
+  test.each(["claude", "codex", "grok"])("offers for `%s`", (command) => {
     expect(decideSetupOffer(ctx({ command })).offer).toBe(true);
   });
 
