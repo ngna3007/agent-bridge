@@ -28,6 +28,7 @@
     "test:live:outbox": "bun run src/live-test/tier2-outbox-e2e.ts",
     "test:live:collision": "bun run src/live-test/tier2-slot-collision.ts",
     "test:live:doctor": "bun run src/live-test/tier2-doctor-fix.ts",
+    "test:live:grok": "bun run src/live-test/tier2e-grok-attach.ts",
     "test:live:roles": "bash src/live-test/tier3-roles.sh",
     "typecheck": "tsc --noEmit",
     "validate:plugin-versions": "bun scripts/check-plugin-versions.js",

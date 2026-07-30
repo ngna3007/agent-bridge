@@ -41,6 +41,7 @@ handshake traffic went past.
 | 2b | Reply outbox under a real held turn | yes | `bun run test:live:outbox` | ~1 min, no tokens |
 | 2c | A real port-slot collision between two projects | yes | `bun run test:live:collision` | ~1 min, no tokens |
 | 2d | `abg doctor --fix` against real drift | yes | `bun run test:live:doctor` | ~1 min, no tokens |
+| 2e | Grok's leader lets a second client into a session it does not own | yes | `bun run test:live:grok` | ~1 min + tokens |
 | 3 | Role files change real agent behavior | yes | `bun run test:live:roles` | minutes + tokens |
 | 4 | Terminal-only — TUI rendering, keys, resume, restore | no | `docs/manual-test-plan.md` | manual |
 
@@ -198,6 +199,23 @@ stale lock versus a fresh one, reaping an orphaned `bridge-server`
 correct behavior is to do nothing. Most recent run: **23 passed, 0
 failed**.
 
+**2e — Grok leader attach** (`tier2e-grok-attach.ts`). The only tier
+that tests something AgentBridge does not ship yet: whether Grok Build
+can host the same trick the Codex adapter relies on — a second client
+injecting a turn into a session a human already owns. `scaling-plan.md`
+assumed it could not, and gated the whole Grok target on the assumption.
+Two `grok agent --leader stdio` clients share a leader; B prompts A's
+session with no `session/load` and both watch what arrives. The
+load-bearing assertion is that **A still receives the stream for a turn
+it did not start** — if only B saw it, attaching would blank the human's
+screen. Also pins `x.ai/sessions/list` and `x.ai/session/interjection` as
+absent from the ACP surface, so no adapter gets written against methods
+that only exist in the binary's strings. Runs in an isolated `GROK_HOME`
+with `[cli] use_leader = true`, so the user's own Grok config is never
+touched; skips cleanly when `~/.grok/auth.json` is missing. Spends a
+small number of real xAI tokens. Most recent run: **12 passed, 0
+failed** (grok 0.2.114). Background in `docs/scaling-plan.md` §4.1a.
+
 ## Tier 3 — role files change real agent behavior
 
 `src/live-test/tier3-roles.sh`, via `bun run test:live:roles`.
@@ -259,6 +277,7 @@ bun run test:live:bridge    # Tier 2   (minutes, real tokens)
 bun run test:live:outbox    # Tier 2b  (~1 min, no tokens)
 bun run test:live:collision # Tier 2c  (~1 min, no tokens)
 bun run test:live:doctor    # Tier 2d  (~1 min, no tokens)
+bun run test:live:grok      # Tier 2e  (~1 min, real tokens, needs `grok login`)
 bun run test:live:roles     # Tier 3   (minutes, real tokens)
 ```
 
