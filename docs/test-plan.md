@@ -42,6 +42,7 @@ handshake traffic went past.
 | 2c | A real port-slot collision between two projects | yes | `bun run test:live:collision` | ~1 min, no tokens |
 | 2d | `abg doctor --fix` against real drift | yes | `bun run test:live:doctor` | ~1 min, no tokens |
 | 2e | Grok's leader lets a second client into a session it does not own | yes | `bun run test:live:grok` | ~1 min + tokens |
+| 2g | What a non-Claude frontend actually receives from the bus | yes | `bun run test:live:grok-inbound` | ~1 min, no tokens |
 | 3 | Role files change real agent behavior | yes | `bun run test:live:roles` | minutes + tokens |
 | 4 | Terminal-only — TUI rendering, keys, resume, restore | no | `docs/manual-test-plan.md` | manual |
 
@@ -222,6 +223,31 @@ user's own Grok config is never touched; skips cleanly when
 tokens. Most recent run: **17 passed, 0 failed** (grok 0.2.114).
 Background in `docs/scaling-plan.md` §4.1a.
 
+**2g — inbound delivery to a non-Claude frontend**
+(`tier2g-grok-inbound.ts`). Per-agent slots let a second agent attach and
+send into the bus. This tier asks whether the bus can reach it back.
+Two frontends attach to one daemon — one declaring `claude`, one
+declaring `grok` — and Codex emits one `[REPLY]` and one untagged
+message. The untagged one reaches both through `get_messages`. The
+`[REPLY]` leaves as `notifications/claude/channel` and is **not** also
+queued, because `pushViaChannel` falls back to the queue only when the
+send *throws*, and an MCP client that ignores an unknown notification is
+not an error. So a frontend that does not implement Claude Code's
+channel extension loses every `[REPLY]` permanently — the marker the
+role files tell Codex to use for direct answers. The last assertion is a
+characterization test: it pins today's behavior so that changing it in
+either direction makes someone look.
+
+Deliberately does not drive a real `grok`. That version could not
+distinguish a Grok that ignores the notification from a Grok that never
+ran — both produce empty output — and it needs xAI balance to say
+anything at all. The claim is about a delivery path, and `grok` reaches
+that path by spawning `src/bridge.ts` and speaking MCP to it, so an MCP
+client of our own exercises the identical production code with no model
+in the loop. Codex is the fake app-server, on PATH via
+`fake-codex-bin/`. Free, deterministic, spends nothing. Most recent
+run: **7 passed, 0 failed**.
+
 ## Tier 3 — role files change real agent behavior
 
 `src/live-test/tier3-roles.sh`, via `bun run test:live:roles`.
@@ -284,6 +310,7 @@ bun run test:live:outbox    # Tier 2b  (~1 min, no tokens)
 bun run test:live:collision # Tier 2c  (~1 min, no tokens)
 bun run test:live:doctor    # Tier 2d  (~1 min, no tokens)
 bun run test:live:grok      # Tier 2e  (~1 min, real tokens, needs `grok login`)
+bun run test:live:grok-inbound # Tier 2g (~1 min, no tokens)
 bun run test:live:roles     # Tier 3   (minutes, real tokens)
 ```
 
