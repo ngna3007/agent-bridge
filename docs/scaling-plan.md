@@ -115,7 +115,7 @@ Claude→Codex is the mirror: `reply` tool → control WS `claude_to_codex` →
 
 `daemon.ts:414-504`. Only one Claude frontend may hold the slot. On contest:
 
-1. If a probe is already in flight → reject new with **4003** `PROBE_IN_PROGRESS`.
+1. If a probe is already in flight → reject new with **4004** `PROBE_IN_PROGRESS`.
 2. Otherwise ping the incumbent, wait `LIVENESS_PROBE_TIMEOUT_MS` (3000).
 3. Incumbent answers → reject contestant with **4001** `REPLACED`.
 4. Incumbent silent → evict it with **4002** `EVICTED_STALE`, accept contestant.
@@ -429,7 +429,7 @@ get an explicit version-mismatch close code.
 ### P3 — Registry and multi-slot daemon (2–3 weeks)
 
 - `attachedClaude: ServerWebSocket | null` becomes
-  `agents: Map<AgentId, AgentConnection>`. The 4001/4002/4003 admission protocol
+  `agents: Map<AgentId, AgentConnection>`. The 4001/4002/4004 admission protocol
   is retained but re-scoped: it now enforces *one connection per agentId*, not
   *one Claude per machine*.
 - Extract the module-level singletons (B7) into a `Session` / `BridgeState`

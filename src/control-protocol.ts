@@ -163,6 +163,17 @@ export const CLOSE_CODE_PROJECT_MISMATCH = 4003;
  * WebSocket close code sent by the daemon when a contestant arrives while a
  * liveness probe is already in flight against the incumbent. Distinct from
  * CLOSE_CODE_REPLACED so the contestant's UI can suggest retrying shortly
- * (the in-flight probe will conclude within LIVENESS_PROBE_TIMEOUT_MS).
+ * (the in-flight probe will conclude within LIVENESS_PROBE_TIMEOUT_MS), and
+ * distinct from CLOSE_CODE_PROJECT_MISMATCH because the two want opposite
+ * recoveries: a probe collision auto-reconnects, a project mismatch is
+ * terminal until the port collision is resolved.
  */
-export const CLOSE_CODE_PROBE_IN_PROGRESS = 4003;
+export const CLOSE_CODE_PROBE_IN_PROGRESS = 4004;
+
+/**
+ * WebSocket close code sent by the daemon when a frontend declares an agent
+ * identity the daemon does not know. The project matched, so this is not
+ * CLOSE_CODE_PROJECT_MISMATCH — it is a frontend built against a newer (or
+ * misspelled) agent list, and no `abg doctor --fix` will help.
+ */
+export const CLOSE_CODE_UNKNOWN_AGENT = 4005;

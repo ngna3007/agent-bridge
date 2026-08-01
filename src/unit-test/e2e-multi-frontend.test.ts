@@ -2,7 +2,11 @@ import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { spawn, type ChildProcess } from "node:child_process";
 import { mkdirSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { CLOSE_CODE_REPLACED, CLOSE_CODE_PROJECT_MISMATCH } from "../control-protocol";
+import {
+  CLOSE_CODE_REPLACED,
+  CLOSE_CODE_PROJECT_MISMATCH,
+  CLOSE_CODE_UNKNOWN_AGENT,
+} from "../control-protocol";
 import type { DaemonStatus } from "../control-protocol";
 
 /**
@@ -232,7 +236,23 @@ describe("E2E: one frontend slot per agent", () => {
     const stranger = await openFrontend();
     attach(stranger, "codex");
 
-    expect(await closeCodeWithin(stranger, 2000)).toBe(CLOSE_CODE_PROJECT_MISMATCH);
+    expect(await closeCodeWithin(stranger, 2000)).toBe(CLOSE_CODE_UNKNOWN_AGENT);
+    expect((await status()).attachedAgents).toEqual([]);
+  }, TEST_TIMEOUT_MS);
+
+  test("a foreign project is refused with a code distinct from the unknown-agent one", async () => {
+    // The two refusals want opposite recoveries — a port collision is fixed by
+    // `abg doctor --fix`, an unrecognized agent by restarting the daemon — so
+    // the frontend can only tell the user which one it is if the codes differ.
+    // Asserting the values apart is what stops them silently collapsing again.
+    expect(CLOSE_CODE_PROJECT_MISMATCH).not.toBe(CLOSE_CODE_UNKNOWN_AGENT);
+
+    const foreign = await openFrontend();
+    foreign.ws.send(
+      JSON.stringify({ type: "claude_connect", projectId: "deadbeef", agent: "claude" }),
+    );
+
+    expect(await closeCodeWithin(foreign, 2000)).toBe(CLOSE_CODE_PROJECT_MISMATCH);
     expect((await status()).attachedAgents).toEqual([]);
   }, TEST_TIMEOUT_MS);
 });

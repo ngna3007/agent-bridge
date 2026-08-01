@@ -47,6 +47,8 @@ export const LIFECYCLE_TAGS: Record<string, string> = {
   system_bridge_evicted:                wrap(C_RED,    "[REPLACED BY NEWER SESSION]"),
   system_bridge_probe_in_progress:      wrap(C_YELLOW, "[RECONNECTING]"),
   system_bridge_replaced:               wrap(C_RED,    "[ANOTHER SESSION ACTIVE]"),
+  system_bridge_project_mismatch:       wrap(C_RED,    "[PORT COLLISION]"),
+  system_bridge_unknown_agent:          wrap(C_RED,    "[UNKNOWN AGENT]"),
   system_bridge_disabled:               BRIDGE_STOPPED_TAG,
   system_bridge_auto_recovery_gave_up:  wrap(C_RED,    "[RECONNECT FAILED]"),
   system_bridge_recovered:              wrap(C_GREEN,  "[CODEX READY]"),

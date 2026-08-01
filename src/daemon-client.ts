@@ -7,6 +7,8 @@ import {
   CLOSE_CODE_REPLACED,
   CLOSE_CODE_EVICTED_STALE,
   CLOSE_CODE_PROBE_IN_PROGRESS,
+  CLOSE_CODE_PROJECT_MISMATCH,
+  CLOSE_CODE_UNKNOWN_AGENT,
 } from "./control-protocol";
 import type {
   ClaudeDeliveryHint,
@@ -390,7 +392,9 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
         if (
           event.code === CLOSE_CODE_REPLACED ||
           event.code === CLOSE_CODE_EVICTED_STALE ||
-          event.code === CLOSE_CODE_PROBE_IN_PROGRESS
+          event.code === CLOSE_CODE_PROBE_IN_PROGRESS ||
+          event.code === CLOSE_CODE_PROJECT_MISMATCH ||
+          event.code === CLOSE_CODE_UNKNOWN_AGENT
         ) {
           this.emit("rejected", event.code);
         } else {
