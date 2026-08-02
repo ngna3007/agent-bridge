@@ -1,7 +1,7 @@
 # Agent communication lifecycle — design
 
 **Date:** 2026-08-02
-**Status:** proposed — revision 3, incorporating two rounds of review
+**Status:** proposed — revision 4, incorporating three rounds of review
 **Supersedes:** the routing half of `docs/scaling-plan.md` §P2
 
 ---
@@ -99,9 +99,15 @@ Consequences:
 ### Honest scope of "authoritative"
 
 Mailboxes are **in-memory and daemon-lifetime**. A daemon restart loses them.
-Revision 1 called this durable; that was wrong. What the model actually
-guarantees is: *no message is lost while the daemon lives, and no loss is ever
-silent.* Disk persistence is out of scope (§12) — the overflow contract in §8
+Revision 1 called this durable; that was wrong. So was "no message is lost" —
+§8 deliberately sheds `fyi` and `untagged` under pressure. What the model
+actually guarantees is:
+
+> *No accepted `reply` is ever silently lost while the daemon lives, and all
+> shedding is visible — to the sender at send time, or to the recipient as a
+> gap marker on drain.*
+
+Disk persistence is out of scope (§13) — the overflow contract in §8
 makes loss visible at send time instead, which solves the failure this document
 exists to fix without adding a storage format to migrate.
 
@@ -279,14 +285,31 @@ So the daemon keeps a separate, small, append-only index:
 messageIndex: Map<string, { from: Origin; recipients: AgentId[]; at: number }>
 ```
 
-- Written at ingress (§7 step 0), independent of mailbox lifetime.
-- Bounded by TTL and count; entries outlive the message, not the daemon.
-- **Authorization:** `inReplyTo` resolves only if the replier was one of that
-  message's `recipients`. Otherwise the reply is rejected. Without this check,
-  any agent could route to any other by guessing an id.
+**Write ordering.** The `id` is assigned at step 0, but `recipients` cannot be
+known then — routing happens at step 1 and per-recipient acceptance at step 2
+(§8 lets a broadcast be accepted by one mailbox and rejected by another). So the
+index entry is written **atomically after the enqueue decisions and before any
+wake-up**, containing only the recipients that actually accepted. If no
+recipient accepted, no entry is written — there is nothing to reply to.
+
+Other rules:
+
+- Independent of mailbox lifetime; entries outlive the message, not the daemon.
+- **Authorization:** `inReplyTo` resolves only if the replier is one of that
+  entry's accepted `recipients`. Otherwise the reply is rejected. Without this
+  check, any agent could route to any other by guessing an id.
+- An entry whose `from` is `"system"` is **not a valid `inReplyTo` target.** The
+  resolver returns an `AgentId`, not an `Origin`; system notices are not turns
+  in a conversation (§6) and cannot be replied to.
 - An `inReplyTo` naming an expired or unknown id is a **parse failure**, not a
   fallthrough to broadcast — same rule, same reason, as an unknown `@name`
   (§4).
+- **Retention outlives every reference to it.** The TTL must exceed the mailbox
+  lease, the lifetime of an active turn, and any pending `requireReply`
+  correlation (§14). An entry that is still referenced is pinned and is never
+  evicted merely because the count cap was reached — the cap sheds unpinned
+  entries, or it fails loudly. Evicting a referenced entry would turn a valid
+  reply into a parse failure, which is silent loss wearing a different hat.
 
 ---
 
@@ -441,10 +464,29 @@ carries the text, and in the common case the model reads it and acts on it with
 no round-trip. What changes is that **the push does not consume the mailbox
 entry**. Only an `ack` from §5.1 does.
 
-The consequence is honest and bounded: when the channel works, the entry is
-acked on the session's next drain and nothing is seen twice; when the channel is
-silently gated, the message is still in the mailbox and `get_messages` returns
-it. Loss becomes duplication. That is the trade this document exists to make.
+Be precise about what that costs, because an earlier draft of this paragraph
+overstated it. With `acknowledgementMode: "none"` **there is no actor that can
+acknowledge a successful inline delivery** — the channel exposes no correlated
+receipt, so the daemon cannot distinguish "the model read it" from "the gate ate
+it". The message therefore stays in the mailbox and **a working push may be
+seen a second time on the next drain.**
+
+The full contract:
+
+1. A push never consumes.
+2. A *working* push may duplicate once, on the next drain.
+3. A drain `ack` (§5.1) prevents every subsequent redelivery.
+4. The canonical `BridgeMessage.id` appears **identically** in the channel
+   metadata and in the drained payload, so the consumer can recognise the
+   duplicate as one it has already seen.
+
+Rule 4 is what makes rule 2 tolerable, and it is a hard requirement on the push
+format rather than a nicety. Loss becomes at-most-one duplicate. That is the
+trade this document exists to make.
+
+When the channel is silently gated, the same mechanism means the message is
+simply still in the mailbox and `get_messages` returns it — the original bug,
+gone.
 
 `{ payloadMode: "signal", acknowledgementMode: "none" }` is the default for an
 unrecognised host — a bare wake-up, no content on a channel that may not
@@ -655,8 +697,11 @@ almost for free, which is part of why §6 chose causal routing.
 | e2e | frontend→Codex goes through the ledger; `deliverToCodex` is reachable only as a step-3 transport |
 | e2e | a wake-up that throws still leaves the message drainable |
 | e2e | **the `tengu_harbor` case**: a content push that returns success while the model receives nothing → the message is still drainable, and arrives exactly once |
-| e2e | a content push that *is* delivered, then acked on the next drain → the message is not seen twice |
+| e2e | a content push that *is* delivered may appear once more on the next drain, carrying the **same** `id` as the push metadata; after the ack it never reappears |
 | e2e | the provenance index outlives the acked message: a reply arriving after the original was drained still routes to its sender |
+| unit | the index entry is written after acceptance and lists only accepting recipients; a broadcast rejected by every mailbox writes no entry |
+| unit | a pinned index entry (live lease, active turn, pending `requireReply`) is not evicted by the count cap |
+| security | `inReplyTo` naming a `from: "system"` entry is rejected |
 | e2e | concurrent Claude and Grok turns against Codex: each reply routes to its own requester |
 | e2e | `requireReply` is not satisfied by a reply addressed elsewhere |
 | e2e | daemon restart: mailboxes are empty and the loss is reported, not silent |
@@ -666,7 +711,19 @@ That last row is the acceptance criterion for the whole document.
 
 ---
 
-## Appendix A: review response (revision 2 → 3)
+## Appendix A: review response (revision 3 → 4)
+
+| Finding | Disposition |
+|---|---|
+| §7 claimed a delivered push is acked on the next drain and never seen twice — impossible under `acknowledgementMode: "none"` | **Accepted.** No actor can acknowledge an inline delivery. §7 now states the real contract: push never consumes, a working push may duplicate exactly once on the next drain, ack stops all further redelivery, and the canonical `id` must appear identically in channel metadata and drained payload so the consumer can dedupe. |
+| §5.2 wrote `recipients` at step 0, before routing (step 1) or acceptance (step 2) | **Accepted.** Id at step 0; the index entry is written atomically after enqueue decisions and before any wake-up, listing only accepting recipients. No acceptance → no entry. |
+| `inReplyTo` could target a `system` entry | **Accepted.** The resolver returns `AgentId`, not `Origin`; system entries are not reply targets. |
+| Index retention could evict a referenced entry | **Accepted.** TTL exceeds lease, active turn, and pending `requireReply`; referenced entries are pinned and the cap sheds only unpinned ones. |
+| §2 claimed no message is lost, while §8 sheds `fyi`/`untagged` | **Accepted.** Restated: no accepted `reply` silently lost, all shedding visible. |
+
+---
+
+## Appendix B: review response (revision 2 → 3)
 
 | Finding | Disposition |
 |---|---|
@@ -682,7 +739,7 @@ not contested.
 
 ---
 
-## Appendix B: review response (revision 1 → 2)
+## Appendix C: review response (revision 1 → 2)
 
 | # | Finding | Disposition |
 |---|---|---|
