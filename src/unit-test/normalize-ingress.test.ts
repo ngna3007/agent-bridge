@@ -60,6 +60,68 @@ describe("normalizeIngress", () => {
       normalizeIngress({ to: "grrok", kind: "reply", content: "x" }, current, ctx),
     ).toThrow(IngressError);
   });
+
+  test("promotes the marker's address when structured `to` is absent", () => {
+    const m = normalizeIngress({ kind: "reply", content: "[REPLY @codex] secret" }, current, ctx);
+    expect(m.to).toBe("codex");
+    expect(m.content).toBe("secret");
+  });
+
+  test("still throws when structured `to` and the marker address disagree", () => {
+    expect(() =>
+      normalizeIngress({ to: "grok", kind: "reply", content: "[REPLY @codex] x" }, current, ctx),
+    ).toThrow(IngressError);
+  });
+
+  test("returns the shared address when structured `to` and the marker agree", () => {
+    const m = normalizeIngress({ to: "grok", kind: "reply", content: "[REPLY @grok] x" }, current, ctx);
+    expect(m.to).toBe("grok");
+  });
+
+  test("adopts the marker's kind for a legacy payload with no `kind` field", () => {
+    const m = normalizeIngress(
+      { source: "claude", content: "[REPLY @codex] hi" },
+      legacy,
+      ctx,
+    );
+    expect(m.kind).toBe("reply");
+    expect(m.to).toBe("codex");
+    expect(m.content).toBe("hi");
+  });
+
+  test("still throws when a present `kind` disagrees with the marker", () => {
+    expect(() =>
+      normalizeIngress({ kind: "status", content: "[REPLY @codex] x" }, current, ctx),
+    ).toThrow(IngressError);
+  });
+
+  test("rejects a wrong-typed `content`", () => {
+    expect(() => normalizeIngress({ content: 12345 }, current, ctx)).toThrow(IngressError);
+  });
+
+  test("rejects a wrong-typed `inReplyTo`", () => {
+    expect(() =>
+      normalizeIngress({ content: "x", inReplyTo: 42 }, current, ctx),
+    ).toThrow(IngressError);
+  });
+
+  test("rejects a wrong-typed `senderRef`", () => {
+    expect(() =>
+      normalizeIngress({ content: "x", senderRef: { bad: true } }, current, ctx),
+    ).toThrow(IngressError);
+  });
+
+  test("rejects an array payload", () => {
+    expect(() => normalizeIngress([], current, ctx)).toThrow(IngressError);
+  });
+
+  test("absent optional fields still succeed", () => {
+    const m = normalizeIngress({ content: "x" }, current, ctx);
+    expect(m.to).toBeNull();
+    expect(m.inReplyTo).toBeUndefined();
+    expect(m.senderRef).toBeUndefined();
+    expect(m.kind).toBe("untagged");
+  });
 });
 
 describe("normalizeProse", () => {

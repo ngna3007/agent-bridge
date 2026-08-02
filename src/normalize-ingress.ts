@@ -38,12 +38,12 @@ export function normalizeIngress(
   socket: IngressSocket,
   ctx: IngressContext,
 ): BridgeMessage {
-  if (typeof raw !== "object" || raw === null) {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
     throw new IngressError("Ingress payload must be an object.");
   }
   const p = raw as Record<string, unknown>;
 
-  if (socket.protocolVersion !== null && socket.protocolVersion >= 1) {
+  if (socket.protocolVersion !== null && socket.protocolVersion >= PROTOCOL_VERSION) {
     const declared = p.from ?? p.source;
     if (declared !== undefined && declared !== socket.agent) {
       throw new IngressError(
@@ -53,13 +53,28 @@ export function normalizeIngress(
   }
 
   const to = readTo(p.to);
+  const kindPresent = p.kind !== undefined && p.kind !== null;
   const kind = readKind(p.kind);
+  if (p.content !== undefined && typeof p.content !== "string") {
+    throw new IngressError("`content` must be a string.");
+  }
+  if (p.inReplyTo !== undefined && typeof p.inReplyTo !== "string") {
+    throw new IngressError("`inReplyTo` must be a string.");
+  }
+  if (p.senderRef !== undefined && typeof p.senderRef !== "string") {
+    throw new IngressError("`senderRef` must be a string.");
+  }
   const content = typeof p.content === "string" ? p.content : "";
 
   // A structured caller already said where this goes. If the text also
   // says, and says something else, there are two sources of truth for one
   // message's destination — the exact class of bug this design removes.
+  // When only one side speaks (structured absent, or kind absent because
+  // this is a legacy peer with no `kind` field at all), the marker's value
+  // is promoted rather than treated as a conflict or discarded.
   let body = content;
+  let finalTo = to;
+  let finalKind = kind;
   let marker;
   try {
     marker = parseMarker(content);
@@ -73,11 +88,13 @@ export function normalizeIngress(
         `Conflict: structured to="${to}" but the content is marked "@${marker.to}". Two sources of truth for one destination.`,
       );
     }
-    if (marker.marker !== "untagged" && marker.marker !== kind) {
+    if (kindPresent && marker.marker !== "untagged" && marker.marker !== kind) {
       throw new IngressError(
         `Conflict: structured kind="${kind}" but the content is marked "[${marker.marker.toUpperCase()}]".`,
       );
     }
+    finalTo = to ?? marker.to;
+    if (!kindPresent && marker.marker !== "untagged") finalKind = marker.marker;
     body = marker.body;
   }
 
@@ -85,9 +102,9 @@ export function normalizeIngress(
     id: ctx.id,
     senderRef: typeof p.senderRef === "string" ? p.senderRef : undefined,
     from: socket.agent,
-    to,
+    to: finalTo,
     inReplyTo: typeof p.inReplyTo === "string" ? p.inReplyTo : undefined,
-    kind,
+    kind: finalKind,
     content: body,
     timestamp: ctx.now,
   };
