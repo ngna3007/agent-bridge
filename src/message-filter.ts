@@ -1,4 +1,6 @@
 import type { BridgeMessage } from "./types";
+import { parseAgentId } from "./agent-id";
+import type { AgentId, MessageKind } from "./agent-id";
 
 export type MarkerLevel = "reply" | "status" | "fyi" | "untagged";
 export type FilterMode = "filtered" | "full";
@@ -22,24 +24,42 @@ export interface FilterResult {
   marker: MarkerLevel;
 }
 
-// [REPLY] is the new name for what used to be [IMPORTANT]. The label
-// change captures the peer-to-peer intent: Codex only marks a message
-// with [REPLY] when it has something to actually *reply about* to
-// Claude (a proposal, a disagreement, a completion, a blocker). The
-// regex accepts both REPLY and the legacy IMPORTANT spelling so older
-// AGENTS.md files keep working until the next `abg init`.
-const MARKER_REGEX = /^\s*\[(REPLY|IMPORTANT|STATUS|FYI)\]\s*/i;
+/** Raised when prose names an address the bus does not have. */
+export class MarkerError extends Error {}
 
-export function parseMarker(content: string): { marker: MarkerLevel; body: string } {
+// [REPLY] is the new name for what used to be [IMPORTANT]; both spellings
+// are accepted so existing role files keep working. The optional
+// `@agent` is only recognised INSIDE the bracket — a bare @grok in prose
+// is a mention, not a destination, or pasting a diff would route mail.
+const MARKER_REGEX =
+  /^\s*\[(REPLY|IMPORTANT|STATUS|FYI)(?:\s+@([a-z][a-z0-9_-]*))?\]\s*/i;
+
+export interface ParsedMarker {
+  marker: MessageKind;
+  /** The @address from inside the marker, or null when unaddressed. */
+  to: AgentId | null;
+  body: string;
+}
+
+export function parseMarker(content: string): ParsedMarker {
   const match = content.match(MARKER_REGEX);
-  if (!match) return { marker: "untagged", body: content };
+  if (!match) return { marker: "untagged", to: null, body: content };
   const raw = match[1].toLowerCase();
-  // Map both REPLY and the legacy IMPORTANT to the same internal marker.
-  const marker = (raw === "important" ? "reply" : raw) as MarkerLevel;
-  return {
-    marker,
-    body: content.slice(match[0].length),
-  };
+  const marker = (raw === "important" ? "reply" : raw) as MessageKind;
+
+  let to: AgentId | null = null;
+  if (match[2] !== undefined) {
+    to = parseAgentId(match[2].toLowerCase());
+    if (to === null) {
+      // Broadcasting a typo would reintroduce invisible routing through
+      // the front door. Fail loudly and tell the sender which name.
+      throw new MarkerError(
+        `Unknown address "@${match[2]}". Known agents: claude, grok, codex.`,
+      );
+    }
+  }
+
+  return { marker, to, body: content.slice(match[0].length) };
 }
 
 export function classifyMessage(content: string, mode: FilterMode): FilterResult {
@@ -171,7 +191,9 @@ export class StatusBuffer {
       .join("\n---\n");
     const summary: BridgeMessage = {
       id: `status_summary_${Date.now()}`,
-      source: "codex",
+      from: "system",
+      to: null,
+      kind: "status",
       content: `[STATUS summary — ${this.buffer.length} update(s), flushed: ${reason}]\n${combined}`,
       timestamp: Date.now(),
     };
