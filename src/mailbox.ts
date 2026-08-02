@@ -130,12 +130,52 @@ export class Mailbox {
     }
   }
 
+  /**
+   * Lease every free entry to one batch.
+   *
+   * A lease hides its entries from further drains for `leaseTimeoutMs`,
+   * so a retry does not re-serve in-flight work, and makes them visible
+   * again on expiry, so a drain response that never arrives costs a
+   * redelivery rather than the message. This is at-least-once by
+   * construction; the canonical `id` is what makes the duplicate cheap.
+   *
+   * A pending gap marker is prepended, not appended: storage order is
+   * already the correct drain order (gap entries stand in for the
+   * elided *oldest* entries and are stored at index 0), so drain is a
+   * straight pass-through of storage order.
+   */
   drain(now: number): DrainBatch {
-    return { batchId: `b${++this.batchSeq}`, messages: [] };
+    const batchId = `${this.agent}_b${++this.batchSeq}_${now}`;
+    const gap = this.takeGapMarker(now);
+    if (gap) this.pushFront(gap);
+
+    const messages: BridgeMessage[] = [];
+    for (const entry of this.entries) {
+      if (entry.leasedBy !== null && entry.leaseExpiresAt > now) continue;
+      entry.leasedBy = batchId;
+      entry.leaseExpiresAt = now + this.opts.leaseTimeoutMs;
+      messages.push(entry.message);
+    }
+    return { batchId, messages };
   }
 
+  /**
+   * Delete exactly the ids named, and only if this batch still holds
+   * them. An ack against a lease that already expired and was re-leased
+   * is stale — honouring it would delete an entry another drain is
+   * currently serving.
+   */
   ack(batchId: string, ids: string[]): number {
-    return 0;
+    const named = new Set(ids);
+    let deleted = 0;
+    for (let i = this.entries.length - 1; i >= 0; i--) {
+      const entry = this.entries[i];
+      if (entry.leasedBy !== batchId) continue;
+      if (!named.has(entry.message.id)) continue;
+      this.entries.splice(i, 1);
+      deleted++;
+    }
+    return deleted;
   }
 
   private push(message: BridgeMessage): void {
@@ -183,7 +223,7 @@ export class Mailbox {
   }
 
   /** Gap entry owed to the recipient, consumed by `drain`. */
-  protected takeGapMarker(now: number): BridgeMessage | null {
+  private takeGapMarker(now: number): BridgeMessage | null {
     if (this.unreportedDrops === 0) return null;
     const content = `[gap] ${this.unreportedDrops} message(s) dropped — mailbox at capacity`;
     this.unreportedDrops = 0;

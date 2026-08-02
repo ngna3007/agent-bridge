@@ -97,3 +97,56 @@ describe("mailbox overflow is per-kind and decided before success", () => {
     expect(m.size).toBeLessThanOrEqual(1);
   });
 });
+
+describe("leased drain and explicit ack", () => {
+  test("a second drain during a live lease returns nothing", () => {
+    const m = box(5);
+    m.enqueue(msg("reply", "a"));
+    const first = m.drain(1_000);
+    expect(first.messages).toHaveLength(1);
+    expect(m.drain(1_500).messages).toHaveLength(0);
+  });
+
+  test("an expired lease redelivers the same id", () => {
+    const m = box(5);
+    const a = msg("reply", "a");
+    m.enqueue(a);
+    const first = m.drain(1_000);
+    const second = m.drain(1_000 + 30_001);
+    expect(second.messages.map((x) => x.id)).toEqual([a.id]);
+    expect(second.batchId).not.toBe(first.batchId);
+  });
+
+  test("a partial ack redelivers only the unacked ids", () => {
+    const m = box(5);
+    const a = msg("reply", "a");
+    const b = msg("reply", "b");
+    m.enqueue(a);
+    m.enqueue(b);
+    const batch = m.drain(1_000);
+    expect(m.ack(batch.batchId, [a.id])).toBe(1);
+    const again = m.drain(1_000 + 30_001);
+    expect(again.messages.map((x) => x.id)).toEqual([b.id]);
+  });
+
+  test("an ack naming a stale batch deletes nothing", () => {
+    const m = box(5);
+    const a = msg("reply", "a");
+    m.enqueue(a);
+    const batch = m.drain(1_000);
+    m.drain(1_000 + 30_001); // lease expires, entry is re-leased
+    expect(m.ack(batch.batchId, [a.id])).toBe(0);
+    expect(m.size).toBe(1);
+  });
+
+  test("a drain with nothing to serve still reports a pending gap", () => {
+    const m = box(1);
+    m.enqueue(msg("untagged", "old"));
+    m.enqueue(msg("untagged", "new"));
+    const batch = m.drain(2_000);
+    expect(batch.messages[0].content).toMatch(/dropped/);
+    // the marker is reported once, not on every drain
+    m.ack(batch.batchId, batch.messages.map((x) => x.id));
+    expect(m.drain(3_000).messages).toHaveLength(0);
+  });
+});
