@@ -1,7 +1,7 @@
 # Agent communication lifecycle — design
 
 **Date:** 2026-08-02
-**Status:** proposed — revision 4, incorporating three rounds of review
+**Status:** proposed — revision 5, incorporating four rounds of review
 **Supersedes:** the routing half of `docs/scaling-plan.md` §P2
 
 ---
@@ -288,9 +288,17 @@ messageIndex: Map<string, { from: Origin; recipients: AgentId[]; at: number }>
 **Write ordering.** The `id` is assigned at step 0, but `recipients` cannot be
 known then — routing happens at step 1 and per-recipient acceptance at step 2
 (§8 lets a broadcast be accepted by one mailbox and rejected by another). So the
-index entry is written **atomically after the enqueue decisions and before any
-wake-up**, containing only the recipients that actually accepted. If no
-recipient accepted, no entry is written — there is nothing to reply to.
+index entry is written **after the enqueue decisions and before any wake-up**,
+containing only the recipients that actually accepted. If no recipient
+accepted, no entry is written — there is nothing to reply to.
+
+**Enqueue and index insertion commit as one transaction.** Mailbox writes and
+the index entry either both land or neither does. If the index insertion fails
+— cap reached, or any other reason — the accepted mailbox entries are **rolled
+back and no wake-up fires**, and the sender is told the send failed. A
+delivered message without causal provenance is a message no one can reply to,
+which is the failure this section exists to prevent; half-committing it would
+create exactly that.
 
 Other rules:
 
@@ -306,10 +314,14 @@ Other rules:
   (§4).
 - **Retention outlives every reference to it.** The TTL must exceed the mailbox
   lease, the lifetime of an active turn, and any pending `requireReply`
-  correlation (§14). An entry that is still referenced is pinned and is never
-  evicted merely because the count cap was reached — the cap sheds unpinned
-  entries, or it fails loudly. Evicting a referenced entry would turn a valid
-  reply into a parse failure, which is silent loss wearing a different hat.
+  correlation (§14). Evicting a live entry would turn a valid reply into a parse
+  failure, which is silent loss wearing a different hat.
+- **The cap evicts expired entries only.** "Unpinned" is not a licence to
+  evict: a recipient may reply at any point within the TTL, so every unexpired
+  entry is potentially referenced whether or not a lease or turn currently
+  names it. When the cap is reached and nothing has expired, **new ingress is
+  rejected loudly** — the sender learns at send time, per §8's principle that
+  the only acceptable place to refuse a message is before accepting it.
 
 ---
 
@@ -474,15 +486,20 @@ seen a second time on the next drain.**
 The full contract:
 
 1. A push never consumes.
-2. A *working* push may duplicate once, on the next drain.
-3. A drain `ack` (§5.1) prevents every subsequent redelivery.
-4. The canonical `BridgeMessage.id` appears **identically** in the channel
-   metadata and in the drained payload, so the consumer can recognise the
-   duplicate as one it has already seen.
+2. A *working* push may duplicate on **every drain attempt that is not
+   acked** — not once. §5.1 redelivers an expired or unacked lease, and that
+   applies here like anywhere else.
+3. The **first successful** `ack` (§5.1) prevents every subsequent redelivery.
+4. Every attempt — the push and each redelivery — carries the **identical**
+   canonical `BridgeMessage.id`, in the channel metadata and in the drained
+   payload alike, so the consumer can recognise each as one it has already
+   seen.
 
 Rule 4 is what makes rule 2 tolerable, and it is a hard requirement on the push
-format rather than a nicety. Loss becomes at-most-one duplicate. That is the
-trade this document exists to make.
+format rather than a nicety. Loss becomes duplication bounded by how many
+drains go unacked — one, in the healthy case where the first drain and its ack
+both succeed. That is the trade this document exists to make, and "exactly
+once" is a statement about the healthy case only.
 
 When the channel is silently gated, the same mechanism means the message is
 simply still in the mailbox and `get_messages` returns it — the original bug,
@@ -697,10 +714,12 @@ almost for free, which is part of why §6 chose causal routing.
 | e2e | frontend→Codex goes through the ledger; `deliverToCodex` is reachable only as a step-3 transport |
 | e2e | a wake-up that throws still leaves the message drainable |
 | e2e | **the `tengu_harbor` case**: a content push that returns success while the model receives nothing → the message is still drainable, and arrives exactly once |
-| e2e | a content push that *is* delivered may appear once more on the next drain, carrying the **same** `id` as the push metadata; after the ack it never reappears |
+| e2e | a content push that *is* delivered reappears on the next drain carrying the **same** `id` as the push metadata; after the first successful ack it never reappears |
+| e2e | two consecutive unacked drains after a delivered push both return it, same `id` each time — duplication is bounded by unacked drains, not by one |
 | e2e | the provenance index outlives the acked message: a reply arriving after the original was drained still routes to its sender |
 | unit | the index entry is written after acceptance and lists only accepting recipients; a broadcast rejected by every mailbox writes no entry |
-| unit | a pinned index entry (live lease, active turn, pending `requireReply`) is not evicted by the count cap |
+| unit | the cap evicts expired index entries only; with the cap reached and nothing expired, ingress is rejected rather than an unexpired entry evicted |
+| unit | an index insertion failure rolls back the mailbox enqueues, fires no wake-up, and fails the send |
 | security | `inReplyTo` naming a `from: "system"` entry is rejected |
 | e2e | concurrent Claude and Grok turns against Codex: each reply routes to its own requester |
 | e2e | `requireReply` is not satisfied by a reply addressed elsewhere |
@@ -711,7 +730,17 @@ That last row is the acceptance criterion for the whole document.
 
 ---
 
-## Appendix A: review response (revision 3 → 4)
+## Appendix A: review response (revision 4 → 5)
+
+| Finding | Disposition |
+|---|---|
+| §7's "at-most-one duplicate" contradicts §5.1's lease redelivery | **Accepted.** A working push may duplicate on every unacked drain; the *first successful* ack ends it; every attempt carries the identical id. "Exactly once" now scopes explicitly to the healthy case. |
+| Enqueue and index insertion must be atomic | **Accepted.** One transaction. An index failure rolls back the accepted mailbox entries, fires no wake-up, and fails the send — a delivered message with no provenance is one nobody can reply to. |
+| "Unpinned" is not a safe eviction criterion | **Accepted.** A recipient may reply anywhere inside the TTL, so every unexpired entry is potentially referenced. The cap evicts expired entries only and otherwise rejects new ingress loudly. |
+
+---
+
+## Appendix B: review response (revision 3 → 4)
 
 | Finding | Disposition |
 |---|---|
@@ -723,7 +752,7 @@ That last row is the acceptance criterion for the whole document.
 
 ---
 
-## Appendix B: review response (revision 2 → 3)
+## Appendix C: review response (revision 2 → 3)
 
 | Finding | Disposition |
 |---|---|
@@ -739,7 +768,7 @@ not contested.
 
 ---
 
-## Appendix C: review response (revision 1 → 2)
+## Appendix D: review response (revision 1 → 2)
 
 | # | Finding | Disposition |
 |---|---|---|
