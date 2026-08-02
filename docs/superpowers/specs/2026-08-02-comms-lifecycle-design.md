@@ -1,7 +1,8 @@
 # Agent communication lifecycle — design
 
 **Date:** 2026-08-02
-**Status:** proposed — revision 5, incorporating four rounds of review
+**Status:** approved — revision 6. Architecture signed off by Codex 2026-08-02
+after four rounds of review. Pending user approval before implementation.
 **Supersedes:** the routing half of `docs/scaling-plan.md` §P2
 
 ---
@@ -497,9 +498,10 @@ The full contract:
 
 Rule 4 is what makes rule 2 tolerable, and it is a hard requirement on the push
 format rather than a nicety. Loss becomes duplication bounded by how many
-drains go unacked — one, in the healthy case where the first drain and its ack
-both succeed. That is the trade this document exists to make, and "exactly
-once" is a statement about the healthy case only.
+drains go unacked — **at most one duplicate in the healthy case**, where the
+push is delivered, the first drain returns it, and that drain is acked. Two
+observations of one message, not one. **The system never claims exactly-once
+delivery**, and no test should be written as though it did.
 
 When the channel is silently gated, the same mechanism means the message is
 simply still in the mailbox and `get_messages` returns it — the original bug,
@@ -713,7 +715,7 @@ almost for free, which is part of why §6 chose causal routing.
 | e2e | **an enqueue failure prevents the wake-up** — ordering is enforced, not asserted |
 | e2e | frontend→Codex goes through the ledger; `deliverToCodex` is reachable only as a step-3 transport |
 | e2e | a wake-up that throws still leaves the message drainable |
-| e2e | **the `tengu_harbor` case**: a content push that returns success while the model receives nothing → the message is still drainable, and arrives exactly once |
+| e2e | **the `tengu_harbor` case**: a content push that returns success while the model receives nothing → the first drain returns the message, and a successful ack prevents another return |
 | e2e | a content push that *is* delivered reappears on the next drain carrying the **same** `id` as the push metadata; after the first successful ack it never reappears |
 | e2e | two consecutive unacked drains after a delivered push both return it, same `id` each time — duplication is bounded by unacked drains, not by one |
 | e2e | the provenance index outlives the acked message: a reply arriving after the original was drained still routes to its sender |
@@ -730,7 +732,17 @@ That last row is the acceptance criterion for the whole document.
 
 ---
 
-## Appendix A: review response (revision 4 → 5)
+## Appendix A: review response (revision 5 → 6)
+
+| Finding | Disposition |
+|---|---|
+| §7 described one duplicate in the healthy case and then called it "exactly once" | **Accepted.** A delivered push plus a first drain is two observations of one message. Restated as "at most one duplicate in the healthy case", with an explicit statement that the system never claims exactly-once. The `tengu_harbor` test is phrased as "first drain returns it; a successful ack prevents another return." |
+
+**Architecture signed off** at this revision. No remaining single-source-of-truth objection.
+
+---
+
+## Appendix B: review response (revision 4 → 5)
 
 | Finding | Disposition |
 |---|---|
@@ -740,7 +752,7 @@ That last row is the acceptance criterion for the whole document.
 
 ---
 
-## Appendix B: review response (revision 3 → 4)
+## Appendix C: review response (revision 3 → 4)
 
 | Finding | Disposition |
 |---|---|
@@ -752,7 +764,7 @@ That last row is the acceptance criterion for the whole document.
 
 ---
 
-## Appendix C: review response (revision 2 → 3)
+## Appendix D: review response (revision 2 → 3)
 
 | Finding | Disposition |
 |---|---|
@@ -768,7 +780,7 @@ not contested.
 
 ---
 
-## Appendix D: review response (revision 1 → 2)
+## Appendix E: review response (revision 1 → 2)
 
 | # | Finding | Disposition |
 |---|---|---|
