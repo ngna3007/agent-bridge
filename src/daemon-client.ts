@@ -87,6 +87,28 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
     super();
   }
 
+  /**
+   * Whether the current connection's first server frame was `hello` —
+   * i.e. the daemon spoke the version handshake. False both before any
+   * frame has arrived and after a confirmed-incompatible first frame,
+   * so a caller can gate `drain`/`ack` on this without separately
+   * tracking the `incompatibleDaemon` event.
+   */
+  get isHandshakeConfirmed(): boolean {
+    return this.sawHello;
+  }
+
+  /**
+   * How many `drain()` calls are still awaiting a `drain_result` (or
+   * timeout, or the socket closing). Exposed so tests can assert the
+   * pending-request map is actually pruned after each settlement path
+   * — a promise that resolves/rejects but leaves its entry behind is
+   * a leak that only a size check on the underlying map can catch.
+   */
+  get pendingDrainCount(): number {
+    return this.pendingDrains.size;
+  }
+
   async connect() {
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.log(`connect() skipped — ws#${this.wsId} already OPEN`);
@@ -258,18 +280,20 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
   drain(): Promise<{ batchId: string; messages: BridgeMessage[] }> {
     const requestId = `d${++this.drainSeq}`;
     return new Promise((resolve) => {
+      // No try/catch: a synchronous send failure (socket not open) must
+      // be distinguishable from "the daemon answered with nothing" — an
+      // uncaught throw here auto-rejects the promise via the Promise
+      // executor, rather than folding both cases into the same
+      // empty-batch resolve. `send` is called before any pending-drain
+      // state is registered, so a rejection here leaves nothing behind
+      // to clean up — the map only ever gains an entry for a request
+      // that actually left the socket.
+      this.send({ type: "drain", requestId });
+
       const timer = setTimeout(() => {
         if (this.pendingDrains.delete(requestId)) resolve({ batchId: "", messages: [] });
       }, DRAIN_TIMEOUT_MS);
-
       this.pendingDrains.set(requestId, { resolve, timer });
-      try {
-        this.send({ type: "drain", requestId });
-      } catch {
-        clearTimeout(timer);
-        this.pendingDrains.delete(requestId);
-        resolve({ batchId: "", messages: [] });
-      }
     });
   }
 
