@@ -192,4 +192,24 @@ describe("dropOldestFree never evicts a live leased entry", () => {
     }
     expect(m.size).toBe(2);
   });
+
+  test("collapseOldest's same-kind path drops the incoming status, not a leased same-kind entry, when every entry is leased", () => {
+    const m = box(2);
+    const a = msg("status", "a");
+    const b = msg("status", "b");
+    m.enqueue(a);
+    m.enqueue(b);
+    const batch = m.drain(1_000); // leases both, unexpired
+    expect(batch.messages).toHaveLength(2);
+
+    const before = m.droppedCounts().status;
+    expect(m.enqueue(msg("status", "c")).accepted).toBe(true);
+
+    expect(m.size).toBe(2);
+    expect(m.size).toBeLessThanOrEqual(2);
+    expect(m.droppedCounts().status).toBe(before + 1);
+    // both original status entries are still there, still leased to
+    // `batch` — proof the same-kind findIndex did not evict either one.
+    expect(m.ack(batch.batchId, [a.id, b.id])).toBe(2);
+  });
 });
