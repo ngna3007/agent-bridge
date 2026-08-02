@@ -1,22 +1,41 @@
 // ===== Bridge Core Types =====
 
-import type { FrontendAgent } from "./frontend-registry";
+import type { AgentId, MessageKind, Origin } from "./agent-id";
 
-/**
- * Who wrote a message.
- *
- * Frontends are the agents that attach to the daemon over the control
- * socket; Codex is the one that sits behind the proxy instead. Widened
- * past `"claude" | "codex"` when Grok turned out to attach through the
- * same MCP surface Claude uses (`docs/scaling-plan.md` §4.1b).
- */
-export type MessageSource = FrontendAgent | "codex";
+export type { AgentId, MessageKind, Origin };
 
 export interface BridgeMessage {
+  /** Canonical, assigned by the daemon at ingress. Globally unique. */
   id: string;
-  source: MessageSource;
+
+  /** The sender's own id, preserved for correlation. Never used for routing. */
+  senderRef?: string;
+
+  /** Derived from the authenticated socket, never from the payload. */
+  from: Origin;
+
+  /**
+   * Who this is for.
+   *   AgentId — one recipient
+   *   "*"     — explicit broadcast
+   *   null    — unaddressed; resolved by resolveRecipients
+   */
+  to: AgentId | "*" | null;
+
+  /** The message this one answers, when it answers one. Primary routing signal. */
+  inReplyTo?: string;
+
+  kind: MessageKind;
+
   content: string;
   timestamp: number;
+
+  /**
+   * Legacy egress only. A 0.7 frontend parses `source`, not `from`; the
+   * daemon sets this when writing to such a socket and nothing reads it
+   * on the way in. Dropped in 0.9.
+   */
+  source?: AgentId;
 }
 
 // ===== JSON-RPC 2.0 =====
