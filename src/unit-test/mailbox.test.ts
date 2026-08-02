@@ -150,3 +150,46 @@ describe("leased drain and explicit ack", () => {
     expect(m.drain(3_000).messages).toHaveLength(0);
   });
 });
+
+describe("dropOldestFree never evicts a live leased entry", () => {
+  test("an untagged arrival is dropped, not an in-flight leased entry, when every entry is leased", () => {
+    const m = box(2);
+    const a = msg("untagged", "a");
+    const b = msg("untagged", "b");
+    m.enqueue(a);
+    m.enqueue(b);
+    const batch = m.drain(1_000); // leases both, unexpired
+    expect(batch.messages).toHaveLength(2);
+
+    const before = m.droppedCounts().untagged;
+    expect(m.enqueue(msg("untagged", "c")).accepted).toBe(true);
+
+    expect(m.size).toBe(2);
+    expect(m.droppedCounts().untagged).toBe(before + 1);
+    // both original entries are still there, still leased to `batch` —
+    // proof neither was evicted to make room for "c".
+    expect(m.ack(batch.batchId, [a.id, b.id])).toBe(2);
+  });
+
+  test("a reply is rejected, naming the all-awaiting-ack cause, when every entry is leased", () => {
+    const m = box(2);
+    m.enqueue(msg("untagged", "a"));
+    m.enqueue(msg("untagged", "b"));
+    m.drain(1_000);
+    const result = m.enqueue(msg("reply", "c"));
+    expect(result.accepted).toBe(false);
+    expect(result.reason).toMatch(/awaiting ack/);
+  });
+
+  test("the capacity invariant holds when every entry stays leased across repeated overflow attempts", () => {
+    const m = box(2);
+    m.enqueue(msg("untagged", "a"));
+    m.enqueue(msg("untagged", "b"));
+    m.drain(1_000);
+    for (let i = 0; i < 5; i++) {
+      m.enqueue(msg("untagged", `x${i}`));
+      expect(m.size).toBeLessThanOrEqual(2);
+    }
+    expect(m.size).toBe(2);
+  });
+});

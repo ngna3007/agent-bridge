@@ -72,23 +72,36 @@ export class Mailbox {
     }
 
     switch (message.kind) {
-      case "reply":
+      case "reply": {
         // The one kind carrying a conversational obligation. Telling the
         // sender "success" and then deleting it is the bug this design
-        // exists to remove, so refuse before accepting.
+        // exists to remove, so refuse before accepting. Name the real
+        // cause when nothing is even evictable — every entry is leased,
+        // i.e. handed to a consumer and awaiting ack — since that is a
+        // materially different situation from ordinary fullness.
+        const allLeased = this.entries.every((e) => e.leasedBy !== null);
         return {
           accepted: false,
-          reason: `${this.agent}'s mailbox is full (${this.opts.capacity} messages). The reply was not delivered.`,
+          reason: allLeased
+            ? `${this.agent}'s mailbox is full (${this.opts.capacity} messages, all awaiting ack). The reply was not delivered.`
+            : `${this.agent}'s mailbox is full (${this.opts.capacity} messages). The reply was not delivered.`,
         };
+      }
 
       case "status": {
         // A capacity-1 (or 0) mailbox has no room for both a gap entry
         // and the incoming message. Skip the gap entry: drop the oldest
-        // and let it surface as an ordinary gap marker through
-        // unreportedDrops on the next drain instead.
+        // free entry and let it surface as an ordinary gap marker
+        // through unreportedDrops on the next drain instead. When
+        // nothing is free (every entry leased, in flight), there is
+        // nothing to evict — drop the incoming message instead.
         if (this.opts.capacity < 2) {
-          this.dropOldestFree();
-          this.push(message);
+          if (this.dropOldestFree()) {
+            this.push(message);
+          } else {
+            this.dropped[message.kind]++;
+            this.unreportedDrops++;
+          }
           return { accepted: true };
         }
         // Collapse the oldest raw status entries into one gap entry that
@@ -97,28 +110,39 @@ export class Mailbox {
         // The gap entry stands in for the elided entries, so it is
         // inserted where they were — at the front — not appended.
         const collapsed = this.collapseOldest("status");
-        this.pushFront({
-          id: this.nextId(),
-          from: "system",
-          to: this.agent,
-          kind: "status",
-          content: `[gap] ${collapsed} status message(s) elided — mailbox at capacity`,
-          timestamp: message.timestamp,
-        });
+        if (this.entries.length > this.opts.capacity - 2) {
+          // Collapse could not free two slots — everything left is
+          // leased and in flight. Report whatever was collapsed (if
+          // anything), then drop the incoming message rather than
+          // overflow capacity or evict in-flight work.
+          if (collapsed > 0) this.pushFront(this.statusGapEntry(collapsed, message.timestamp));
+          this.dropped[message.kind]++;
+          this.unreportedDrops++;
+          return { accepted: true };
+        }
+        this.pushFront(this.statusGapEntry(collapsed, message.timestamp));
         this.push(message);
         return { accepted: true };
       }
 
       case "fyi":
         // Background context. Droppable by contract; the counter and the
-        // next drain's gap marker keep the drop visible.
+        // next drain's gap marker keep the drop visible. Never evicts
+        // anything — it always drops itself when full.
         this.dropped.fyi++;
         this.unreportedDrops++;
         return { accepted: true };
 
       case "untagged":
-        this.dropOldestFree();
-        this.push(message);
+        // Drop the oldest free entry to make room. When nothing is free
+        // (every entry leased, in flight), there is nothing to evict —
+        // drop the incoming message instead.
+        if (this.dropOldestFree()) {
+          this.push(message);
+        } else {
+          this.dropped.untagged++;
+          this.unreportedDrops++;
+        }
         return { accepted: true };
     }
   }
@@ -190,36 +214,55 @@ export class Mailbox {
    * Remove entries of one kind until two slots are free — one for the
    * gap entry, one for the incoming message. When same-kind victims run
    * out before that, fall back to the oldest free entry of any kind so
-   * the loop always makes progress toward those two free slots. Returns
-   * how many entries were removed in total. Callers with capacity < 2
-   * must not call this — see the capacity guard in `enqueue`.
+   * the loop always makes progress toward those two free slots. Only
+   * unleased entries are ever candidates — an in-flight leased entry,
+   * handed to a consumer and awaiting ack, is never a valid eviction
+   * victim. When nothing free remains, the loop stops early and the
+   * caller is left to notice `entries.length` did not reach the target.
+   * Returns how many entries were removed in total. Callers with
+   * capacity < 2 must not call this — see the capacity guard in
+   * `enqueue`.
    */
   private collapseOldest(kind: MessageKind): number {
     let removed = 0;
     while (this.entries.length > this.opts.capacity - 2) {
-      const idx = this.entries.findIndex((e) => e.message.kind === kind);
-      if (idx === -1) {
-        this.dropOldestFree();
+      const idx = this.entries.findIndex((e) => e.leasedBy === null && e.message.kind === kind);
+      if (idx !== -1) {
+        this.entries.splice(idx, 1);
         removed++;
+        this.dropped[kind]++;
         continue;
       }
-      this.entries.splice(idx, 1);
+      if (!this.dropOldestFree()) break;
       removed++;
-      this.dropped[kind]++;
     }
     return removed;
   }
 
   // Evicts the globally oldest unleased entry, not the oldest entry of
   // any particular kind — a mailbox is one recipient's single ordered
-  // queue, and "oldest" means oldest overall across all kinds.
-  private dropOldestFree(): void {
+  // queue, and "oldest" means oldest overall across all kinds. A leased
+  // entry — handed to a consumer and awaiting ack — is never evicted;
+  // only `ack` (or lease expiry followed by a later drop) removes it.
+  // Returns false, evicting nothing, when no free entry exists.
+  private dropOldestFree(): boolean {
     const idx = this.entries.findIndex((e) => e.leasedBy === null);
-    const victim = this.entries.splice(idx === -1 ? 0 : idx, 1)[0];
-    if (victim) {
-      this.dropped[victim.message.kind]++;
-      this.unreportedDrops++;
-    }
+    if (idx === -1) return false;
+    const victim = this.entries.splice(idx, 1)[0];
+    this.dropped[victim.message.kind]++;
+    this.unreportedDrops++;
+    return true;
+  }
+
+  private statusGapEntry(collapsed: number, timestamp: number): BridgeMessage {
+    return {
+      id: this.nextId(),
+      from: "system",
+      to: this.agent,
+      kind: "status",
+      content: `[gap] ${collapsed} status message(s) elided — mailbox at capacity`,
+      timestamp,
+    };
   }
 
   /** Gap entry owed to the recipient, consumed by `drain`. */
