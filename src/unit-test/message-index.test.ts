@@ -38,6 +38,22 @@ describe("provenance index", () => {
     expect(m.resolveSender("s1", "claude", 10)).toBeNull();
   });
 
+  test("re-recording an existing id is rejected and does not replace the entry", () => {
+    const m = idx();
+    m.record("m1", { from: "claude", recipients: ["codex"], at: 0 }, 0);
+    expect(m.record("m1", { from: "grok", recipients: ["claude"], at: 500 }, 500)).toBe(false);
+    // still resolves against the ORIGINAL recipients, proving no overwrite
+    expect(m.resolveSender("m1", "codex", 1_000)).toBe("claude");
+    expect(m.resolveSender("m1", "claude", 1_000)).toBeNull();
+  });
+
+  test("duplicate id rejection happens below capacity too", () => {
+    const m = idx(10, 60_000);
+    m.record("m1", { from: "claude", recipients: ["codex"], at: 0 }, 0);
+    expect(m.record("m1", { from: "codex", recipients: ["claude"], at: 100 }, 100)).toBe(false);
+    expect(m.size).toBe(1);
+  });
+
   test("the cap evicts expired entries only", () => {
     const m = idx(2, 1_000);
     m.record("old", { from: "claude", recipients: ["codex"], at: 0 }, 0);

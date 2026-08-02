@@ -30,16 +30,21 @@ export class MessageIndex {
   }
 
   record(id: string, entry: IndexEntry, now: number): boolean {
+    // Message ids are daemon-assigned and unique, so a repeat id is a
+    // caller bug. `recipients` is the authorization gate for replies —
+    // silently overwriting it on a re-record could widen or narrow who
+    // may reply with no signal to the caller. Surface the bug instead.
+    if (this.entries.has(id)) return false;
     if (this.entries.size >= this.opts.capacity) {
       this.evictExpired(now);
-    }
-    if (this.entries.size >= this.opts.capacity) {
-      // Every remaining entry is unexpired, and a recipient may reply to
-      // any of them at any point inside the TTL. Evicting one would turn
-      // a valid reply into a parse failure — silent loss wearing a
-      // different hat. Refuse the new message instead, where the sender
-      // can see it.
-      return false;
+      if (this.entries.size >= this.opts.capacity) {
+        // Every remaining entry is unexpired, and a recipient may reply to
+        // any of them at any point inside the TTL. Evicting one would turn
+        // a valid reply into a parse failure — silent loss wearing a
+        // different hat. Refuse the new message instead, where the sender
+        // can see it.
+        return false;
+      }
     }
     this.entries.set(id, entry);
     return true;
