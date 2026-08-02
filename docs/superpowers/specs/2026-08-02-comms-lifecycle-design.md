@@ -1,7 +1,7 @@
 # Agent communication lifecycle — design
 
 **Date:** 2026-08-02
-**Status:** proposed — revision 2, incorporating Codex review
+**Status:** proposed — revision 3, incorporating two rounds of review
 **Supersedes:** the routing half of `docs/scaling-plan.md` §P2
 
 ---
@@ -28,6 +28,12 @@ successfully, with no error. So the fallback never fires, and the message is
 gone: never pushed, never queued, never recoverable. Tier 2g
 (`src/live-test/tier2g-grok-inbound.ts`, check 7) asserts this as current
 behaviour.
+
+The same shape has already bitten Claude itself. `docs/channels-silent-block.md`
+records a *successful* `notifications/claude/channel` call that the model never
+saw, because a server-side `tengu_harbor` flag had the channel gated off. A
+send returning success has never been evidence of delivery on this transport —
+for any frontend.
 
 **2. Codex is a hard dependency for any conversation.**
 `claude_to_codex` is the only send path, and it terminates at the Codex adapter.
@@ -232,12 +238,55 @@ place a message can be.
 Codex gets a mailbox like everyone else. `deliverToCodex` stops being an
 ingress and becomes what it always should have been — Codex's *wake-up
 transport*, invoked from step 3 of §7 rather than from the message path.
-`ReplyOutbox` keeps its job (Codex accepts one turn at a time) but becomes a
-property of that transport rather than a parallel queue.
+`ReplyOutbox` keeps its job (Codex accepts one turn at a time) but holds
+**mailbox ids only** — never message bodies. A queue of ids cannot become a
+second custodian; a queue of messages already did once.
 
-**Consumption is acknowledged, not assumed.** A message leaves a mailbox when
-the recipient's drain is confirmed — not when a socket write returns. This is
-what makes §7 step 4 sound.
+### 5.1 Consumption: leased batches and explicit ack
+
+"Confirmed" needs a wire protocol or it is a wish. Drain is a two-step lease:
+
+```ts
+// 1. recipient asks for work. daemon leases, does not delete.
+drain(agent) -> { batchId: string, messages: BridgeMessage[] }
+
+// 2. recipient confirms what it actually took.
+ack(batchId, ids: string[]) -> void
+```
+
+- A lease marks its messages **invisible to further drains** for
+  `LEASE_TIMEOUT_MS`, so a second call does not re-serve in-flight work.
+- `ack` deletes exactly the ids named. Ids in the batch but absent from the
+  ack, and leases that expire unacked, become visible again and are
+  **redelivered**.
+- A failed or never-returned drain response therefore costs a redelivery, not a
+  message.
+
+This is at-least-once by construction. Duplicates are the price of never
+losing one, and dedupe-by-`id` at the consumer is what makes that price small.
+Exactly-once is not available over a transport that cannot acknowledge, and
+claiming it would be the same category of error as revision 1's silent push.
+
+### 5.2 Provenance index
+
+Causal routing (§6) resolves `inReplyTo` by looking up the original message's
+`from`. But that message is deleted from its mailbox on ack — often long before
+the reply arrives. The mailbox cannot answer the question.
+
+So the daemon keeps a separate, small, append-only index:
+
+```ts
+messageIndex: Map<string, { from: Origin; recipients: AgentId[]; at: number }>
+```
+
+- Written at ingress (§7 step 0), independent of mailbox lifetime.
+- Bounded by TTL and count; entries outlive the message, not the daemon.
+- **Authorization:** `inReplyTo` resolves only if the replier was one of that
+  message's `recipients`. Otherwise the reply is rejected. Without this check,
+  any agent could route to any other by guessing an id.
+- An `inReplyTo` naming an expired or unknown id is a **parse failure**, not a
+  fallthrough to broadcast — same rule, same reason, as an unknown `@name`
+  (§4).
 
 ---
 
@@ -355,57 +404,61 @@ transport, is what makes the ordering true rather than merely asserted.
 **Step 3 is best-effort by definition.** A wake-up that throws, times out, or is
 silently ignored is logged and dropped. The message is already in the mailbox.
 
-### Wake-up transports declare whether they acknowledge
+### Payload and acknowledgement are independent axes
 
-This is where I **disagree with the review's recommendation** while accepting
-its finding.
+Revision 2 proposed a single `acknowledgesDelivery: boolean` — content-carrying
+pushes would also consume the mailbox entry. That was wrong, and this
+repository already contains the disproof.
 
-Codex is right that a successful push proves the transport accepted a
-notification, not that an agent consumed a message — so dedupe-by-id cannot be
-driven by "we pushed it". Its proposed fix is that wake-ups carry no content and
-every agent always pulls.
+`docs/channels-silent-block.md` documents the exact failure: with the
+`tengu_harbor` gate closed, "the daemon receives the `agentMessage`, calls
+`notifications/claude/channel`, **the call returns success, and the model never
+sees a thing**." The gate is server-side and per-account; it can also be closed
+by an env var Claude Code re-imports from `settings.json`. A capability flag
+compiled into the transport cannot see any of that. It describes what the
+transport *believes*, and the belief is wrong precisely in the case that
+produced the original bug.
 
-That is sound, and I think it is the wrong trade. It costs a mandatory
-`get_messages` round-trip for *every* message including Claude's, whose inline
-`[REPLY]` delivery is the product's main ergonomic advantage. It makes the
-common case worse to fix the uncommon one.
+MCP notifications are one-way. `await server.notification()` proves bytes were
+written. Nothing more is available from it, ever.
 
-Instead, make acknowledgement a **declared property of the transport**:
+So the two questions are separated, because they were always separate
+questions:
 
 ```ts
 interface WakeupTransport {
-  /**
-   * True only when a successful send is, by the host's contract, delivery
-   * into the agent's context. Claude Code's channel notification is (it
-   * renders into the conversation — that is what the extension does).
-   * A plain MCP host is not: it may drop an unknown notification silently.
-   */
-  acknowledgesDelivery: boolean;
+  /** Does the wake-up carry the message, or only the fact that one exists? */
+  payloadMode: "content" | "signal";
+
+  /** Can this transport produce correlated evidence of consumption? */
+  acknowledgementMode: "explicit" | "none";
 }
 ```
 
-- `acknowledgesDelivery: true` (Claude channel) → wake-up carries content, and a
-  successful send consumes the message. Today's UX, preserved exactly.
-- `acknowledgesDelivery: false` (any unknown host, and Grok until its adapter
-  proves otherwise) → the wake-up is a bare signal. The message stays in the
-  mailbox until an acknowledged drain.
+The Claude Code channel is `{ payloadMode: "content", acknowledgementMode:
+"none" }`. Inline `[REPLY]` delivery is preserved exactly — the push still
+carries the text, and in the common case the model reads it and acts on it with
+no round-trip. What changes is that **the push does not consume the mailbox
+entry**. Only an `ack` from §5.1 does.
 
-The default for an unrecognized host is `false`. The `[REPLY]`-loss bug was
-precisely a `false` transport being treated as `true`, so the default must fail
-in the safe direction.
+The consequence is honest and bounded: when the channel works, the entry is
+acked on the session's next drain and nothing is seen twice; when the channel is
+silently gated, the message is still in the mailbox and `get_messages` returns
+it. Loss becomes duplication. That is the trade this document exists to make.
 
-**Semantics are at-least-once**, and dedupe-by-`id` on drain is what makes that
-safe. Exactly-once is not available across a transport that cannot ack.
+`{ payloadMode: "signal", acknowledgementMode: "none" }` is the default for an
+unrecognised host — a bare wake-up, no content on a channel that may not
+deliver it.
 
 **`kind` governs step 3 wake-up policy, not step 2 storage.** `reply` wakes;
-`status` folds into the `StatusBuffer` summary; `fyi` wakes nobody. The change
-from today is that `status` and `fyi` are *stored anyway*, so an agent that
-wants them can pull them instead of them being dropped unrecoverably.
+`status` wakes only as a coalesced summary; `fyi` wakes nobody. The change from
+today is that `status` and `fyi` are *stored anyway*, so an agent that wants
+them can pull them instead of them being dropped unrecoverably.
 
-**Status is stored once.** Either the raw messages or the generated summary
-enters the mailbox — never both, since they are different `id`s and dedupe
-cannot collapse them. Decision: **store raw, summarize at wake-up.** The
-summary is a presentation of the mailbox, not a second entry in it.
+**Status has one representation: raw entries in the mailbox.** The summary sent
+at wake-up is rendered from them and is never itself stored — a rendering has
+no `id` and no lifecycle. See §8 for what happens when raw status entries
+exceed the cap.
 
 ---
 
@@ -422,7 +475,7 @@ returned.**
 | `kind` | policy on a full mailbox |
 |---|---|
 | `reply` | **reject at send.** The sender gets an explicit failure naming the blocked recipient. Never silently dropped — it is the one kind carrying a conversational obligation. |
-| `status` | **coalesce** into the existing summary entry. Bounded by construction. |
+| `status` | **collapse the oldest raw entries into one gap entry** (`"N status messages elided"`), which is itself a normal mailbox entry with its own id. Bounded, and the representation stays "raw entries" throughout — nothing is stored in two shapes. |
 | `fyi` | **droppable**, with a counter surfaced in `abg status` and as a gap marker on the next drain. |
 | `untagged` | drop-oldest, gap-marked on drain. |
 
@@ -472,12 +525,38 @@ Rules:
 - The daemon sets `from` from `ws.data.agent`. Codex's ingress is attributed to
   `codex` because of which adapter it arrived through. System notices are
   attributed to `system`.
-- If a payload carries `from` or `source` **disagreeing** with the socket
-  identity, the message is **rejected and logged** — not silently corrected. A
-  mismatch is either a bug or an impersonation attempt, and both deserve to be
-  loud.
 - `senderRef` is the one sender-supplied identifier that is kept, and it is used
   only for correlating a reply with a request. It never routes.
+
+### 10.1 Normalization — one function, version-aware
+
+Revision 2 said two different things about a payload whose `source` disagrees
+with the socket: §10 rejected it unconditionally, §11 ignored it for legacy
+frontends. Both cannot be the rule, and a rule stated twice is how the first
+draft's routing bug happened.
+
+**There is exactly one normalization function, and it lives inside
+authenticated ingress:**
+
+```ts
+function normalizeIngress(
+  raw: unknown,
+  socket: { agent: Origin; protocolVersion: number | null },
+): BridgeMessage;   // throws on rejection
+```
+
+Nothing else reads `source`. Nothing else writes `from`. The version is a
+parameter, not a second code path:
+
+| declared version | payload `from` / `source` |
+|---|---|
+| ≥ 1 (current) | must be absent, or equal `socket.agent`. Disagreement → **reject and log.** |
+| absent (legacy 0.7) | **ignored entirely.** The field is vestigial in that version, was never authenticated, and cannot be a mismatch signal. |
+
+`from` is set from `socket.agent` in both rows. The difference is only whether
+a disagreeing payload field is an error or noise — and that is a property of
+what the version *promised*, which is why the version must be declared rather
+than inferred.
 
 ---
 
@@ -487,16 +566,15 @@ The wire format changes. A 0.7 frontend against a 0.8 daemon must not silently
 drop messages — silent cross-version loss is the failure class this document
 removes, and shipping it in the fix would be self-defeating.
 
-**Negotiate, don't sniff.** `claude_connect` gains a `protocolVersion`. The
-daemon keys its compatibility behaviour on the declared version rather than
-inferring it from which fields happen to be missing — inference is how a
-partially-upgraded Grok frontend sending a legacy `source: "claude"` would get
-silently mis-attributed.
+**Negotiate, don't sniff.** `claude_connect` gains a `protocolVersion`, and
+§10.1 keys off it. Inferring the version from which fields happen to be present
+is how a partially-upgraded frontend sending a legacy `source: "claude"` would
+get silently mis-handled.
 
-- **Old frontend (no `protocolVersion`) + new daemon:** the daemon treats it as
-  0.7. It ignores payload `source` for attribution (§10 applies regardless),
-  treats the message as unaddressed, and emits **both** `from` and `source` on
-  the way out so the old frontend still parses it. `source` is dropped in 0.9.
+- **Old frontend (no `protocolVersion`) + new daemon:** normalized by the legacy
+  row of §10.1. Treated as unaddressed, and **both** `from` and `source` are
+  emitted on the way out so the old frontend still parses it. `source` is
+  dropped in 0.9.
 - **New frontend + old daemon:** the frontend detects the absent version
   handshake **before sending anything** and refuses with a clear message naming
   `abg kill`. It does not degrade silently.
@@ -518,7 +596,8 @@ branch, and repo facets. (This retires `docs/scaling-plan.md` §4.1a constraint
 #2, "discovery is a file, not a method"; `active_sessions.json` is obsolete for
 attach and was observed empty even where sessions existed.)
 
-It declares `acknowledgesDelivery` and nothing else changes. **That is the test
+It declares its `payloadMode` and `acknowledgementMode` and nothing else
+changes. **That is the test
 of whether this design is right** — if adding the adapter requires touching §6
 or §7, the design is wrong.
 
@@ -563,14 +642,21 @@ almost for free, which is part of why §6 chose causal routing.
 | unit | `MARKER_REGEX` extracts `@agent`; bare `@agent` in prose does not address; unknown `@name` fails rather than broadcasts; `[IMPORTANT]` → `reply` |
 | unit | structured `reply({to})` builds the envelope directly; a conflicting embedded marker is rejected |
 | unit | `from: "system"` never mutates routing state |
-| unit | per-kind overflow: `reply` rejects at send; `status` coalesces; `fyi` drops with a counter; a full mailbox for A still accepts for B |
+| unit | per-kind overflow: `reply` rejects at send; `status` collapses to a gap entry; `fyi` drops with a counter; a full mailbox for A still accepts for B |
 | unit | daemon-assigned canonical ids; `senderRef` preserved; two agents cannot collide |
+| unit | leased drain: a second drain during a live lease returns nothing; an expired lease redelivers; a partial `ack` redelivers only the unacked ids |
+| unit | `normalizeIngress` is the only writer of `from` — current version rejects a disagreeing payload, legacy version ignores it, both derive from the socket |
+| unit | status overflow produces a gap entry with its own id; no summary is ever stored |
+| security | `inReplyTo` naming a message the replier did not receive is rejected |
+| security | `inReplyTo` naming an expired or unknown index entry fails rather than broadcasting |
 | security | a payload `from` disagreeing with socket identity is rejected, not corrected |
 | security | attribution comes from `ws.data.agent`, not the payload, on every ingress |
 | e2e | **an enqueue failure prevents the wake-up** — ordering is enforced, not asserted |
 | e2e | frontend→Codex goes through the ledger; `deliverToCodex` is reachable only as a step-3 transport |
 | e2e | a wake-up that throws still leaves the message drainable |
-| e2e | `acknowledgesDelivery: false` + silently-ignored wake-up → exactly one copy on the next pull |
+| e2e | **the `tengu_harbor` case**: a content push that returns success while the model receives nothing → the message is still drainable, and arrives exactly once |
+| e2e | a content push that *is* delivered, then acked on the next drain → the message is not seen twice |
+| e2e | the provenance index outlives the acked message: a reply arriving after the original was drained still routes to its sender |
 | e2e | concurrent Claude and Grok turns against Codex: each reply routes to its own requester |
 | e2e | `requireReply` is not satisfied by a reply addressed elsewhere |
 | e2e | daemon restart: mailboxes are empty and the loss is reported, not silent |
@@ -580,14 +666,30 @@ That last row is the acceptance criterion for the whole document.
 
 ---
 
-## Appendix: review response (revision 1 → 2)
+## Appendix A: review response (revision 2 → 3)
+
+| Finding | Disposition |
+|---|---|
+| `acknowledgesDelivery` relocates the trust assumption rather than removing it | **Accepted, and my revision-2 counter-proposal withdrawn.** The disproof is in this repository: `docs/channels-silent-block.md` records a successful `notifications/claude/channel` call that the model never sees, gated by a server-side per-account flag no compiled-in capability can observe. Split into `payloadMode` × `acknowledgementMode` (§7). Claude keeps `content` push; the push no longer consumes. |
+| Drain ack has no wire protocol | **Accepted.** §5.1: leased batches, explicit `ack(batchId, ids)`, lease expiry redelivers. |
+| `inReplyTo` cannot resolve after the original is drained | **Accepted.** §5.2 adds a daemon-owned `messageIndex` with TTL, plus an authorization check so an id cannot be guessed into a routing capability. |
+| §10 and §11 contradict on legacy `source` | **Accepted.** One `normalizeIngress(raw, socket)` inside authenticated ingress, version as a parameter (§10.1). |
+| §7 stores raw status, §8 coalesces into a stored summary | **Accepted.** One representation: raw entries. Overflow collapses old ones into a gap entry that is itself an ordinary entry. The wake-up summary is rendered, never stored. |
+| `ReplyOutbox` must not duplicate custody | **Accepted.** Mailbox ids only. |
+
+Revision 2's remaining position — no disk persistence — is unchanged and was
+not contested.
+
+---
+
+## Appendix B: review response (revision 1 → 2)
 
 | # | Finding | Disposition |
 |---|---|---|
 | 1 | Routing rule duplicated (attached vs known) | **Accepted.** §6 is now a single `resolveRecipients`; "known" uniformly. |
 | 2 | Ledger ownership undefined | **Accepted**, daemon-owned mailbox. `ClaudeAdapter.pendingMessages` deleted. |
 | 3 | Step ordering bypassed by `deliverToCodex` | **Accepted.** Verified at `daemon.ts:517,635`. Single `routeMessage` entry; Codex gets a mailbox. |
-| 4 | Dedupe needs acknowledgement | **Finding accepted, recommendation declined.** Content-free wake-ups penalise Claude's inline delivery to fix an unknown-host problem. Replaced with a per-transport `acknowledgesDelivery` flag defaulting to `false`. |
+| 4 | Dedupe needs acknowledgement | Finding accepted; revision 2's counter-proposal (a per-transport `acknowledgesDelivery` flag) was **withdrawn in revision 3** — see Appendix A. |
 | 5 | `lastAddressedBy` wrong under concurrency | **Accepted.** Removed entirely; replaced with `inReplyTo` + turn-scoped `activeRequester`. |
 | 6 | Migration auth hole | **Accepted**, and escalated to its own section (§10). `from` from socket identity; disagreement rejects; version negotiated not sniffed. |
 | 7 | `drop-oldest` wrong for accepted replies | **Accepted.** Per-kind contract in §8; per-recipient independent acceptance. Disk persistence still declined (§13) — reject-at-send makes loss visible without a storage format. |
