@@ -63,10 +63,10 @@ const DISABLED_RECOVERY_MAX_ATTEMPTS = 6;
 const DISABLED_RECOVERY_CONFIRM_TIMEOUT_MS = 1000;
 
 claude.setReplySender(async (msg: BridgeMessage, requireReply?: boolean) => {
-  if (msg.source !== "claude") {
-    return { success: false, error: "Invalid message source" };
-  }
-
+  // The `msg.source !== "claude"` check that used to live here was
+  // client-side — in the very process that would be doing the spoofing.
+  // Attribution is now derived from the authenticated socket by
+  // normalizeIngress on the daemon side.
   if (daemonDisabled) {
     return {
       success: false,
