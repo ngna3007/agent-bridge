@@ -82,11 +82,22 @@ export class Mailbox {
         };
 
       case "status": {
+        // A capacity-1 (or 0) mailbox has no room for both a gap entry
+        // and the incoming message. Skip the gap entry: drop the oldest
+        // and let it surface as an ordinary gap marker through
+        // unreportedDrops on the next drain instead.
+        if (this.opts.capacity < 2) {
+          this.dropOldestFree();
+          this.push(message);
+          return { accepted: true };
+        }
         // Collapse the oldest raw status entries into one gap entry that
         // is itself an ordinary entry with its own id. Status keeps a
         // single representation: raw entries, never a stored summary.
+        // The gap entry stands in for the elided entries, so it is
+        // inserted where they were — at the front — not appended.
         const collapsed = this.collapseOldest("status");
-        this.push({
+        this.pushFront({
           id: this.nextId(),
           from: "system",
           to: this.agent,
@@ -131,29 +142,37 @@ export class Mailbox {
     this.entries.push({ message, leasedBy: null, leaseExpiresAt: 0 });
   }
 
+  private pushFront(message: BridgeMessage): void {
+    this.entries.unshift({ message, leasedBy: null, leaseExpiresAt: 0 });
+  }
+
   /**
-   * Remove the oldest entries of one kind, leaving at least one slot
-   * free. Returns how many were removed.
+   * Remove entries of one kind until two slots are free — one for the
+   * gap entry, one for the incoming message. When same-kind victims run
+   * out before that, fall back to the oldest free entry of any kind so
+   * the loop always makes progress toward those two free slots. Returns
+   * how many entries were removed in total. Callers with capacity < 2
+   * must not call this — see the capacity guard in `enqueue`.
    */
   private collapseOldest(kind: MessageKind): number {
     let removed = 0;
-    // Two slots: one for the gap entry, one for the incoming message.
     while (this.entries.length > this.opts.capacity - 2) {
       const idx = this.entries.findIndex((e) => e.message.kind === kind);
-      if (idx === -1) break;
+      if (idx === -1) {
+        this.dropOldestFree();
+        removed++;
+        continue;
+      }
       this.entries.splice(idx, 1);
       removed++;
       this.dropped[kind]++;
     }
-    if (removed === 0) {
-      // Nothing of this kind to collapse — fall back to the oldest entry
-      // so the incoming message still has somewhere to go.
-      this.dropOldestFree();
-      removed = 1;
-    }
     return removed;
   }
 
+  // Evicts the globally oldest unleased entry, not the oldest entry of
+  // any particular kind — a mailbox is one recipient's single ordered
+  // queue, and "oldest" means oldest overall across all kinds.
   private dropOldestFree(): void {
     const idx = this.entries.findIndex((e) => e.leasedBy === null);
     const victim = this.entries.splice(idx === -1 ? 0 : idx, 1)[0];

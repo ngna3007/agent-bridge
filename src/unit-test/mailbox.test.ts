@@ -76,4 +76,24 @@ describe("mailbox overflow is per-kind and decided before success", () => {
     m.remove([a.id]);
     expect(m.size).toBe(0);
   });
+
+  test("status collapse never pushes the mailbox past capacity with mixed-kind traffic", () => {
+    // Regression for a partial collapse: a same-kind victim can run out
+    // before two slots are free (mixed kinds at capacity 3: only one
+    // status entry to collapse). The mailbox must still end at or under
+    // capacity, not grow past it.
+    const m = box(3);
+    m.enqueue(msg("status", "a"));
+    m.enqueue(msg("fyi", "b"));
+    m.enqueue(msg("reply", "c"));
+    expect(m.enqueue(msg("status", "d")).accepted).toBe(true);
+    expect(m.size).toBeLessThanOrEqual(3);
+  });
+
+  test("status collapse at capacity < 2 skips the gap entry and stays at capacity", () => {
+    const m = box(1);
+    m.enqueue(msg("status", "a"));
+    expect(m.enqueue(msg("status", "b")).accepted).toBe(true);
+    expect(m.size).toBeLessThanOrEqual(1);
+  });
 });
