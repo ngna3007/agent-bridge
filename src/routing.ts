@@ -29,7 +29,18 @@ export function resolveRecipients(
   const everyoneElse = () =>
     state.knownAgents().filter((a) => a !== envelope.from);
 
-  if (isAgentId(envelope.to)) return [envelope.to];
+  if (isAgentId(envelope.to)) {
+    if (envelope.to === envelope.from) {
+      // Self-addressing is an agent bug, not a delivery case. Reject loudly
+      // — same treatment as an unresolvable inReplyTo — so the sender
+      // learns its marker was wrong instead of the message quietly
+      // vanishing, and the no-forward-to-origin invariant holds.
+      throw new RoutingError(
+        `${envelope.from} addressed itself; a sender is never its own recipient`,
+      );
+    }
+    return [envelope.to];
+  }
   if (envelope.to === "*") return everyoneElse();
 
   // System notices are observations about the bus, not turns in a

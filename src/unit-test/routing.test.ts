@@ -28,6 +28,22 @@ describe("resolveRecipients", () => {
     expect(resolveRecipients(env({ from: "codex", to: "grok" }), state(), 0)).toEqual(["grok"]);
   });
 
+  test("an explicit address equal to the sender throws rather than looping back", () => {
+    expect(() => resolveRecipients(env({ from: "codex", to: "codex" }), state(), 0)).toThrow(
+      RoutingError,
+    );
+    expect(() => resolveRecipients(env({ from: "codex", to: "codex" }), state(), 0)).toThrow(
+      /codex/,
+    );
+  });
+
+  test('"*" broadcast still excludes only the sender, unaffected by the self-address guard', () => {
+    expect(resolveRecipients(env({ from: "codex", to: "*" }), state(), 0)).toEqual([
+      "claude",
+      "grok",
+    ]);
+  });
+
   test('"*" broadcasts to every known agent except the sender', () => {
     expect(resolveRecipients(env({ from: "codex", to: "*" }), state(), 0)).toEqual([
       "claude",
