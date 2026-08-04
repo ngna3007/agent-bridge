@@ -103,10 +103,18 @@ export type ControlClientMessage =
  *   [REPLY] events and any system_* lifecycle notice the daemon
  *   wants Claude to act on immediately.
  *
- * - "queue": held in the ClaudeAdapter's pull queue. Claude only sees
- *   it when it explicitly calls the get_messages tool. Used for
- *   untagged Codex output so that not every Codex reply automatically
- *   spends Claude's context tokens.
+ * - "queue": not pushed. The message stays in the daemon's mailbox for
+ *   that agent — there is no second queue in the frontend any more —
+ *   and Claude sees it when it calls get_messages, which is what drains
+ *   and acks the mailbox. Used for untagged Codex output so that not
+ *   every Codex line automatically spends Claude's context tokens.
+ *
+ * The hint is advisory in exactly one direction: a frontend too old to
+ * know the field pushes everything, which is what it did before the
+ * field existed. It is not advisory in the other — a frontend that
+ * receives "queue" and pushes anyway makes this type a lie, and makes
+ * liars of `BRIDGE_CONTRACT_REMINDER` and every doc that describes the
+ * pull queue to the agents using it.
  */
 export type ClaudeDeliveryHint = "push" | "queue";
 

@@ -84,37 +84,34 @@ claude.setReplySender(async (msg: BridgeMessage, requireReply?: boolean) => {
 
 // Statusbar tags + colors live in src/lifecycle-tags.ts so daemon.ts
 // (which writes [BRIDGE STOPPED] on shutdown) can never drift from
-// what bridge.ts emits.
+// what bridge.ts emits. The push-or-queue decision lives in
+// src/inbound-disposition.ts so it can be unit-tested.
 import { tagForLifecycle } from "./lifecycle-tags";
+import { dispositionFor } from "./inbound-disposition";
 
-daemonClient.on("codexMessage", (message) => {
-  const tag = isDaemonLifecycle(message.id);
-  if (tag) {
-    log(`Daemon lifecycle event ${message.id} → status.line`);
-    statusLine.write(tag);
-    return;
+daemonClient.on("codexMessage", (message, deliveryHint) => {
+  const disposition = dispositionFor(message.id, deliveryHint);
+  switch (disposition.kind) {
+    case "lifecycle":
+      log(`Daemon lifecycle event ${message.id} → status.line`);
+      statusLine.write(disposition.tag);
+      return;
+    case "queue":
+      // Held, not dropped. The daemon's mailbox still has it and
+      // get_messages drains it; not pushing is what keeps routine Codex
+      // output from spending Claude's context, which is the contract
+      // both CLAUDE.md and the reminder injected into Codex describe.
+      log(`Holding ${message.id} for get_messages (hint=queue)`);
+      return;
+    case "push":
+      // A push is a wake-up. It never consumes — the message stays in
+      // the daemon's mailbox until an ack, so a channel that silently
+      // drops it costs latency rather than the message.
+      log(`Waking Claude for ${message.id} (${message.content.length} chars)`);
+      void claude.pushNotification(message);
+      return;
   }
-  // A push is a wake-up. It never consumes — the message stays in the
-  // daemon's mailbox until an ack, so a channel that silently drops it
-  // costs latency rather than the message. The daemon's delivery hint
-  // no longer changes this: every non-lifecycle message wakes Claude,
-  // and get_messages is what actually drains the mailbox.
-  log(`Waking Claude for ${message.id} (${message.content.length} chars)`);
-  void claude.pushNotification(message);
 });
-
-function isDaemonLifecycle(id: string): string | null {
-  // Daemon-side BridgeMessage ids are formatted as "<prefix>_<ts>",
-  // e.g. "system_waiting_1717000000000". Extract the prefix portion
-  // and look it up in the shared tag table. Anything system_* falls
-  // back to a sanitized auto-uppercased tag so a new event id can
-  // never silently leak into Claude's chat.
-  const match = /^([a-z_]+?)_\d+$/.exec(id);
-  if (!match) return null;
-  const prefix = match[1];
-  if (!prefix.startsWith("system_")) return null;
-  return tagForLifecycle(prefix);
-}
 
 daemonClient.on("status", (status) => {
   log(
