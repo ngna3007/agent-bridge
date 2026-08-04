@@ -246,6 +246,107 @@ describe("CodexAdapter turn state machine", () => {
     expect(adapter.injectMessage("hello")).toBe(true);
   });
 
+  test("a second injectMessage in the same tick is refused, before turn/started lands", () => {
+    // The daemon fires up to three injections back to back when a turn
+    // completes (Claude-online notice, held AgentBridge notices, queued
+    // reply). `turn/started` is an async round trip away, so turnInProgress
+    // is still false for all of them. Without the in-flight reservation
+    // every one of them would send its own turn/start and the losers would
+    // be dropped upstream while the daemon reported them delivered.
+    const adapter = createAdapter();
+    const sent: string[] = [];
+    adapter.threadId = "thread-1";
+    adapter.appServerWs = { readyState: WebSocket.OPEN, send: (data: string) => sent.push(data) } as any;
+
+    expect(adapter.injectMessage("first")).toBe(true);
+    expect(adapter.turnInProgress).toBe(false);
+    expect(adapter.injectMessage("second")).toBe(false);
+    expect(adapter.injectMessage("third")).toBe(false);
+
+    expect(sent.length).toBe(1);
+    // The caller that was refused must be able to tell "retry later" from
+    // "nowhere to send this" — that is what turnPending answers.
+    expect(adapter.turnPending).toBe(true);
+    // Held under a timer, so a turn/start that is never confirmed cannot
+    // stall injection forever.
+    expect(adapter.pendingTurnStarts.size).toBe(1);
+
+    adapter.clearResponseTrackingState();
+  });
+
+  test("turn/started releases the reservation and hands the guard to turnInProgress", () => {
+    const adapter = createAdapter();
+    adapter.threadId = "thread-1";
+    adapter.appServerWs = { readyState: WebSocket.OPEN, send: () => {} } as any;
+
+    expect(adapter.injectMessage("hello")).toBe(true);
+    adapter.handleServerNotification({ method: "turn/started", params: { turn: { id: "t1" } } });
+
+    expect(adapter.pendingTurnStarts.size).toBe(0);
+    expect(adapter.turnInProgress).toBe(true);
+    expect(adapter.turnPending).toBe(true);
+
+    adapter.handleServerNotification({ method: "turn/completed", params: { turn: { id: "t1" } } });
+    expect(adapter.turnPending).toBe(false);
+    expect(adapter.injectMessage("next turn")).toBe(true);
+
+    adapter.clearResponseTrackingState();
+  });
+
+  test("a refused turn/start releases the reservation instead of stalling injection", () => {
+    // The stall this guards against: a turn/start the app-server rejects
+    // never produces a turn/started, so nothing but the error response can
+    // free the slot.
+    const adapter = createAdapter();
+    adapter.threadId = "thread-1";
+    adapter.appServerWs = { readyState: WebSocket.OPEN, send: () => {} } as any;
+
+    expect(adapter.injectMessage("hello")).toBe(true);
+    const requestId = adapter.nextInjectionId + 1;
+    expect(adapter.injectMessage("blocked")).toBe(false);
+
+    adapter.handleAppServerPayload(JSON.stringify({ id: requestId, error: { message: "boom" } }));
+
+    expect(adapter.pendingTurnStarts.size).toBe(0);
+    expect(adapter.turnPending).toBe(false);
+    expect(adapter.injectMessage("retry")).toBe(true);
+
+    adapter.clearResponseTrackingState();
+  });
+
+  test("a connection reset releases the reservation", () => {
+    // Both turn-state resets (app-server close, new-session reconnect) run
+    // through clearResponseTrackingState. Nothing on the old connection can
+    // confirm a turn/start sent on it.
+    const adapter = createAdapter();
+    adapter.threadId = "thread-1";
+    adapter.appServerWs = { readyState: WebSocket.OPEN, send: () => {} } as any;
+
+    expect(adapter.injectMessage("hello")).toBe(true);
+    expect(adapter.turnPending).toBe(true);
+
+    adapter.clearResponseTrackingState();
+
+    expect(adapter.pendingTurnStarts.size).toBe(0);
+    expect(adapter.turnPending).toBe(false);
+    expect(adapter.injectMessage("after reset")).toBe(true);
+
+    adapter.clearResponseTrackingState();
+  });
+
+  test("a send that throws reserves nothing", () => {
+    const adapter = createAdapter();
+    adapter.threadId = "thread-1";
+    adapter.appServerWs = {
+      readyState: WebSocket.OPEN,
+      send: () => { throw new Error("socket died"); },
+    } as any;
+
+    expect(adapter.injectMessage("hello")).toBe(false);
+    expect(adapter.pendingTurnStarts.size).toBe(0);
+    expect(adapter.turnPending).toBe(false);
+  });
+
   test("clearResponseTrackingState + turn reset simulates onclose behavior", () => {
     const adapter = createAdapter();
     // Start a turn and track a response

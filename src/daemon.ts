@@ -345,7 +345,11 @@ registerTransport("codex", {
     if (requester) outboxRequester.set(message.id, requester);
     log(`Queued reply for Codex while it was busy (depth ${depth}, dropped ${dropped.length})`);
 
-    let note = codex.turnInProgress
+    // `turnPending`, not `turnInProgress`: a turn/start already on the
+    // wire is a turn from the sender's point of view, and telling them
+    // "no thread" for it would be wrong in the one direction that
+    // matters — it reads as "gone", not as "held".
+    let note = codex.turnPending
       ? depth > 1
         ? `Codex is mid-turn. Held for delivery when the turn ends (${depth} replies now queued, sent in order).`
         : "Codex is mid-turn. Held for delivery when the turn ends."
@@ -1213,8 +1217,13 @@ function drainReplyOutbox(): void {
     return;
   }
 
-  if (codex.turnInProgress) {
-    // A new turn started between the completion event and this call.
+  if (codex.turnPending) {
+    // A new turn started — or was started, by the notice flush a few
+    // lines earlier in the same tick — between the completion event and
+    // this call. `turnPending` covers the in-flight case that
+    // `turnInProgress` cannot see yet; without it a deferral here would
+    // fall through to the "thread is gone" branch below and discard the
+    // whole outbox.
     // Keep the original queuedAt so the TTL still measures Claude's wait.
     replyOutbox.requeue(reply);
     log(`Queued reply ${reply.id} still blocked by an in-progress turn; keeping it`);

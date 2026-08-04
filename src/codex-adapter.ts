@@ -94,6 +94,48 @@ export class CodexAdapter extends EventEmitter {
   private activeTurnIds = new Set<string>();
   turnInProgress = false;
 
+  /**
+   * `turn/start` requests this bridge has sent but the app-server has not
+   * yet confirmed with a `turn/started`.
+   *
+   * `turnInProgress` is set from the `turn/started` notification, which is
+   * an async round trip away. Two callers in the same synchronous tick —
+   * the daemon fires three of them back to back when a turn completes —
+   * would both read `false` and both send a `turn/start` on a thread that
+   * runs one turn at a time. The loser is logged upstream and dropped,
+   * while the daemon has already reported it delivered. A reservation
+   * taken the instant the frame goes out closes that window: the second
+   * caller is refused and keeps its payload for the next turn.
+   *
+   * Every entry carries a timer, so a reservation whose turn never starts
+   * expires instead of stalling injection forever. See `reserveTurnStart`.
+   */
+  private pendingTurnStarts = new Map<number, ReturnType<typeof setTimeout>>();
+
+  /**
+   * How long an unconfirmed `turn/start` blocks the next injection.
+   *
+   * The failure this bounds is a `turn/start` that is neither answered nor
+   * followed by a `turn/started` — a dropped frame, an app-server that
+   * accepted and forgot. Long enough that a healthy round trip is never
+   * cut short, short enough that a lost one costs one deferral rather
+   * than the rest of the session.
+   */
+  private static readonly TURN_START_CONFIRM_TIMEOUT_MS = 15000;
+
+  /**
+   * Whether an injection right now would be refused because Codex is
+   * already occupied — a turn running, or one starting.
+   *
+   * Callers that hold a payload must ask this, not `turnInProgress`, to
+   * tell "retry when the turn ends" apart from "there is nowhere to send
+   * this". Reading `turnInProgress` alone during the in-flight window
+   * misreads a deferral as a dead thread.
+   */
+  get turnPending(): boolean {
+    return this.turnInProgress || this.pendingTurnStarts.size > 0;
+  }
+
   // Proxy-layer id rewriting: upstream uses globally unique ids
   private nextProxyId = 100000;
   private upstreamToClient = new Map<number, { connId: number; clientId: number | string }>();
@@ -248,6 +290,14 @@ export class CodexAdapter extends EventEmitter {
       this.log(`Rejected injection: Codex turn is in progress (thread ${this.threadId})`);
       return false;
     }
+    if (this.pendingTurnStarts.size > 0) {
+      // A turn/start sent moments ago that the app-server has not yet
+      // confirmed. Treated exactly like an in-progress turn, because it
+      // is about to become one — and a caller that reads `false` here
+      // keeps its payload, which is the whole point.
+      this.log(`Rejected injection: a turn/start is already in flight (thread ${this.threadId})`);
+      return false;
+    }
     this.log(`Injecting message into Codex (${text.length} chars)`);
     const requestId = this.nextInjectionId--;
     this.trackBridgeRequestId(requestId);
@@ -257,6 +307,9 @@ export class CodexAdapter extends EventEmitter {
         id: requestId,
         params: { threadId: this.threadId, input: [{ type: "text", text }] },
       } satisfies AppServerRequest<"turn/start", TurnStartParams>));
+      // Only after the frame is actually on the wire: a send that threw
+      // started nothing and must not block the next caller.
+      this.reserveTurnStart(requestId);
       return true;
     } catch (err: any) {
       this.untrackBridgeRequestId(requestId);
@@ -1213,6 +1266,11 @@ export class CodexAdapter extends EventEmitter {
     }
 
     if (!isNaN(numericId) && this.consumeBridgeRequestId(numericId)) {
+      // Answered, so it is no longer in flight — on error especially: a
+      // turn/start that was refused will never produce a turn/started,
+      // and holding its reservation would block injection until the
+      // timeout for no reason.
+      this.clearTrackedId(this.pendingTurnStarts, numericId);
       if (parsed.error) {
         this.log(`Bridge-originated request failed (id ${responseId}): ${parsed.error.message ?? "unknown error"}`);
       } else {
@@ -1419,7 +1477,36 @@ export class CodexAdapter extends EventEmitter {
     this.emit("ready", threadId);
   }
 
+  /**
+   * Claim the single turn slot from the moment `turn/start` is sent.
+   *
+   * The timer is the anti-stall: the reservation is released by
+   * `turn/started`, by the response to this very request, and by every
+   * path that resets turn state — but if all of those are missed, the
+   * timer releases it anyway. A flag that can only be set by an event
+   * that may never arrive is how a race becomes a permanent stall.
+   */
+  private reserveTurnStart(requestId: number) {
+    this.clearTrackedId(this.pendingTurnStarts, requestId);
+    const timer = setTimeout(() => {
+      this.pendingTurnStarts.delete(requestId);
+      this.log(`turn/start ${requestId} was never confirmed; releasing the injection slot`);
+    }, CodexAdapter.TURN_START_CONFIRM_TIMEOUT_MS);
+    timer.unref?.();
+    this.pendingTurnStarts.set(requestId, timer);
+  }
+
+  /** Release every reservation: the app-server's turn state has been resolved for us. */
+  private clearPendingTurnStarts() {
+    for (const timer of this.pendingTurnStarts.values()) clearTimeout(timer);
+    this.pendingTurnStarts.clear();
+  }
+
   private markTurnStarted(turnId?: string) {
+    // A turn is running, whoever started it. `turnInProgress` now guards
+    // injection on its own, so the optimistic reservation has done its
+    // job and holding it longer would only delay the next injection.
+    this.clearPendingTurnStarts();
     const wasInProgress = this.turnInProgress;
     if (typeof turnId === "string" && turnId.length > 0) {
       this.activeTurnIds.add(turnId);
@@ -1536,6 +1623,13 @@ export class CodexAdapter extends EventEmitter {
       clearTimeout(timer);
     }
     this.bridgeRequestIds.clear();
+
+    // A turn/start reservation is keyed by a bridge request id, so once
+    // those are dropped no response can ever release it. Released here so
+    // every connection-scoped reset — app-server close and new-session
+    // reconnect both land in this method — frees the injection slot
+    // without each having to remember to.
+    this.clearPendingTurnStarts();
   }
 
   private clearResponseTrackingState() {
