@@ -14990,6 +14990,23 @@ var DAEMON_LIFECYCLE_IDS = new Set([
   "system_tui_reconnected"
 ]);
 
+// src/inbound-disposition.ts
+function lifecycleTagFor(id) {
+  const match = /^([a-z_]+?)_\d+$/.exec(id);
+  if (!match)
+    return null;
+  const prefix = match[1];
+  if (!prefix.startsWith("system_"))
+    return null;
+  return tagForLifecycle(prefix);
+}
+function dispositionFor(id, hint) {
+  const tag = lifecycleTagFor(id);
+  if (tag)
+    return { kind: "lifecycle", tag };
+  return hint === "queue" ? { kind: "queue" } : { kind: "push" };
+}
+
 // src/bridge.ts
 if (process.env.AGENTBRIDGE_ACTIVE !== "1") {
   process.exit(0);
@@ -15031,25 +15048,22 @@ claude.setReplySender(async (msg, requireReply) => {
   }
   return daemonClient.sendReply(msg, requireReply);
 });
-daemonClient.on("codexMessage", (message) => {
-  const tag = isDaemonLifecycle(message.id);
-  if (tag) {
-    log(`Daemon lifecycle event ${message.id} \u2192 status.line`);
-    statusLine.write(tag);
-    return;
+daemonClient.on("codexMessage", (message, deliveryHint) => {
+  const disposition = dispositionFor(message.id, deliveryHint);
+  switch (disposition.kind) {
+    case "lifecycle":
+      log(`Daemon lifecycle event ${message.id} \u2192 status.line`);
+      statusLine.write(disposition.tag);
+      return;
+    case "queue":
+      log(`Holding ${message.id} for get_messages (hint=queue)`);
+      return;
+    case "push":
+      log(`Waking Claude for ${message.id} (${message.content.length} chars)`);
+      claude.pushNotification(message);
+      return;
   }
-  log(`Waking Claude for ${message.id} (${message.content.length} chars)`);
-  claude.pushNotification(message);
 });
-function isDaemonLifecycle(id) {
-  const match = /^([a-z_]+?)_\d+$/.exec(id);
-  if (!match)
-    return null;
-  const prefix = match[1];
-  if (!prefix.startsWith("system_"))
-    return null;
-  return tagForLifecycle(prefix);
-}
 daemonClient.on("status", (status) => {
   log(`Daemon status: ready=${status.bridgeReady} tui=${status.tuiConnected} thread=${status.threadId ?? "none"} queued=${status.queuedMessageCount}`);
   if (!hasSeenTuiConnect && status.tuiConnected && !previousTuiConnected) {

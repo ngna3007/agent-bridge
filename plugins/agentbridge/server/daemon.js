@@ -214,6 +214,7 @@ class CodexAdapter extends EventEmitter {
   activeTurnIds = new Set;
   turnInProgress = false;
   pendingTurnStarts = new Map;
+  injectionCorrelations = new Map;
   static TURN_START_CONFIRM_TIMEOUT_MS = 15000;
   get turnPending() {
     return this.turnInProgress || this.pendingTurnStarts.size > 0;
@@ -312,7 +313,7 @@ class CodexAdapter extends EventEmitter {
       proc.on("exit", () => clearTimeout(killTimer));
     }
   }
-  injectMessage(text) {
+  injectMessage(text, correlation) {
     if (!this.threadId) {
       this.log("Cannot inject: no active thread");
       return false;
@@ -321,12 +322,8 @@ class CodexAdapter extends EventEmitter {
       this.log("Cannot inject: app-server WebSocket not connected");
       return false;
     }
-    if (this.turnInProgress) {
-      this.log(`Rejected injection: Codex turn is in progress (thread ${this.threadId})`);
-      return false;
-    }
-    if (this.pendingTurnStarts.size > 0) {
-      this.log(`Rejected injection: a turn/start is already in flight (thread ${this.threadId})`);
+    if (this.turnPending) {
+      this.log(this.turnInProgress ? `Rejected injection: Codex turn is in progress (thread ${this.threadId})` : `Rejected injection: a turn/start is already in flight (thread ${this.threadId})`);
       return false;
     }
     this.log(`Injecting message into Codex (${text.length} chars)`);
@@ -339,6 +336,8 @@ class CodexAdapter extends EventEmitter {
         params: { threadId: this.threadId, input: [{ type: "text", text }] }
       }));
       this.reserveTurnStart(requestId);
+      if (correlation)
+        this.injectionCorrelations.set(requestId, correlation);
       return true;
     } catch (err) {
       this.untrackBridgeRequestId(requestId);
@@ -1027,8 +1026,13 @@ class CodexAdapter extends EventEmitter {
     }
     if (!isNaN(numericId) && this.consumeBridgeRequestId(numericId)) {
       this.clearTrackedId(this.pendingTurnStarts, numericId);
+      const correlation = this.injectionCorrelations.get(numericId);
+      this.injectionCorrelations.delete(numericId);
       if (parsed.error) {
-        this.log(`Bridge-originated request failed (id ${responseId}): ${parsed.error.message ?? "unknown error"}`);
+        const error = parsed.error.message ?? "unknown error";
+        this.log(`Bridge-originated request failed (id ${responseId}): ${error}`);
+        if (correlation)
+          this.emit("injectionRejected", { correlation, error });
       } else {
         this.log(`Bridge-originated request completed (id ${responseId})`);
       }
@@ -1208,6 +1212,7 @@ class CodexAdapter extends EventEmitter {
     this.clearTrackedId(this.pendingTurnStarts, requestId);
     const timer = setTimeout(() => {
       this.pendingTurnStarts.delete(requestId);
+      this.injectionCorrelations.delete(requestId);
       this.log(`turn/start ${requestId} was never confirmed; releasing the injection slot`);
     }, CodexAdapter.TURN_START_CONFIRM_TIMEOUT_MS);
     timer.unref?.();
@@ -1217,6 +1222,7 @@ class CodexAdapter extends EventEmitter {
     for (const timer of this.pendingTurnStarts.values())
       clearTimeout(timer);
     this.pendingTurnStarts.clear();
+    this.injectionCorrelations.clear();
   }
   markTurnStarted(turnId) {
     this.clearPendingTurnStarts();
@@ -2629,6 +2635,9 @@ function resolveRecipients(envelope, state, now) {
     if (envelope.to === envelope.from) {
       throw new RoutingError(`${envelope.from} addressed itself; a sender is never its own recipient`);
     }
+    if (!state.knownAgents().includes(envelope.to)) {
+      throw new RoutingError(`${envelope.to} has never connected to this bridge, so it has no session to deliver to. The message was not sent.`);
+    }
     return [envelope.to];
   }
   if (envelope.to === "*")
@@ -2710,6 +2719,12 @@ class PendingRequests {
     }
     return satisfied.reverse();
   }
+  cancel(messageId) {
+    const i = this.requests.findIndex((r) => r.messageId === messageId);
+    if (i === -1)
+      return null;
+    return this.requests.splice(i, 1)[0];
+  }
   expire(now, ttlMs) {
     const expired = [];
     for (let i = this.requests.length - 1;i >= 0; i--) {
@@ -2756,6 +2771,74 @@ function describeError(err) {
   } catch {
     return String(err);
   }
+}
+
+// src/daemon-bus.ts
+function deliveryHintFor(message, mode) {
+  if (mode === "full")
+    return "push";
+  switch (message.kind) {
+    case "reply":
+      return "push";
+    case "status":
+    case "fyi":
+      return "queue";
+    case "untagged":
+      return message.from === "system" ? "push" : "queue";
+  }
+}
+function senderFacingText(outcome) {
+  switch (outcome.status) {
+    case "delivered":
+      return null;
+    case "partial":
+      return outcome.note;
+    case "failed":
+      return outcome.error;
+  }
+}
+async function routeThroughBus(deps, envelope) {
+  const { bus, log } = deps;
+  try {
+    const outcome = await bus.route(envelope, (deps.now ?? Date.now)());
+    if (outcome.rejected.length === 0)
+      return { status: "delivered", accepted: outcome.accepted };
+    log(`Message ${envelope.id} rejected by ${outcome.rejected.map((r) => r.agent).join(", ")}`);
+    return {
+      status: "partial",
+      note: outcome.rejected.map((r) => r.reason).join(" "),
+      accepted: outcome.accepted
+    };
+  } catch (err) {
+    if (err instanceof RoutingError || err instanceof SendRejected) {
+      log(`Message ${envelope.id} was not delivered: ${err.message}`);
+      return { status: "failed", error: err.message };
+    }
+    log(`Message ${envelope.id} failed to route: ${describeRouteError(err)}`);
+    return { status: "failed", error: "The daemon could not route this message." };
+  }
+}
+function describeRouteError(err) {
+  if (err instanceof Error)
+    return err.message;
+  try {
+    return JSON.stringify(err);
+  } catch {
+    return String(err);
+  }
+}
+function registerTransport(deps, agent, transport) {
+  if (transport.acknowledgementMode !== "none") {
+    deps.transports.register(agent, transport);
+    return;
+  }
+  deps.transports.register(agent, {
+    ...transport,
+    wake: async (message) => {
+      await transport.wake(message);
+      deps.mailboxFor(agent).remove([message.id]);
+    }
+  });
 }
 
 // src/normalize-ingress.ts
@@ -2949,20 +3032,10 @@ function nextMessageId() {
 var requireReplyIds = new Set;
 var codexDeferralNotes = new Map;
 var outboxRequester = new Map;
-function registerTransport(agent, transport) {
-  if (transport.acknowledgementMode !== "none") {
-    transports.register(agent, transport);
-    return;
-  }
-  transports.register(agent, {
-    ...transport,
-    wake: async (message) => {
-      await transport.wake(message);
-      mailboxFor(agent).remove([message.id]);
-    }
-  });
+function registerTransport2(agent, transport) {
+  registerTransport({ transports, mailboxFor }, agent, transport);
 }
-registerTransport("codex", {
+registerTransport2("codex", {
   payloadMode: "content",
   acknowledgementMode: "none",
   wake: (message) => {
@@ -3004,52 +3077,12 @@ function frontendTransport(agent) {
   };
 }
 for (const agent of FRONTEND_AGENTS)
-  registerTransport(agent, frontendTransport(agent));
-function deliveryHintFor(message, mode) {
-  if (mode === "full")
-    return "push";
-  switch (message.kind) {
-    case "reply":
-      return "push";
-    case "status":
-    case "fyi":
-      return "queue";
-    case "untagged":
-      return message.from === "system" ? "push" : "queue";
-  }
-}
-function senderFacingText(outcome) {
-  switch (outcome.status) {
-    case "delivered":
-      return null;
-    case "partial":
-      return outcome.note;
-    case "failed":
-      return outcome.error;
-  }
-}
-async function routeThroughBus(envelope) {
-  try {
-    const outcome = await bus.route(envelope, Date.now());
-    if (outcome.rejected.length === 0)
-      return { status: "delivered", accepted: outcome.accepted };
-    log(`Message ${envelope.id} rejected by ${outcome.rejected.map((r) => r.agent).join(", ")}`);
-    return {
-      status: "partial",
-      note: outcome.rejected.map((r) => r.reason).join(" "),
-      accepted: outcome.accepted
-    };
-  } catch (err) {
-    if (err instanceof RoutingError || err instanceof SendRejected) {
-      log(`Message ${envelope.id} was not delivered: ${err.message}`);
-      return { status: "failed", error: err.message };
-    }
-    log(`Message ${envelope.id} failed to route: ${describeError2(err)}`);
-    return { status: "failed", error: "The daemon could not route this message." };
-  }
+  registerTransport2(agent, frontendTransport(agent));
+async function routeThroughBus2(envelope) {
+  return routeThroughBus({ bus, log }, envelope);
 }
 function routeOrLog(envelope) {
-  routeThroughBus(envelope).then((outcome) => {
+  routeThroughBus2(envelope).then((outcome) => {
     const text = senderFacingText(outcome);
     if (text !== null)
       log(`Daemon-authored ${envelope.id}: ${text}`);
@@ -3157,7 +3190,7 @@ async function handleCodexMessage(msg) {
   if (result.marker === "reply" && statusBuffer.size > 0) {
     statusBuffer.flush("reply message arrived");
   }
-  const outcome = await routeThroughBus(envelope);
+  const outcome = await routeThroughBus2(envelope);
   const text = senderFacingText(outcome);
   if (text !== null)
     tellCodex(text);
@@ -3168,10 +3201,16 @@ async function handleCodexMessage(msg) {
     startAttentionWindow();
   }
 }
+function endCodexTurn(why) {
+  if (!activeRequester.has("codex"))
+    return;
+  log(`Clearing Codex's turn-scoped requester: ${why}`);
+  activeRequester.delete("codex");
+}
 codex.on("turnCompleted", () => {
   log("Codex turn completed");
   statusBuffer.flush("turn completed");
-  activeRequester.delete("codex");
+  endCodexTurn("the turn completed");
   notifyFrontends((to) => systemMessage("system_turn_completed", "\u2705 Codex finished the current turn. You can reply now if needed.", to));
   startAttentionWindow();
   if (claudeSocket() && shouldNotifyCodexClaudeOnline()) {
@@ -3204,10 +3243,28 @@ codex.on("tuiDisconnected", (connId) => {
 codex.on("error", (err) => {
   log(`Codex error: ${err.message}`);
 });
+codex.on("injectionRejected", ({ correlation, error }) => {
+  log(`Codex refused the turn for ${correlation.id}: ${error}`);
+  endCodexTurn("Codex refused the turn");
+  if (pendingRequests.cancel(correlation.id)) {
+    log(`Cancelled the pending reply request for refused message ${correlation.id}`);
+  }
+  lastPinnedContractThreadId = null;
+  const notice = (to) => noticeMessage("turn_start_rejected", `\u26A0\uFE0F Codex refused the turn carrying your message \u2014 it was not delivered and Codex never saw it. ` + `The app-server said: ${error}
+
+Undelivered message:
+${truncateForNotice(correlation.text)}`, to);
+  const requester = isAgentId(correlation.requester) ? correlation.requester : null;
+  if (requester)
+    routeOrLog(notice(requester));
+  else
+    emitToFrontends(notice);
+});
 codex.on("exit", (code) => {
   log(`Codex process exited (code ${code})`);
   codexBootstrapped = false;
   statusBuffer.flush("codex exited");
+  endCodexTurn("the Codex app-server exited");
   tuiConnectionState.handleCodexExit();
   clearPendingClaudeDisconnect("Codex process exited");
   claudeOnlineNoticeSent = false;
@@ -3380,7 +3437,7 @@ async function sendFromFrontend(ws, requestId, frame, requireReply) {
   }
   if (requireReply)
     requireReplyIds.add(envelope.id);
-  const outcome = await routeThroughBus(envelope);
+  const outcome = await routeThroughBus2(envelope);
   requireReplyIds.delete(envelope.id);
   if (outcome.status === "failed") {
     sendProtocolMessage(ws, {
@@ -3414,7 +3471,7 @@ function deliverToCodex(content, requireReply, requester, messageId) {
   if (requireReply)
     contentToSend += REPLY_REQUIRED_INSTRUCTION;
   log(`Forwarding Claude \u2192 Codex (${content.length} chars, requireReply=${requireReply}, pinnedContract=${needsContract})`);
-  if (!codex.injectMessage(contentToSend))
+  if (!codex.injectMessage(contentToSend, { id: messageId, requester, text: content }))
     return false;
   if (needsContract && PIN_CONTRACT_MODE === "once" && activeThreadId) {
     lastPinnedContractThreadId = activeThreadId;
