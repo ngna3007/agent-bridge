@@ -278,8 +278,17 @@ const outboxRequester = new Map<string, AgentId>();
  *
  * This is where `deliverToCodex` is demoted from "the delivery" to "one
  * transport's wake-up". A refusal is a deferral, not a loss — the outbox
- * re-injects when the current turn ends, and the message itself stays in
- * Codex's mailbox either way.
+ * holds the content and re-injects when the current turn ends.
+ *
+ * Note what the deferral costs: this wake returns normally, so the
+ * `registerTransport` self-ack below deletes the mailbox entry even
+ * though Codex has not seen the message. On the deferred path the
+ * **outbox**, not the mailbox, is the system of record. That is why the
+ * outbox has to report every way it can drop an entry — cap-drop on
+ * accept, expiry and undeliverable in `drainReplyOutbox`, discard in
+ * `discardOutboxForLostCodex` — each echoing the text back to the
+ * sender. Those reports are what keep a deferral from becoming a silent
+ * loss once the mailbox copy is gone.
  */
 /**
  * Register a transport, self-acking it when it can never ack for itself.
@@ -580,6 +589,74 @@ codex.on("turnStarted", () => {
   );
 });
 
+/**
+ * Notices for Codex that arrived while one of its turns was still open.
+ *
+ * `agentMessage` is emitted from `item/completed`, which fires *inside*
+ * the turn — `turnInProgress` is not cleared until `turn/completed`. So
+ * every notice produced while handling a Codex message is injected into
+ * a busy adapter and refused. Discarding the refusal would leave Codex
+ * unable to learn the one thing only the daemon knows: that the name it
+ * addressed does not resolve, or that its `[REPLY]` reached one
+ * recipient and was shed by another.
+ *
+ * These are not queued replies. The reply outbox carries a mailbox id, a
+ * `requireReply` flag and a requester, and reports its own losses to
+ * *frontends* as "a reply you sent" — a daemon notice routed through it
+ * would be echoed back to the user as their own message. So notices get
+ * their own deferral, flushed by the `turnCompleted` handler alongside
+ * the Claude-online notice that already works this way.
+ */
+const pendingCodexNotices: string[] = [];
+let droppedCodexNotices = 0;
+
+/** Bounds the queue in a process that runs for days. Overflow is reported, not hidden. */
+const PENDING_CODEX_NOTICE_CAP = 20;
+
+/**
+ * Tell Codex something it cannot otherwise learn, now or when it is free.
+ *
+ * Never silent: delivered immediately, or held and flushed at the end of
+ * the current turn, or — if the queue overflows — counted and reported
+ * in the flush.
+ */
+function tellCodex(text: string): void {
+  const framed = `[AgentBridge] ${text}`;
+  if (codex.injectMessage(framed)) return;
+  pendingCodexNotices.push(framed);
+  while (pendingCodexNotices.length > PENDING_CODEX_NOTICE_CAP) {
+    pendingCodexNotices.shift();
+    droppedCodexNotices++;
+  }
+  log(`Deferred an AgentBridge notice to Codex (${pendingCodexNotices.length} pending)`);
+}
+
+/**
+ * Flush every held notice as one injection.
+ *
+ * One injection, not one per notice: the first would start a turn and
+ * every later one would be refused, so they would trickle out a turn at
+ * a time. On failure nothing is consumed and the next completed turn
+ * tries again.
+ */
+function flushPendingCodexNotices(): void {
+  if (pendingCodexNotices.length === 0) return;
+  const parts = [...pendingCodexNotices];
+  if (droppedCodexNotices > 0) {
+    parts.unshift(
+      `[AgentBridge] ${droppedCodexNotices} earlier notice${droppedCodexNotices > 1 ? "s were" : " was"}` +
+        ` dropped to stay under the ${PENDING_CODEX_NOTICE_CAP}-notice limit.`,
+    );
+  }
+  if (!codex.injectMessage(parts.join("\n\n"))) {
+    log(`Could not flush ${pendingCodexNotices.length} held AgentBridge notice(s); keeping them`);
+    return;
+  }
+  log(`Flushed ${pendingCodexNotices.length} held AgentBridge notice(s) to Codex`);
+  pendingCodexNotices.length = 0;
+  droppedCodexNotices = 0;
+}
+
 // An async listener hands the emitter a promise it does not await, so a
 // throw anywhere in the handler becomes an unhandled rejection — in a
 // process designed to run for days, on the path every Codex message
@@ -599,7 +676,7 @@ async function handleCodexMessage(msg: BridgeMessage): Promise<void> {
     result = classifyMessage(msg.content, FILTER_MODE);
   } catch (err: unknown) {
     // An unknown @name is a parse failure, not a broadcast. Tell Codex.
-    codex.injectMessage(`[AgentBridge] ${describeError(err)}`);
+    tellCodex(describeError(err));
     return;
   }
 
@@ -641,7 +718,7 @@ async function handleCodexMessage(msg: BridgeMessage): Promise<void> {
       { id: nextMessageId(), now: Date.now() },
     );
   } catch (err: unknown) {
-    codex.injectMessage(`[AgentBridge] ${describeError(err)}`);
+    tellCodex(describeError(err));
     return;
   }
 
@@ -654,9 +731,11 @@ async function handleCodexMessage(msg: BridgeMessage): Promise<void> {
   // has no other way to learn that the name it addressed does not
   // resolve, or that its `[REPLY]` reached Grok and not Claude. A
   // partial shed is the dangerous one — the send "succeeded", so
-  // nothing else in the system will ever mention it again.
+  // nothing else in the system will ever mention it again. This runs
+  // inside Codex's own turn, so the injection is always refused and the
+  // notice is always deferred; `tellCodex` is what makes it arrive.
   const text = senderFacingText(outcome);
-  if (text !== null) codex.injectMessage(`[AgentBridge] ${text}`);
+  if (text !== null) tellCodex(text);
   if (outcome.status === "failed") return;
 
   // [REPLY] message — give the recipient an attention window to respond.
@@ -699,6 +778,13 @@ codex.on("turnCompleted", () => {
   if (claudeSocket() && shouldNotifyCodexClaudeOnline()) {
     notifyCodexClaudeOnline();
   }
+
+  // Anything the daemon owed Codex about its own last turn — a parse
+  // failure, a partial shed. Before the outbox drain because it explains
+  // a message Codex has already sent, and because whichever of the two
+  // wins the injection slot, the loser keeps its payload and retries at
+  // the next completed turn.
+  flushPendingCodexNotices();
 
   // Deliver anything Claude sent while this turn was running. Last,
   // because the online notice is the handshake that explains what
