@@ -33,6 +33,7 @@ import type {
   DaemonStatus,
 } from "./control-protocol";
 import type { AgentId, BridgeMessage } from "./types";
+import { forEgress } from "./daemon-egress";
 import { probeLiveness as probeLivenessImpl } from "./liveness-probe";
 import {
   DEFAULT_FRONTEND_AGENT,
@@ -1009,7 +1010,7 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
         type: "drain_result",
         requestId: message.requestId,
         batchId: batch.batchId,
-        messages: batch.messages,
+        messages: batch.messages.map((m) => forEgress(m, ws.data.protocolVersion)),
       });
       return;
     }
@@ -1542,9 +1543,10 @@ function scheduleClaudeDisconnectNotification(clientId: number) {
 
 function trySendBridgeMessage(ws: ServerWebSocket<ControlSocketData>, message: BridgeMessage, deliveryHint?: "push" | "queue"): boolean {
   try {
+    const egressMessage = forEgress(message, ws.data.protocolVersion);
     const payload: ControlServerMessage = deliveryHint
-      ? { type: "codex_to_claude", message, deliveryHint }
-      : { type: "codex_to_claude", message };
+      ? { type: "codex_to_claude", message: egressMessage, deliveryHint }
+      : { type: "codex_to_claude", message: egressMessage };
     const result = ws.send(JSON.stringify(payload));
     if (typeof result === "number" && result <= 0) {
       log(`Bridge message send returned ${result} (0=dropped, -1=backpressure)`);
