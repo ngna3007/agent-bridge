@@ -46,8 +46,6 @@ export function parseFrontendAgent(raw: unknown): FrontendAgent | null {
 }
 
 export interface FrontendRegistryOptions<S> {
-  /** Cap per agent, matching the daemon's existing single-buffer cap. */
-  maxBufferedMessages: number;
   /** True when the socket can still be written to. */
   isOpen: (socket: S) => boolean;
   /** True when the socket is definitively gone (not merely closing). */
@@ -59,23 +57,16 @@ export interface Occupant<S> {
   socket: S;
 }
 
-export interface BufferResult {
-  /** Oldest messages evicted to stay under the cap. Non-zero is worth logging. */
-  dropped: number;
-}
-
-export class FrontendRegistry<S, M> {
+export class FrontendRegistry<S> {
   private readonly slots = new Map<FrontendAgent, S>();
-  private readonly buffers = new Map<FrontendAgent, M[]>();
   /**
    * Agents seen at least once in this daemon's lifetime, plus Claude.
    *
-   * Buffering is only meaningful for an agent that exists. Without this,
-   * a fan-out with nobody attached would open a buffer for every agent
-   * the union names and hold messages forever for one that is never
-   * launched. Claude is seeded because the daemon has always buffered
-   * for it before it first attaches, and losing that would change the
-   * behavior of every existing single-agent session.
+   * A daemon-authored notice is addressed to the frontends that exist,
+   * not to every name the union knows. Claude is seeded because the
+   * daemon has always held messages for it before it first attaches,
+   * and losing that would change the behavior of every existing
+   * single-agent session.
    */
   private readonly known = new Set<FrontendAgent>([DEFAULT_FRONTEND_AGENT]);
   private readonly probing = new Set<FrontendAgent>();
@@ -103,7 +94,7 @@ export class FrontendRegistry<S, M> {
     return this.slots.size;
   }
 
-  /** Agents this daemon has served, so callers know which buffers exist. */
+  /** Agents this daemon has served, so callers know who a notice is for. */
   knownAgents(): FrontendAgent[] {
     return [...this.known];
   }
@@ -171,68 +162,20 @@ export class FrontendRegistry<S, M> {
   }
 
   /**
-   * Who should receive a message from `source`.
+   * Every agent whose slot is held by a socket that can still be written
+   * to, in insertion order.
    *
-   * Only writable sockets, and never the sender — the loop-prevention
-   * invariant, applied to a set instead of to a pair. A `source` that is
-   * not a frontend (Codex) excludes nobody.
+   * Deliberately says nothing about who a message is *for*: routing is
+   * `resolveRecipients`' job and lives in one place. This answers only
+   * "which sockets are writable right now", which is what a wake-up
+   * transport and a status broadcast need.
    */
-  recipients(source?: string): Occupant<S>[] {
+  writable(): Occupant<S>[] {
     const out: Occupant<S>[] = [];
     for (const [agent, socket] of this.slots) {
-      if (agent === source) continue;
       if (!this.opts.isOpen(socket)) continue;
       out.push({ agent, socket });
     }
     return out;
-  }
-
-  /** Hold a message for an agent that is not currently attached. */
-  buffer(agent: FrontendAgent, message: M): BufferResult {
-    const queue = this.buffers.get(agent) ?? [];
-    queue.push(message);
-    let dropped = 0;
-    if (queue.length > this.opts.maxBufferedMessages) {
-      dropped = queue.length - this.opts.maxBufferedMessages;
-      queue.splice(0, dropped);
-    }
-    this.buffers.set(agent, queue);
-    this.known.add(agent);
-    return { dropped };
-  }
-
-  /** Drain `agent`'s buffer for replay. The caller owns the messages after this. */
-  takeBuffered(agent: FrontendAgent): M[] {
-    const queue = this.buffers.get(agent);
-    if (!queue || queue.length === 0) return [];
-    this.buffers.set(agent, []);
-    return queue;
-  }
-
-  /**
-   * Put messages back at the front of `agent`'s buffer.
-   *
-   * Used when a replay dies partway through: the remainder has to keep
-   * its place ahead of anything that arrived during the flush, or a
-   * reconnect silently reorders the conversation.
-   *
-   * Deliberately does not enforce the cap. Trimming here could only drop
-   * either the messages just rescued from a failed flush or the newest
-   * arrivals, and the daemon has always let a re-buffer run over and
-   * settled it on the next `buffer` call, which drops oldest-first.
-   */
-  requeue(agent: FrontendAgent, messages: M[]): void {
-    if (messages.length === 0) return;
-    const queue = this.buffers.get(agent) ?? [];
-    queue.unshift(...messages);
-    this.buffers.set(agent, queue);
-  }
-
-  /** Buffered count for one agent, or across all of them. */
-  bufferedCount(agent?: FrontendAgent): number {
-    if (agent) return this.buffers.get(agent)?.length ?? 0;
-    let total = 0;
-    for (const queue of this.buffers.values()) total += queue.length;
-    return total;
   }
 }

@@ -13,9 +13,8 @@ interface FakeSocket {
 
 const socket = (id: string, state: FakeSocket["state"] = "open"): FakeSocket => ({ id, state });
 
-function registry(maxBufferedMessages = 100) {
-  return new FrontendRegistry<FakeSocket, string>({
-    maxBufferedMessages,
+function registry() {
+  return new FrontendRegistry<FakeSocket>({
     isOpen: (s) => s.state === "open",
     isClosed: (s) => s.state === "closed",
   });
@@ -152,110 +151,50 @@ describe("probes", () => {
   });
 });
 
-describe("recipients", () => {
-  test("a message is never routed back to its source", () => {
+/*
+ * `recipients()` used to live here and encoded "a message is never routed
+ * back to its source". That rule did not disappear — it moved to
+ * `resolveRecipients` in `routing.ts`, which is now the only place any
+ * routing decision is made, and `routing.test.ts` covers it there. What
+ * remains in this module is the strictly narrower question the wake-up
+ * transports and the status broadcast actually ask.
+ */
+describe("writable", () => {
+  test("every held slot with a live socket, whoever the sender is", () => {
     const r = registry();
     r.claim("claude", socket("claude-1"));
     r.claim("grok", socket("grok-1"));
 
-    expect(r.recipients("claude").map((x) => x.agent)).toEqual(["grok"]);
-    expect(r.recipients("grok").map((x) => x.agent)).toEqual(["claude"]);
+    expect(r.writable().map((x) => x.agent)).toEqual(["claude", "grok"]);
   });
 
-  test("a Codex-sourced message reaches every attached frontend", () => {
-    const r = registry();
-    r.claim("claude", socket("claude-1"));
-    r.claim("grok", socket("grok-1"));
-
-    expect(r.recipients("codex").map((x) => x.agent)).toEqual(["claude", "grok"]);
-    expect(r.recipients().map((x) => x.agent)).toEqual(["claude", "grok"]);
-  });
-
-  test("unwritable sockets are skipped so the caller buffers instead", () => {
+  test("unwritable sockets are skipped so the message stays in the mailbox", () => {
     const r = registry();
     r.claim("claude", socket("claude-1", "closing"));
     r.claim("grok", socket("grok-1"));
 
-    expect(r.recipients("codex").map((x) => x.agent)).toEqual(["grok"]);
+    expect(r.writable().map((x) => x.agent)).toEqual(["grok"]);
   });
-});
 
-describe("buffers", () => {
-  test("each agent gets its own buffer", () => {
+  test("the socket comes back with the agent, so a caller can write to it", () => {
     const r = registry();
-    r.buffer("claude", "for-claude");
-    r.buffer("grok", "for-grok");
+    const claude = socket("claude-1");
+    r.claim("claude", claude);
 
-    expect(r.bufferedCount("claude")).toBe(1);
-    expect(r.bufferedCount("grok")).toBe(1);
-    expect(r.bufferedCount()).toBe(2);
-    expect(r.takeBuffered("claude")).toEqual(["for-claude"]);
-    expect(r.bufferedCount("grok")).toBe(1);
-  });
-
-  test("draining leaves the buffer empty", () => {
-    const r = registry();
-    r.buffer("claude", "a");
-    r.buffer("claude", "b");
-
-    expect(r.takeBuffered("claude")).toEqual(["a", "b"]);
-    expect(r.takeBuffered("claude")).toEqual([]);
-    expect(r.bufferedCount("claude")).toBe(0);
-  });
-
-  test("overflow drops oldest first and reports how many", () => {
-    const r = registry(3);
-    for (const m of ["a", "b", "c"]) r.buffer("claude", m);
-    expect(r.buffer("claude", "d")).toEqual({ dropped: 1 });
-    expect(r.takeBuffered("claude")).toEqual(["b", "c", "d"]);
-  });
-
-  test("a failed flush puts the remainder back in front of newer messages", () => {
-    const r = registry();
-    r.buffer("claude", "old-1");
-    r.buffer("claude", "old-2");
-
-    const taken = r.takeBuffered("claude");
-    r.buffer("claude", "arrived-during-flush");
-    r.requeue("claude", taken.slice(1));
-
-    expect(r.takeBuffered("claude")).toEqual(["old-2", "arrived-during-flush"]);
-  });
-
-  test("requeue of nothing is a no-op", () => {
-    const r = registry();
-    r.buffer("claude", "a");
-    r.requeue("claude", []);
-    expect(r.takeBuffered("claude")).toEqual(["a"]);
-  });
-
-  test("a re-buffer may exceed the cap; the next buffer settles it", () => {
-    // Matches the daemon's long-standing behavior: the cap is enforced
-    // on arrival, not on rescue, so a failed flush never discards the
-    // messages it just failed to deliver.
-    const r = registry(2);
-    r.requeue("claude", ["x", "y", "z"]);
-    expect(r.bufferedCount("claude")).toBe(3);
-
-    r.buffer("claude", "w");
-    expect(r.takeBuffered("claude")).toEqual(["z", "w"]);
+    expect(r.writable()[0]?.socket).toBe(claude);
   });
 });
 
 describe("known agents", () => {
   test("Claude is known before it ever attaches", () => {
-    // The daemon has always buffered for Claude before its first
+    // The daemon has always held messages for Claude before its first
     // connect; losing that would change every existing session.
     expect(registry().knownAgents()).toEqual(["claude"]);
   });
 
-  test("an agent becomes known by attaching or by being buffered for", () => {
+  test("an agent becomes known by attaching", () => {
     const r = registry();
     r.claim("grok", socket("grok-1"));
     expect(r.knownAgents()).toEqual(["claude", "grok"]);
-
-    const other = registry();
-    other.buffer("grok", "held");
-    expect(other.knownAgents()).toEqual(["claude", "grok"]);
   });
 });
