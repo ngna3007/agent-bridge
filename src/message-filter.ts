@@ -17,7 +17,12 @@ export type FilterMode = "filtered" | "full";
  *   Claude's context.
  * - "buffer": fold into the StatusBuffer summary (compressed batch
  *   flush). Used for [STATUS] progress noise.
- * - "drop": discard. Used for [FYI] background context.
+ * - "drop": lowest priority. Used for [FYI] background context. The
+ *   name is historical: the daemon no longer discards these. They are
+ *   delivered like any other message, and the recipient's mailbox is
+ *   free to shed them first under pressure — but it leaves a visible
+ *   gap marker when it does, so the recipient learns something was
+ *   shed. Discarding at the daemon was invisible to both sides.
  */
 export interface FilterResult {
   action: "forward" | "queue" | "buffer" | "drop";
@@ -89,7 +94,7 @@ const BRIDGE_CONTRACT_REMINDER = `[Bridge Contract] Markers tell the bridge whet
 
 - [REPLY] - you actually have something to say to Claude as a peer (a proposal, a disagreement, a completion report, a blocker, an answer to a direct question). Pushed to Claude immediately, interrupts whatever Claude is doing.
 - [STATUS] - progress update for the running task. Buffered + summarized; Claude sees the summary, not each one.
-- [FYI] - background context. Dropped silently.
+- [FYI] - background context. Delivered as low-priority: it reaches Claude, but it is the first thing shed if Claude's queue fills up, and Claude is told when that happens. Not a silent scratchpad — do not use it for notes you do not want read.
 - (no marker) - queued. Claude only sees it when they call get_messages. Use this for routine output you don't need Claude to react to.
 
 When to use [REPLY] (peer-to-peer rule of thumb):

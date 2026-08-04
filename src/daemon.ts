@@ -41,7 +41,7 @@ import {
   parseFrontendAgent,
 } from "./frontend-registry";
 import type { FrontendAgent } from "./frontend-registry";
-import { AGENT_IDS, isAgentId } from "./agent-id";
+import { isAgentId } from "./agent-id";
 import { Mailbox } from "./mailbox";
 import { MessageIndex } from "./message-index";
 import { MessageBus, SendRejected } from "./message-bus";
@@ -230,9 +230,22 @@ const bus = new MessageBus({
   mailboxFor,
   index: messageIndex,
   state: {
-    // "Known", uniformly — never "attached". A detached agent still has a
-    // mailbox; that is the entire point of having one.
-    knownAgents: () => [...AGENT_IDS],
+    // Broadcast means everyone who is actually here. An agent that has
+    // never connected is not a recipient: fanning out to it fills a
+    // mailbox nobody will ever drain, and the first hundred messages
+    // later come back as "grok's mailbox is full" on sends that worked
+    // perfectly — which trains the user to ignore the shed note that
+    // partial-rejection reporting depends on being read.
+    //
+    // Codex is unconditional because it has no control socket to attach
+    // with; its presence is the app-server process, not a slot.
+    //
+    // "Known", not "attached": a frontend that has attached once and is
+    // mid-reconnect must keep receiving into its mailbox, which is the
+    // entire reason the mailbox exists. `FrontendRegistry.knownAgents`
+    // seeds Claude, so a message that arrives before Claude's first
+    // connect is still retained — long-standing behaviour.
+    knownAgents: () => ["codex", ...frontends.knownAgents()],
     senderOf: (id, replier, now) => messageIndex.resolveSender(id, replier, now),
     activeRequesterFor: (agent) => activeRequester.get(agent) ?? null,
   },
@@ -268,7 +281,40 @@ const outboxRequester = new Map<string, AgentId>();
  * re-injects when the current turn ends, and the message itself stays in
  * Codex's mailbox either way.
  */
-transports.register("codex", {
+/**
+ * Register a transport, self-acking it when it can never ack for itself.
+ *
+ * `acknowledgementMode: "none"` means no correlated evidence of
+ * consumption will ever arrive, so the mailbox entry has no event that
+ * could delete it — it would sit until capacity evicted it, and every
+ * later send to that agent would be shed against a backlog nobody is
+ * reading. Deleting on a *successful* wake is the closest honest
+ * approximation: the message reached the only channel this agent has.
+ *
+ * Only on success. `TransportRegistry.wake` reports `"woken"` exactly
+ * when the inner wake returns without throwing, so a `"failed"` wake
+ * propagates and the entry stays put. A `"no-transport"` result never
+ * reaches this wrapper at all.
+ *
+ * This is a weakening of at-least-once, confined to transports that
+ * structurally cannot participate in it. Every `"explicit"` transport —
+ * which is every frontend — still deletes only on a real ack.
+ */
+function registerTransport(agent: AgentId, transport: WakeupTransport): void {
+  if (transport.acknowledgementMode !== "none") {
+    transports.register(agent, transport);
+    return;
+  }
+  transports.register(agent, {
+    ...transport,
+    wake: async (message) => {
+      await transport.wake(message);
+      mailboxFor(agent).remove([message.id]);
+    },
+  });
+}
+
+registerTransport("codex", {
   payloadMode: "content",
   acknowledgementMode: "none",
   wake: (message) => {
@@ -316,20 +362,24 @@ transports.register("codex", {
 function frontendTransport(agent: FrontendAgent): WakeupTransport {
   return {
     payloadMode: "content",
-    acknowledgementMode: "none",
+    // A frontend *can* produce correlated evidence: it drains under a
+    // lease and acks by id over its control socket. Nothing deletes on
+    // its behalf, which is why the push may be lost without the message
+    // being lost.
+    acknowledgementMode: "explicit",
     wake: (message) => {
       const socket = frontends.occupant(agent);
       if (socket === null || !frontends.isAttached(agent)) {
         throw new Error(`${agent} is not attached`);
       }
-      if (!trySendBridgeMessage(socket, message, deliveryHintFor(message))) {
+      if (!trySendBridgeMessage(socket, message, deliveryHintFor(message, FILTER_MODE))) {
         throw new Error(`the control socket for ${agent} refused the frame`);
       }
     },
   };
 }
 
-for (const agent of FRONTEND_AGENTS) transports.register(agent, frontendTransport(agent));
+for (const agent of FRONTEND_AGENTS) registerTransport(agent, frontendTransport(agent));
 
 /**
  * Whether a frontend should surface this message immediately or hold it
@@ -337,7 +387,13 @@ for (const agent of FRONTEND_AGENTS) transports.register(agent, frontendTranspor
  * decision is a property of the message rather than of the call site
  * that happened to emit it.
  */
-function deliveryHintFor(message: BridgeMessage): ClaudeDeliveryHint {
+function deliveryHintFor(message: BridgeMessage, mode: FilterMode): ClaudeDeliveryHint {
+  // Filter mode decides routing, delivery mode decides transport, and
+  // `full` means "forward everything" — including transport-wise. Reading
+  // the hint off the envelope alone made `AGENTBRIDGE_FILTER_MODE=full`
+  // plus `[STATUS]` come out as "queue", i.e. invisible until the next
+  // `get_messages`, which is the opposite of what full mode promises.
+  if (mode === "full") return "push";
   switch (message.kind) {
     case "reply":
       return "push";
@@ -351,13 +407,35 @@ function deliveryHintFor(message: BridgeMessage): ClaudeDeliveryHint {
   }
 }
 
-interface RouteOutcome {
-  /** True when at least one recipient accepted. */
-  delivered: boolean;
-  /** Accepted, but some recipient shed it. Shown to the sender verbatim. */
-  note?: string;
-  /** The send did not happen. Shown to the sender verbatim. */
-  error?: string;
+/**
+ * What happened to one send, in a shape a caller cannot half-handle.
+ *
+ * Deliberately a discriminated union rather than
+ * `{ delivered, note?, error? }`. With optional fields, "some recipient
+ * shed this message" is a field a caller can simply not read — and one
+ * of three call sites did exactly that, so a `[REPLY]` could be dropped
+ * for a full mailbox with the sender told nothing and one log line as
+ * the only trace. `"partial"` now has to be named to be passed over, and
+ * `senderFacingText` is the single place that decides what a sender is
+ * owed.
+ */
+type RouteOutcome =
+  | { status: "delivered" }
+  /** Accepted by someone, shed by someone else. The sender must hear this. */
+  | { status: "partial"; note: string }
+  /** Nobody took it. The sender must hear this. */
+  | { status: "failed"; error: string };
+
+/** What to tell the sender, or `null` when there is nothing to say. */
+function senderFacingText(outcome: RouteOutcome): string | null {
+  switch (outcome.status) {
+    case "delivered":
+      return null;
+    case "partial":
+      return outcome.note;
+    case "failed":
+      return outcome.error;
+  }
 }
 
 /**
@@ -372,29 +450,38 @@ interface RouteOutcome {
 async function routeThroughBus(envelope: BridgeMessage): Promise<RouteOutcome> {
   try {
     const outcome = await bus.route(envelope, Date.now());
-    if (outcome.rejected.length === 0) return { delivered: true };
+    if (outcome.rejected.length === 0) return { status: "delivered" };
     log(
       `Message ${envelope.id} rejected by ${outcome.rejected.map((r) => r.agent).join(", ")}`,
     );
     return {
-      delivered: true,
+      status: "partial",
       note: outcome.rejected.map((r) => r.reason).join(" "),
     };
   } catch (err: unknown) {
     if (err instanceof RoutingError || err instanceof SendRejected) {
       log(`Message ${envelope.id} was not delivered: ${err.message}`);
-      return { delivered: false, error: err.message };
+      return { status: "failed", error: err.message };
     }
     // Not a delivery decision — a bug. Say so rather than reporting it
     // to the sender as a routing verdict.
     log(`Message ${envelope.id} failed to route: ${describeError(err)}`);
-    return { delivered: false, error: "The daemon could not route this message." };
+    return { status: "failed", error: "The daemon could not route this message." };
   }
 }
 
-/** Fire-and-forget send for a path with no sender waiting on a result. */
+/**
+ * Fire-and-forget send for a path with no sender waiting on a result.
+ *
+ * The daemon is the sender here, so the log *is* the sender-facing
+ * surface. It still has to be told — an outcome that reaches nobody at
+ * all is the failure mode this union exists to make impossible.
+ */
 function routeOrLog(envelope: BridgeMessage): void {
-  void routeThroughBus(envelope);
+  void routeThroughBus(envelope).then((outcome) => {
+    const text = senderFacingText(outcome);
+    if (text !== null) log(`Daemon-authored ${envelope.id}: ${text}`);
+  });
 }
 
 /**
@@ -411,6 +498,29 @@ function emitToFrontends(build: (to: AgentId) => BridgeMessage): void {
   for (const agent of frontends.knownAgents()) routeOrLog(build(agent));
 }
 
+/**
+ * Fan a lifecycle notice out to the frontends *without* a mailbox.
+ *
+ * `system_*` notices are statusbar tags — "Codex is working", "turn
+ * completed", "TUI reconnected". They carry no reply semantics, nobody
+ * can act on a stale one, and each is superseded by the next within
+ * seconds. Giving them at-least-once storage was actively harmful: two
+ * per Codex turn is enough to pin a 100-slot mailbox permanently, after
+ * which every real `[REPLY]` is shed against a backlog of notices about
+ * turns that ended an hour ago.
+ *
+ * So they are wake-only: delivered if the agent is here to receive them,
+ * dropped if it is not. That is the correct semantic for a tag, and it
+ * is not silent shedding of *messages* — nothing addressed by one agent
+ * to another takes this path. Everything with content a sender could be
+ * waiting on still goes through `emitToFrontends` and the bus.
+ */
+function notifyFrontends(build: (to: AgentId) => BridgeMessage): void {
+  for (const agent of frontends.attachedAgents()) {
+    void transports.wake(agent, build(agent), log);
+  }
+}
+
 function describeError(err: unknown): string {
   if (err instanceof Error) return err.message;
   try {
@@ -424,7 +534,7 @@ const tuiConnectionState = new TuiConnectionState({
   disconnectGraceMs: TUI_DISCONNECT_GRACE_MS,
   log,
   onDisconnectPersisted: (connId) => {
-    emitToFrontends((to) =>
+    notifyFrontends((to) =>
       systemMessage(
         "system_tui_disconnected",
         `⚠️ Codex TUI disconnected (conn #${connId}). Codex is still running in the background — reconnect the TUI to resume.`,
@@ -433,7 +543,7 @@ const tuiConnectionState = new TuiConnectionState({
     );
   },
   onReconnectAfterNotice: (connId) => {
-    emitToFrontends((to) =>
+    notifyFrontends((to) =>
       systemMessage(
         "system_tui_reconnected",
         `✅ Codex TUI reconnected (conn #${connId}). Bridge restored, communication can continue.`,
@@ -461,7 +571,7 @@ const statusBuffer = new StatusBuffer((summary) =>
 
 codex.on("turnStarted", () => {
   log("Codex turn started");
-  emitToFrontends((to) =>
+  notifyFrontends((to) =>
     systemMessage(
       "system_turn_started",
       "⏳ Codex is working on the current task. Wait for completion before sending a reply.",
@@ -470,7 +580,17 @@ codex.on("turnStarted", () => {
   );
 });
 
-codex.on("agentMessage", async (msg: BridgeMessage) => {
+// An async listener hands the emitter a promise it does not await, so a
+// throw anywhere in the handler becomes an unhandled rejection — in a
+// process designed to run for days, on the path every Codex message
+// takes. The emitter gets a sync function; the rejection is caught here.
+codex.on("agentMessage", (msg: BridgeMessage) => {
+  void handleCodexMessage(msg).catch((err: unknown) => {
+    log(`agentMessage handler failed for ${msg.id}: ${describeError(err)}`);
+  });
+});
+
+async function handleCodexMessage(msg: BridgeMessage): Promise<void> {
   // `msg.source` is deliberately not read: attribution on ingress comes
   // from where the message arrived, and everything on this emitter
   // arrived from Codex. `normalizeProse` writes `from` accordingly.
@@ -530,16 +650,18 @@ codex.on("agentMessage", async (msg: BridgeMessage) => {
   }
 
   const outcome = await routeThroughBus(envelope);
-  // A refusal is the sender's business: Codex has no other way to learn
-  // that the name it addressed does not resolve.
-  if (!outcome.delivered && outcome.error) {
-    codex.injectMessage(`[AgentBridge] ${outcome.error}`);
-    return;
-  }
+  // Both a refusal and a partial shed are the sender's business: Codex
+  // has no other way to learn that the name it addressed does not
+  // resolve, or that its `[REPLY]` reached Grok and not Claude. A
+  // partial shed is the dangerous one — the send "succeeded", so
+  // nothing else in the system will ever mention it again.
+  const text = senderFacingText(outcome);
+  if (text !== null) codex.injectMessage(`[AgentBridge] ${text}`);
+  if (outcome.status === "failed") return;
 
   // [REPLY] message — give the recipient an attention window to respond.
   if (result.marker === "reply") startAttentionWindow();
-});
+}
 
 codex.on("turnCompleted", () => {
   log("Codex turn completed");
@@ -548,7 +670,7 @@ codex.on("turnCompleted", () => {
   // Check if reply was required but Codex didn't send any agentMessage
   if (replyRequired && !replyReceivedDuringTurn) {
     log("⚠️ Reply was required but Codex did not send any agentMessage");
-    emitToFrontends((to) =>
+    notifyFrontends((to) =>
       systemMessage(
         "system_reply_missing",
         "⚠️ Codex completed the turn without sending a reply (require_reply was set). Codex may not have generated an agentMessage. You may want to retry or rephrase.",
@@ -564,7 +686,7 @@ codex.on("turnCompleted", () => {
   // authorised closes with it.
   activeRequester.delete("codex");
 
-  emitToFrontends((to) =>
+  notifyFrontends((to) =>
     systemMessage(
       "system_turn_completed",
       "✅ Codex finished the current turn. You can reply now if needed.",
@@ -591,7 +713,7 @@ codex.on("ready", (threadId: string) => {
   log(`Codex ready — thread ${threadId}`);
   log("Bridge fully operational");
 
-  emitToFrontends((to) => systemMessage("system_ready", currentReadyMessage(), to));
+  notifyFrontends((to) => systemMessage("system_ready", currentReadyMessage(), to));
 
   if (claudeSocket() && shouldNotifyCodexClaudeOnline()) {
     notifyCodexClaudeOnline();
@@ -627,7 +749,7 @@ codex.on("exit", (code: number | null) => {
   // Codex thread is gone; next thread needs the contract pinned again.
   lastPinnedContractThreadId = null;
   discardOutboxForLostCodex("the Codex app-server exited");
-  emitToFrontends((to) =>
+  notifyFrontends((to) =>
     systemMessage(
       "system_codex_exit",
       `⚠️ Codex app-server exited (code ${code ?? "unknown"}). AgentBridge daemon is still running, but the Codex side needs to be restarted.`,
@@ -812,6 +934,21 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
       // now comes from the authenticated socket via `normalizeIngress`,
       // so a frontend cannot send as its neighbour regardless of what it
       // writes in the body.
+      //
+      // `attached` is the authorization predicate `drain` and `ack`
+      // already use. A socket that never claimed a slot has no agent
+      // identity, so `normalizeIngress` would attribute its message to
+      // whatever `DEFAULT_FRONTEND_AGENT` happens to be — Claude.
+      if (!ws.data.attached) {
+        sendProtocolMessage(ws, {
+          type: "claude_to_codex_result",
+          requestId: message.requestId,
+          success: false,
+          error: "This socket is not attached. Send claude_connect first.",
+        });
+        return;
+      }
+
       if (!tuiConnectionState.canReply()) {
         sendProtocolMessage(ws, {
           type: "claude_to_codex_result",
@@ -868,12 +1005,12 @@ async function sendFromFrontend(
   const outcome = await routeThroughBus(envelope);
   requireReplyIds.delete(envelope.id);
 
-  if (!outcome.delivered) {
+  if (outcome.status === "failed") {
     sendProtocolMessage(ws, {
       type: "claude_to_codex_result",
       requestId,
       success: false,
-      error: outcome.error ?? "The daemon could not route this message.",
+      error: outcome.error,
     });
     return;
   }
@@ -881,24 +1018,20 @@ async function sendFromFrontend(
   // A deferral is an acceptance with an explanation, not a failure — the
   // message is in Codex's mailbox and the outbox will re-wake it. Saying
   // `success: false` here is what used to make callers resend by hand.
+  //
+  // A partial shed rides along in the same field: both are "accepted,
+  // and here is what you need to know about it".
   const deferral = codexDeferralNotes.get(envelope.id);
   codexDeferralNotes.delete(envelope.id);
-  if (deferral !== undefined) {
-    sendProtocolMessage(ws, {
-      type: "claude_to_codex_result",
-      requestId,
-      success: true,
-      queued: true,
-      note: deferral,
-    });
-    return;
-  }
+  const shed = senderFacingText(outcome);
+  const note = [deferral, shed].filter((t) => t !== null && t !== undefined).join(" ");
 
   sendProtocolMessage(ws, {
     type: "claude_to_codex_result",
     requestId,
     success: true,
-    note: outcome.note,
+    queued: deferral !== undefined ? true : undefined,
+    note: note === "" ? undefined : note,
   });
 }
 
@@ -1141,10 +1274,12 @@ async function attachFrontend(ws: ServerWebSocket<ControlSocketData>, agent: Fro
   // deliver the same message twice.
   if (!isRapidReattach) {
     // Only send status messages if this is not a rapid reattach (avoid flooding Claude)
+    // Wake-only, like every other `system_*` notice: this describes the
+    // state of the bridge at this instant, and the agent is right here.
     if (tuiConnectionState.canReply()) {
-      routeOrLog(systemMessage("system_ready", currentReadyMessage(), agent));
+      void transports.wake(agent, systemMessage("system_ready", currentReadyMessage(), agent), log);
     } else if (codexBootstrapped) {
-      routeOrLog(systemMessage("system_waiting", currentWaitingMessage(), agent));
+      void transports.wake(agent, systemMessage("system_waiting", currentWaitingMessage(), agent), log);
     }
   }
 
@@ -1465,11 +1600,11 @@ async function bootCodex() {
     codexBootstrapped = true;
     writeStatusFile();
 
-    emitToFrontends((to) => systemMessage("system_waiting", currentWaitingMessage(), to));
+    notifyFrontends((to) => systemMessage("system_waiting", currentWaitingMessage(), to));
     broadcastStatus();
   } catch (err: any) {
     log(`Failed to start Codex: ${err.message}`);
-    emitToFrontends((to) =>
+    notifyFrontends((to) =>
       systemMessage(
         "system_codex_start_failed",
         `❌ AgentBridge failed to start Codex app-server: ${err.message}`,
