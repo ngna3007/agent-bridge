@@ -233,10 +233,13 @@ export class ClaudeAdapter extends EventEmitter {
           meta: {
             chat_id: this.sessionId,
             message_id: msgId,
-            // The daemon-assigned canonical id. It appears here and in the
-            // drained payload identically — that is what makes a duplicate
-            // (e.g. a working push seen again on a later unacked drain)
-            // recognisable rather than confusing.
+            // The daemon-assigned canonical id, attached so the host layer
+            // can correlate this push with its origin. The drain path
+            // (`handleGetMessages` below) does not currently surface any
+            // id in its output, so a consumer has no id-based way to
+            // recognise this push against a later unacked drain of the
+            // same message. A redelivered duplicate is an accepted cost
+            // of at-least-once delivery, not a bug this id closes.
             canonical_id: message.id,
             user: "Codex",
             user_id: "codex",

@@ -8,23 +8,36 @@
  * frontend is a peer or a megaphone: when Codex says something, does that
  * frontend ever learn it?
  *
- * There are two delivery paths out of the daemon and a frontend's fate
- * differs on each:
+ * There are two delivery paths out of the daemon:
  *
  *   push   `[REPLY]`-tagged output. `ClaudeAdapter.pushViaChannel` emits
  *          `notifications/claude/channel` — a Claude Code extension to MCP.
  *          Base MCP has no server-push wake-up, so a non-Claude client can
  *          only ignore an unknown notification. Ignoring it is not an
- *          error, so the send *succeeds*, and the adapter's queue fallback
- *          (which only runs when the send throws) never fires.
- *   queue  untagged output. Parked in the pull queue and handed over when
- *          the agent calls `get_messages`, an ordinary MCP tool.
+ *          error, so the send *succeeds* whether or not anyone was
+ *          listening.
+ *   queue  every accepted message, tagged or not. The daemon enqueues it
+ *          into every resolved recipient's mailbox *before* attempting any
+ *          push, and hands it over when the agent calls `get_messages`, an
+ *          ordinary MCP tool.
  *
- * The prediction under test: **pull reaches any frontend; push reaches only
- * a client that understands Claude's channel extension, and what it misses
- * is gone rather than deferred.** `[REPLY]` is the marker the role files
- * tell Codex to use for direct answers, so if this holds, the highest-value
- * message class is exactly the one a Grok frontend cannot receive.
+ * What this harness verifies today: a `[REPLY]` is not push-only. It is
+ * enqueued into every accepted recipient's mailbox exactly like an
+ * untagged message, so a frontend that ignores
+ * `notifications/claude/channel` — the whole client class a non-Claude
+ * frontend belongs to — still finds it on the next `get_messages`. The
+ * push is a wake-up, not the delivery; only an ack removes a message from
+ * a mailbox. `[REPLY]` is the marker the role files tell Codex to use for
+ * direct answers, so this is the highest-value message class, and it is
+ * the one this harness guards against silently becoming push-only again.
+ *
+ * This harness was originally written the other way around, to
+ * characterize a real defect: a `[REPLY]` left the daemon as a channel
+ * notification only, and a client that could not consume that
+ * notification lost the message permanently. That defect is fixed —
+ * mailbox enqueue no longer depends on whether a push is even attempted —
+ * and the check below now guards against a regression back to that
+ * behavior rather than documenting it.
  *
  * Why this does not drive a real `grok`
  * ------------------------------------
