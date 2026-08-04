@@ -63,6 +63,30 @@ interface PendingRequest {
   threadId?: string;
 }
 
+/**
+ * What an injection was carrying, handed back if the app-server refuses it.
+ *
+ * Every field is opaque to the adapter — it stores them and echoes them
+ * back untouched. The adapter has no idea what an agent id is and should
+ * not learn; the daemon is the one that has to tell a sender its message
+ * did not land.
+ */
+export interface InjectionCorrelation {
+  /** The daemon's message id, so the caller recognises its own payload. */
+  id: string;
+  /** Who to tell, or null when the daemon itself was the sender. */
+  requester: string | null;
+  /** The text handed to `injectMessage`, echoed back so it can be reported. */
+  text: string;
+}
+
+/** An injection the app-server answered with an error. Emitted as `injectionRejected`. */
+export interface InjectionRejection {
+  correlation: InjectionCorrelation;
+  /** The app-server's own error message, as close to verbatim as it gave it. */
+  error: string;
+}
+
 export class CodexAdapter extends EventEmitter {
   private static readonly RESPONSE_TRACKING_TTL_MS = 30000;
 
@@ -111,6 +135,26 @@ export class CodexAdapter extends EventEmitter {
    * expires instead of stalling injection forever. See `reserveTurnStart`.
    */
   private pendingTurnStarts = new Map<number, ReturnType<typeof setTimeout>>();
+
+  /**
+   * What each in-flight `turn/start` was carrying, for the caller that
+   * handed it over.
+   *
+   * `injectMessage` returning true means "the frame is on the wire", not
+   * "Codex took it". The app-server can still answer with an error, and
+   * that answer lands here, long after the caller was told true. Without
+   * this map the refusal is a log line and nothing else: the daemon has
+   * already self-acked the mailbox entry away, so the message is gone
+   * and its sender is told nothing — the one shape the never-silently-
+   * lost guarantee forbids outright. Holding the payload alongside the
+   * request id is what lets the rejection be reported back with the text
+   * it lost.
+   *
+   * Naturally near-empty: injection is serialised by `turnPending`, so at
+   * most one entry is live at a time. Cleared wherever the reservation
+   * itself is cleared.
+   */
+  private injectionCorrelations = new Map<number, InjectionCorrelation>();
 
   /**
    * How long an unconfirmed `turn/start` blocks the next injection.
@@ -276,8 +320,16 @@ export class CodexAdapter extends EventEmitter {
     }
   }
 
-  /** Inject a message into the active Codex thread via turn/start. Returns true if sent. */
-  injectMessage(text: string): boolean {
+  /**
+   * Inject a message into the active Codex thread via turn/start.
+   *
+   * Returns true when the frame reached the wire — which is *not* the
+   * same as "Codex accepted it". The app-server may still answer with an
+   * error, and that answer arrives asynchronously; pass `correlation` to
+   * hear about it on the `injectionRejected` event. Without it a refusal
+   * is only logged, and the caller goes on believing it delivered.
+   */
+  injectMessage(text: string, correlation?: InjectionCorrelation): boolean {
     if (!this.threadId) {
       this.log("Cannot inject: no active thread");
       return false;
@@ -286,16 +338,20 @@ export class CodexAdapter extends EventEmitter {
       this.log("Cannot inject: app-server WebSocket not connected");
       return false;
     }
-    if (this.turnInProgress) {
-      this.log(`Rejected injection: Codex turn is in progress (thread ${this.threadId})`);
-      return false;
-    }
-    if (this.pendingTurnStarts.size > 0) {
-      // A turn/start sent moments ago that the app-server has not yet
-      // confirmed. Treated exactly like an in-progress turn, because it
-      // is about to become one — and a caller that reads `false` here
-      // keeps its payload, which is the whole point.
-      this.log(`Rejected injection: a turn/start is already in flight (thread ${this.threadId})`);
+    // One question, asked once. `turnPending` is the definition of
+    // "Codex is occupied" — restating its terms here is how a future
+    // third term gets honoured by the daemon's deferral check and not by
+    // the guard that actually sends, which would inject into a dead
+    // thread and report success. The log string is the only thing that
+    // needs to tell the two cases apart: a turn/start already in flight
+    // is a turn from the caller's point of view, it is simply not
+    // confirmed yet.
+    if (this.turnPending) {
+      this.log(
+        this.turnInProgress
+          ? `Rejected injection: Codex turn is in progress (thread ${this.threadId})`
+          : `Rejected injection: a turn/start is already in flight (thread ${this.threadId})`,
+      );
       return false;
     }
     this.log(`Injecting message into Codex (${text.length} chars)`);
@@ -310,6 +366,7 @@ export class CodexAdapter extends EventEmitter {
       // Only after the frame is actually on the wire: a send that threw
       // started nothing and must not block the next caller.
       this.reserveTurnStart(requestId);
+      if (correlation) this.injectionCorrelations.set(requestId, correlation);
       return true;
     } catch (err: any) {
       this.untrackBridgeRequestId(requestId);
@@ -1271,8 +1328,17 @@ export class CodexAdapter extends EventEmitter {
       // and holding its reservation would block injection until the
       // timeout for no reason.
       this.clearTrackedId(this.pendingTurnStarts, numericId);
+      const correlation = this.injectionCorrelations.get(numericId);
+      this.injectionCorrelations.delete(numericId);
       if (parsed.error) {
-        this.log(`Bridge-originated request failed (id ${responseId}): ${parsed.error.message ?? "unknown error"}`);
+        const error = parsed.error.message ?? "unknown error";
+        this.log(`Bridge-originated request failed (id ${responseId}): ${error}`);
+        // The caller was told `true` when the frame went out and has
+        // long since moved on — for an injection, that means the mailbox
+        // entry was self-acked away. This event is the only remaining
+        // way anyone learns the message did not land, so it carries the
+        // text back with it.
+        if (correlation) this.emit("injectionRejected", { correlation, error } satisfies InjectionRejection);
       } else {
         this.log(`Bridge-originated request completed (id ${responseId})`);
       }
@@ -1490,6 +1556,12 @@ export class CodexAdapter extends EventEmitter {
     this.clearTrackedId(this.pendingTurnStarts, requestId);
     const timer = setTimeout(() => {
       this.pendingTurnStarts.delete(requestId);
+      // No response and no `turn/started` is not a refusal — nobody said
+      // no, the answer simply never came. Reporting it as a rejection
+      // would tell the sender its message was refused when it may well
+      // be running, so the correlation is dropped silently and the slot
+      // is freed. The unanswered-injection case is its own problem.
+      this.injectionCorrelations.delete(requestId);
       this.log(`turn/start ${requestId} was never confirmed; releasing the injection slot`);
     }, CodexAdapter.TURN_START_CONFIRM_TIMEOUT_MS);
     timer.unref?.();
@@ -1500,6 +1572,11 @@ export class CodexAdapter extends EventEmitter {
   private clearPendingTurnStarts() {
     for (const timer of this.pendingTurnStarts.values()) clearTimeout(timer);
     this.pendingTurnStarts.clear();
+    // Same reasoning as the timer: every caller of this method has
+    // learned the turn state some other way (a `turn/started`, or a
+    // connection reset that invalidates every id), so no response is
+    // coming that could name these as refused.
+    this.injectionCorrelations.clear();
   }
 
   private markTurnStarted(turnId?: string) {

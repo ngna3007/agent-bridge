@@ -314,6 +314,116 @@ describe("CodexAdapter turn state machine", () => {
     adapter.clearResponseTrackingState();
   });
 
+  test("injectMessage asks turnPending, not its two current terms", () => {
+    // The drift this pins: turnPending is the definition of "Codex is
+    // occupied", and injectMessage used to restate its two terms instead
+    // of calling it. A third term added to the getter would then be
+    // honoured by the daemon's deferral check and ignored by the guard
+    // that actually sends — injecting into a dead thread, returning true,
+    // and letting the Codex transport's self-ack delete the mailbox entry
+    // for a message Codex never received. Shadowing the getter stands in
+    // for that future third term.
+    const adapter = createAdapter();
+    adapter.threadId = "thread-1";
+    adapter.appServerWs = { readyState: WebSocket.OPEN, send: () => {} } as any;
+
+    Object.defineProperty(adapter, "turnPending", { get: () => true, configurable: true });
+    // Neither of the terms the old guard read is set.
+    expect(adapter.turnInProgress).toBe(false);
+    expect(adapter.pendingTurnStarts.size).toBe(0);
+
+    expect(adapter.injectMessage("hello")).toBe(false);
+
+    adapter.clearResponseTrackingState();
+  });
+
+  test("a refused turn/start is reported to the caller that handed over the payload", () => {
+    // injectMessage returning true means "the frame is on the wire", not
+    // "Codex accepted it". The refusal arrives later, after the daemon has
+    // self-acked the mailbox entry away — so without this event the
+    // message is gone, Codex never saw it, and the sender is told nothing.
+    const adapter = createAdapter();
+    adapter.threadId = "thread-1";
+    adapter.appServerWs = { readyState: WebSocket.OPEN, send: () => {} } as any;
+
+    const rejections: any[] = [];
+    adapter.on("injectionRejected", (r: any) => rejections.push(r));
+
+    expect(adapter.injectMessage("please review", { id: "msg_1", requester: "claude", text: "please review" })).toBe(true);
+    const requestId = adapter.nextInjectionId + 1;
+
+    adapter.handleAppServerPayload(JSON.stringify({
+      id: requestId,
+      error: { message: "thread is closed" },
+    }));
+
+    expect(rejections).toEqual([
+      {
+        correlation: { id: "msg_1", requester: "claude", text: "please review" },
+        error: "thread is closed",
+      },
+    ]);
+
+    adapter.clearResponseTrackingState();
+  });
+
+  test("an accepted turn/start reports nothing and forgets the payload", () => {
+    const adapter = createAdapter();
+    adapter.threadId = "thread-1";
+    adapter.appServerWs = { readyState: WebSocket.OPEN, send: () => {} } as any;
+
+    const rejections: any[] = [];
+    adapter.on("injectionRejected", (r: any) => rejections.push(r));
+
+    expect(adapter.injectMessage("hi", { id: "msg_2", requester: "claude", text: "hi" })).toBe(true);
+    const requestId = adapter.nextInjectionId + 1;
+
+    adapter.handleAppServerPayload(JSON.stringify({ id: requestId, result: {} }));
+
+    expect(rejections).toEqual([]);
+    expect(adapter.injectionCorrelations.size).toBe(0);
+
+    adapter.clearResponseTrackingState();
+  });
+
+  test("an injection with no correlation is refused silently, as before", () => {
+    // Daemon-authored notices have no sender waiting on a result; the log
+    // is their sender-facing surface. They must not manufacture a notice
+    // addressed to nobody.
+    const adapter = createAdapter();
+    adapter.threadId = "thread-1";
+    adapter.appServerWs = { readyState: WebSocket.OPEN, send: () => {} } as any;
+
+    const rejections: any[] = [];
+    adapter.on("injectionRejected", (r: any) => rejections.push(r));
+
+    expect(adapter.injectMessage("daemon notice")).toBe(true);
+    const requestId = adapter.nextInjectionId + 1;
+    adapter.handleAppServerPayload(JSON.stringify({ id: requestId, error: { message: "nope" } }));
+
+    expect(rejections).toEqual([]);
+
+    adapter.clearResponseTrackingState();
+  });
+
+  test("a connection reset drops the correlation without reporting a refusal", () => {
+    // Nobody refused anything — the connection went away. Reporting it as
+    // a refusal would tell the sender Codex said no when Codex said
+    // nothing at all; the exit path owns that case.
+    const adapter = createAdapter();
+    adapter.threadId = "thread-1";
+    adapter.appServerWs = { readyState: WebSocket.OPEN, send: () => {} } as any;
+
+    const rejections: any[] = [];
+    adapter.on("injectionRejected", (r: any) => rejections.push(r));
+
+    expect(adapter.injectMessage("hi", { id: "msg_3", requester: "claude", text: "hi" })).toBe(true);
+    adapter.clearResponseTrackingState();
+
+    expect(adapter.injectionCorrelations.size).toBe(0);
+    expect(rejections).toEqual([]);
+  });
+
   test("a connection reset releases the reservation", () => {
     // Both turn-state resets (app-server close, new-session reconnect) run
     // through clearResponseTrackingState. Nothing on the old connection can

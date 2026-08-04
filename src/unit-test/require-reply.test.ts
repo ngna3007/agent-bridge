@@ -64,4 +64,25 @@ describe("requireReply correlation", () => {
     expect(p.expire(5_001, 5_000).map((r) => r.messageId)).toEqual(["q1"]);
     expect(p.size).toBe(0);
   });
+  test("cancel drops the request for a message that never arrived", () => {
+    // A turn/start the app-server refused carried a message Codex never
+    // saw. Letting its request expire would tell the sender "no reply
+    // came", pointing at Codex rather than at the send that failed.
+    const p = new PendingRequests();
+    p.add({ requester: "claude", messageId: "q1", at: 0 });
+    p.add({ requester: "grok", messageId: "q2", at: 0 });
+
+    expect(p.cancel("q1")?.requester).toBe("claude");
+    expect(p.size).toBe(1);
+    // Cancelled, not satisfied: nothing was answered.
+    expect(p.satisfy(undefined, ["claude"])).toEqual([]);
+    expect(p.size).toBe(1);
+  });
+
+  test("cancelling an unknown id changes nothing", () => {
+    const p = new PendingRequests();
+    p.add({ requester: "claude", messageId: "q1", at: 0 });
+    expect(p.cancel("nope")).toBeNull();
+    expect(p.size).toBe(1);
+  });
 });

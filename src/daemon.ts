@@ -2,6 +2,7 @@
 
 import type { ServerWebSocket } from "bun";
 import { CodexAdapter } from "./codex-adapter";
+import type { InjectionRejection } from "./codex-adapter";
 import { getRotatingLogger } from "./log-rotator";
 import { StatusLineWriter } from "./status-line-writer";
 import { BRIDGE_STOPPED_TAG } from "./lifecycle-tags";
@@ -657,6 +658,24 @@ async function handleCodexMessage(msg: BridgeMessage): Promise<void> {
   }
 }
 
+/**
+ * Close the turn-scoped state a Codex turn owns.
+ *
+ * Spec §6 says the requester is discarded at turn end, and a crash is a
+ * turn end. When only the clean path cleared it, an app-server that died
+ * mid-turn left `activeRequester` set forever: Codex's next spontaneous
+ * untagged output hit `routing.ts`'s requester branch and resolved to
+ * that one stale agent instead of broadcasting, so every other attached
+ * frontend received nothing and nobody was told — silent non-delivery to
+ * a live agent, which is exactly what the guarantee forbids. Every path
+ * that ends a turn calls this, not just the one that ends it well.
+ */
+function endCodexTurn(why: string): void {
+  if (!activeRequester.has("codex")) return;
+  log(`Clearing Codex's turn-scoped requester: ${why}`);
+  activeRequester.delete("codex");
+}
+
 codex.on("turnCompleted", () => {
   log("Codex turn completed");
   statusBuffer.flush("turn completed");
@@ -667,9 +686,7 @@ codex.on("turnCompleted", () => {
   // turn ending is not itself evidence of anything; Codex may open
   // another turn on the same requirement moments later.
 
-  // The turn that the requester opened is over, so the reply window it
-  // authorised closes with it.
-  activeRequester.delete("codex");
+  endCodexTurn("the turn completed");
 
   notifyFrontends((to) =>
     systemMessage(
@@ -730,10 +747,51 @@ codex.on("error", (err: Error) => {
   log(`Codex error: ${err.message}`);
 });
 
+/**
+ * The app-server refused a turn the daemon already reported as sent.
+ *
+ * `injectMessage` returning true only means the frame left this process.
+ * The refusal arrives later, by which time the Codex transport's
+ * `acknowledgementMode: "none"` self-ack has deleted the mailbox entry —
+ * so without this handler the message is gone, Codex never saw it, and
+ * the only trace is a log line the sender cannot read. That is the exact
+ * shape the never-silently-lost guarantee rules out, which is why the
+ * notice echoes the text back: a sender told "this did not land" and not
+ * shown what it was cannot act on it.
+ */
+codex.on("injectionRejected", ({ correlation, error }: InjectionRejection) => {
+  log(`Codex refused the turn for ${correlation.id}: ${error}`);
+
+  // The turn never opened, so nothing about it is in scope any more.
+  endCodexTurn("Codex refused the turn");
+  // A require-reply request against a message Codex never received would
+  // otherwise expire into "no reply came" — pointing at Codex instead of
+  // at the send that failed.
+  if (pendingRequests.cancel(correlation.id)) {
+    log(`Cancelled the pending reply request for refused message ${correlation.id}`);
+  }
+  // The contract reminder rode along on the refused turn, so it was
+  // never pinned. Let the next injection carry it again.
+  lastPinnedContractThreadId = null;
+
+  const notice = (to: AgentId) =>
+    noticeMessage(
+      "turn_start_rejected",
+      `⚠️ Codex refused the turn carrying your message — it was not delivered and Codex never saw it. ` +
+        `The app-server said: ${error}\n\nUndelivered message:\n${truncateForNotice(correlation.text)}`,
+      to,
+    );
+
+  const requester = isAgentId(correlation.requester) ? correlation.requester : null;
+  if (requester) routeOrLog(notice(requester));
+  else emitToFrontends(notice);
+});
+
 codex.on("exit", (code: number | null) => {
   log(`Codex process exited (code ${code})`);
   codexBootstrapped = false;
   statusBuffer.flush("codex exited");
+  endCodexTurn("the Codex app-server exited");
   tuiConnectionState.handleCodexExit();
   clearPendingClaudeDisconnect("Codex process exited");
   claudeOnlineNoticeSent = false;
@@ -1058,7 +1116,11 @@ function deliverToCodex(
   if (requireReply) contentToSend += REPLY_REQUIRED_INSTRUCTION;
 
   log(`Forwarding Claude → Codex (${content.length} chars, requireReply=${requireReply}, pinnedContract=${needsContract})`);
-  if (!codex.injectMessage(contentToSend)) return false;
+  // The correlation is what turns a later app-server refusal from a log
+  // line into something the sender hears about. `content`, not
+  // `contentToSend`: the echo should be what the sender wrote, not the
+  // contract reminder the daemon stapled to it.
+  if (!codex.injectMessage(contentToSend, { id: messageId, requester, text: content })) return false;
 
   if (needsContract && PIN_CONTRACT_MODE === "once" && activeThreadId) {
     lastPinnedContractThreadId = activeThreadId;

@@ -39,6 +39,21 @@ export function resolveRecipients(
         `${envelope.from} addressed itself; a sender is never its own recipient`,
       );
     }
+    // Same membership rule as broadcast, for the same reason. `isAgentId`
+    // says the name is well-formed, not that anything answers to it, so
+    // a directed send to an agent that has never connected used to be
+    // accepted: a mailbox was lazily created, the entry was enqueued, the
+    // wake-up failed harmlessly — and the sender was told "delivered"
+    // for a message parked where nobody will ever drain it. Silent
+    // shedding under a success report is worse than a refusal, so it is
+    // refused. Note "known", not "attached": an agent that has connected
+    // once and is mid-reconnect stays a legitimate recipient, and one
+    // that connects later still drains whatever accumulated for it.
+    if (!state.knownAgents().includes(envelope.to)) {
+      throw new RoutingError(
+        `${envelope.to} has never connected to this bridge, so it has no session to deliver to. The message was not sent.`,
+      );
+    }
     return [envelope.to];
   }
   if (envelope.to === "*") return everyoneElse();

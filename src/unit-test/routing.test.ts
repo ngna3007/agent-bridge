@@ -37,6 +37,30 @@ describe("resolveRecipients", () => {
     );
   });
 
+  test("a directed send to an agent that has never connected is refused, not accepted", () => {
+    // isAgentId says the name is well-formed, not that anything answers
+    // to it. Accepting this lazily created a mailbox, enqueued the entry,
+    // failed the wake-up harmlessly — and returned "delivered" to a
+    // sender whose message was parked where nobody will ever drain it.
+    const s = state({ knownAgents: () => ["claude", "codex"] as AgentId[] });
+    expect(() => resolveRecipients(env({ from: "codex", to: "grok" }), s, 0)).toThrow(RoutingError);
+    expect(() => resolveRecipients(env({ from: "codex", to: "grok" }), s, 0)).toThrow(/never connected/);
+  });
+
+  test("a directed send to a known-but-detached agent still routes — the mailbox is the point", () => {
+    // "Known", not "attached": an agent mid-reconnect, or one that
+    // connects later, legitimately drains what accumulated for it.
+    const s = state({ knownAgents: () => ["claude", "grok", "codex"] as AgentId[] });
+    expect(resolveRecipients(env({ from: "codex", to: "grok" }), s, 0)).toEqual(["grok"]);
+  });
+
+  test("the self-address guard is checked before membership, so the message names the real bug", () => {
+    const s = state({ knownAgents: () => ["claude"] as AgentId[] });
+    expect(() => resolveRecipients(env({ from: "codex", to: "codex" }), s, 0)).toThrow(
+      /addressed itself/,
+    );
+  });
+
   test('"*" broadcast still excludes only the sender, unaffected by the self-address guard', () => {
     expect(resolveRecipients(env({ from: "codex", to: "*" }), state(), 0)).toEqual([
       "claude",

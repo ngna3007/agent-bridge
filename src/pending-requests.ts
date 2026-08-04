@@ -39,6 +39,22 @@ export class PendingRequests {
     return satisfied.reverse();
   }
 
+  /**
+   * Drop the request `messageId` opened, because the message never
+   * arrived.
+   *
+   * Distinct from `satisfy`: nothing was answered. A request whose
+   * message the app-server refused would otherwise sit until its TTL and
+   * then tell the sender "no reply came" — which is true and useless,
+   * because it points at Codex rather than at the send that failed. The
+   * sender is told about the refusal directly instead.
+   */
+  cancel(messageId: string): PendingRequest | null {
+    const i = this.requests.findIndex((r) => r.messageId === messageId);
+    if (i === -1) return null;
+    return this.requests.splice(i, 1)[0];
+  }
+
   expire(now: number, ttlMs: number): PendingRequest[] {
     const expired: PendingRequest[] = [];
     for (let i = this.requests.length - 1; i >= 0; i--) {
