@@ -380,7 +380,6 @@ The daemon writes a short colored tag to `<state-dir>/status.line` on every life
 | Daemon control connection dropped | `[BRIDGE OFFLINE]` | red |
 | Daemon failed to start | `[BRIDGE FAILED]` | red |
 | Codex failed to start | `[CODEX FAILED]` | red |
-| Required reply missing | `[CODEX NO REPLY]` | red |
 | Evicted by a newer session | `[REPLACED BY NEWER SESSION]` | red |
 | Another session active | `[ANOTHER SESSION ACTIVE]` | red |
 | Recovery exhausted | `[RECONNECT FAILED]` | red |

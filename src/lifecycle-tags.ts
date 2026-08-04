@@ -57,7 +57,6 @@ export const LIFECYCLE_TAGS: Record<string, string> = {
   system_codex_start_failed:            wrap(C_RED,    "[CODEX FAILED]"),
   system_turn_started:                  wrap(C_YELLOW, "[CODEX THINKING]"),
   system_turn_completed:                wrap(C_GREEN,  "[CODEX READY]"),
-  system_reply_missing:                 wrap(C_RED,    "[CODEX NO REPLY]"),
   system_tui_disconnected:              wrap(C_YELLOW, "[CODEX UI OFFLINE]"),
   system_tui_reconnected:               wrap(C_GREEN,  "[CODEX READY]"),
 };
@@ -83,7 +82,6 @@ export const DAEMON_LIFECYCLE_IDS: ReadonlySet<string> = new Set([
   "system_codex_start_failed",
   "system_turn_started",
   "system_turn_completed",
-  "system_reply_missing",
   "system_tui_disconnected",
   "system_tui_reconnected",
 ]);

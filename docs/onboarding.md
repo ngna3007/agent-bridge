@@ -257,6 +257,13 @@ holds three messages for ten minutes by default
 is dropped or expires, AgentBridge tells Claude and echoes the text back, so a
 lost reply is never silent. `abg status` shows how many are held.
 
+**If Claude marks a message `require_reply`**, AgentBridge tracks that specific
+request until Codex actually answers it with `[REPLY]` — not just any `[REPLY]`
+in the meantime, and not until the current turn happens to end, since Codex can
+open another turn on the same question moments later. If ten minutes pass by
+default (`AGENTBRIDGE_REPLY_REQUIRED_TTL_MS`) with no answer, Claude is told the
+window expired instead of waiting silently forever.
+
 ---
 
 ## Step 7 — Reading the status line
@@ -272,7 +279,6 @@ happening without asking.
 | `[WAITING FOR CODEX]` | daemon up, waiting on the TUI | start `abg codex` |
 | `[CODEX READY]` | idle, ready for a message | send away |
 | `[CODEX THINKING]` | mid-turn | wait — don't reply now |
-| `[CODEX NO REPLY]` | turn ended with no `[REPLY]` | check the TUI; Codex may have answered without the marker |
 | `[CODEX UI OFFLINE]` | TUI disconnected, daemon alive | restart `abg codex`; the conversation survives |
 | `[BRIDGE OFFLINE]` | bridge lost the daemon | it retries with backoff; usually self-heals |
 | `[RECONNECTING]` | liveness probe running | wait a beat |

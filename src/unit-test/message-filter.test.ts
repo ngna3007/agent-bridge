@@ -97,9 +97,10 @@ describe("classifyMessage — full mode preserves marker identity (regression)",
   // discarding what parseMarker had found. Full mode is a *routing* switch
   // ("forward everything"), but the marker is also read for *semantics*:
   // daemon.ts gates require_reply satisfaction on `result.marker === "reply"`.
-  // Erasing the marker meant a correctly-tagged [REPLY] never set
-  // replyReceivedDuringTurn, so every require_reply turn in full mode ended
-  // with a spurious system_reply_missing warning to Claude.
+  // Erasing the marker meant a correctly-tagged [REPLY] never satisfied
+  // the pending request (see src/pending-requests.ts), so every
+  // require_reply turn in full mode ended with a spurious `reply_missing`
+  // warning to Claude once the request's TTL expired.
 
   test("reports the parsed marker, not untagged", () => {
     expect(classifyMessage("[REPLY] x", "full")).toEqual({ action: "forward", marker: "reply" });
@@ -128,7 +129,7 @@ describe("daemon reply-tracking decision rules (mirrors src/daemon.ts)", () => {
   // handler; they exist to pin the daemon-visible consequence of the
   // classifyMessage contract above. Same precedent as pin-contract.test.ts.
 
-  /** src/daemon.ts: `if (replyRequired && result.marker === "reply")` */
+  /** src/daemon.ts: `if (result.marker === "reply") pendingRequests.satisfy(...)` */
   function replySatisfiedBy(contents: string[], mode: FilterMode): boolean {
     return contents.some((c) => classifyMessage(c, mode).marker === "reply");
   }
@@ -144,7 +145,8 @@ describe("daemon reply-tracking decision rules (mirrors src/daemon.ts)", () => {
 
   test("a [REPLY] satisfies require_reply in full mode", () => {
     // This is the bug: it returned false before the fix, so the daemon
-    // emitted system_reply_missing even though Codex did reply.
+    // would have emitted reply_missing once the request's TTL expired,
+    // even though Codex did reply.
     expect(replySatisfiedBy(["[REPLY] done, LGTM"], "full")).toBe(true);
   });
 

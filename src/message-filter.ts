@@ -73,7 +73,7 @@ export function classifyMessage(content: string, mode: FilterMode): FilterResult
   // The parsed marker is still reported so callers that key off semantics —
   // notably the daemon's require_reply satisfaction check — keep working.
   // Reporting "untagged" here used to erase a genuine [REPLY] and make the
-  // daemon emit a spurious system_reply_missing in full mode.
+  // daemon emit a spurious reply_missing in full mode.
   if (mode === "full") return { action: "forward", marker };
   switch (marker) {
     case "reply":

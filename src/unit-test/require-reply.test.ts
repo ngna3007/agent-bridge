@@ -36,4 +36,32 @@ describe("requireReply correlation", () => {
     expect(p.expire(10_000, 5_000).map((r) => r.messageId)).toEqual(["q1"]);
     expect(p.size).toBe(0);
   });
+
+  test("satisfy returns multiple matches oldest-first", () => {
+    const p = new PendingRequests();
+    p.add({ requester: "claude", messageId: "q1", at: 0 });
+    p.add({ requester: "claude", messageId: "q2", at: 1 });
+    // Neither is named by inReplyTo, so both are matched by "routed to
+    // the requester" — a single reply can close out more than one
+    // outstanding request from the same agent.
+    expect(p.satisfy(undefined, ["claude"]).map((r) => r.messageId)).toEqual(["q1", "q2"]);
+    expect(p.size).toBe(0);
+  });
+
+  test("expire returns multiple matches oldest-first", () => {
+    const p = new PendingRequests();
+    p.add({ requester: "claude", messageId: "q1", at: 0 });
+    p.add({ requester: "grok", messageId: "q2", at: 100 });
+    expect(p.expire(10_000, 5_000).map((r) => r.messageId)).toEqual(["q1", "q2"]);
+    expect(p.size).toBe(0);
+  });
+
+  test("expire's boundary is inclusive: exactly ttlMs old is not yet expired", () => {
+    const p = new PendingRequests();
+    p.add({ requester: "claude", messageId: "q1", at: 0 });
+    expect(p.expire(5_000, 5_000)).toHaveLength(0);
+    expect(p.size).toBe(1);
+    expect(p.expire(5_001, 5_000).map((r) => r.messageId)).toEqual(["q1"]);
+    expect(p.size).toBe(0);
+  });
 });

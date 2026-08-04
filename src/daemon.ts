@@ -1140,7 +1140,7 @@ async function sendFromFrontend(
  * used to be set before the attempt, so a rejected injection left the
  * thread marked as already-pinned (the contract would then never be
  * sent) and armed a pending request against Codex's *current* turn —
- * producing a `system_reply_missing` warning for a message Codex never
+ * producing a `reply_missing` warning for a message Codex never
  * received.
  */
 function deliverToCodex(
@@ -1501,6 +1501,19 @@ function clearAttentionWindow() {
  * survives a reconnect the same way any other message does — a request
  * is not answered just because the requester's socket blipped, and the
  * notice that it wasn't must not be lost the same way.
+ *
+ * Emitted as `reply_missing`, in the `reply_*` family alongside
+ * `reply_expired` / `reply_delivered` / `reply_undeliverable` /
+ * `reply_discarded` — not `system_*`. Every `system_*` id is wake-only
+ * by convention (Task 11: a statusbar tag with no reply semantics must
+ * never occupy a mailbox slot), but this notice is routed through the
+ * bus deliberately, same as its `reply_*` siblings — a loss report, not
+ * a statusbar tag. Naming it into that family makes the exception
+ * legible instead of a `system_`-prefixed id quietly breaking the
+ * convention it appears to follow. Built with `noticeMessage`, so it
+ * reaches the sender as content (`bridge.ts`'s `isDaemonLifecycle` only
+ * intercepts `system_*` ids into the statusbar; everything else pushes
+ * to the model), exactly like the four siblings above.
  */
 function checkExpiredRequests(): void {
   const expired = pendingRequests.expire(Date.now(), PENDING_REQUEST_TTL_MS);
@@ -1509,8 +1522,8 @@ function checkExpiredRequests(): void {
       `Reply required for ${req.messageId} expired after ${PENDING_REQUEST_TTL_MS}ms without a reply (requester: ${req.requester})`,
     );
     routeOrLog(
-      systemMessage(
-        "system_reply_missing",
+      noticeMessage(
+        "reply_missing",
         "⚠️ Codex did not send a reply before the reply-required window expired. You may want to retry or rephrase.",
         req.requester,
       ),
