@@ -150,9 +150,18 @@ export class CodexAdapter extends EventEmitter {
    * request id is what lets the rejection be reported back with the text
    * it lost.
    *
+   * Keyed and released by *bridge request id*, never by the injection
+   * slot. Those are two different lifetimes and conflating them lost the
+   * refusal that matters most: the app-server refuses a turn/start
+   * because another turn is already running, so the winning
+   * `turn/started` — which frees the slot — arrives before the refusal
+   * does. The entry survives until the response lands, until the id
+   * stops being correlatable at all (`RESPONSE_TRACKING_TTL_MS`), or
+   * until the connection those ids belong to is gone.
+   *
    * Naturally near-empty: injection is serialised by `turnPending`, so at
-   * most one entry is live at a time. Cleared wherever the reservation
-   * itself is cleared.
+   * most one entry is live at a time, and it is bounded above by the same
+   * TTL as `bridgeRequestIds`.
    */
   private injectionCorrelations = new Map<number, InjectionCorrelation>();
 
@@ -1554,12 +1563,12 @@ export class CodexAdapter extends EventEmitter {
     this.clearTrackedId(this.pendingTurnStarts, requestId);
     const timer = setTimeout(() => {
       this.pendingTurnStarts.delete(requestId);
-      // No response and no `turn/started` is not a refusal — nobody said
-      // no, the answer simply never came. Reporting it as a rejection
-      // would tell the sender its message was refused when it may well
-      // be running, so the correlation is dropped silently and the slot
-      // is freed. The unanswered-injection case is its own problem.
-      this.injectionCorrelations.delete(requestId);
+      // Only the reservation. The correlation outlives it deliberately:
+      // this timer is about the *injection slot*, and it fires at 15s
+      // while a response stays correlatable for 30s. Dropping the
+      // correlation here would lose a refusal that arrives in between —
+      // and "no turn/started yet" is if anything a hint that a refusal
+      // is what is coming.
       this.log(`turn/start ${requestId} was never confirmed; releasing the injection slot`);
     }, CodexAdapter.TURN_START_CONFIRM_TIMEOUT_MS);
     timer.unref?.();
@@ -1570,11 +1579,14 @@ export class CodexAdapter extends EventEmitter {
   private clearPendingTurnStarts() {
     for (const timer of this.pendingTurnStarts.values()) clearTimeout(timer);
     this.pendingTurnStarts.clear();
-    // Same reasoning as the timer: every caller of this method has
-    // learned the turn state some other way (a `turn/started`, or a
-    // connection reset that invalidates every id), so no response is
-    // coming that could name these as refused.
-    this.injectionCorrelations.clear();
+    // Reservations only. `markTurnStarted` calls this for *whoever's*
+    // turn started, and the most likely reason the app-server refuses
+    // the bridge's turn/start is that another turn is already running —
+    // so the winning turn/started arrives first and the refusal second.
+    // Clearing correlations here dropped exactly that refusal, after the
+    // transport's self-ack had already deleted the mailbox entry: real
+    // loss with nobody told. Correlations are keyed by bridge request id
+    // and are released with it, not with the injection slot.
   }
 
   private markTurnStarted(turnId?: string) {
@@ -1682,6 +1694,12 @@ export class CodexAdapter extends EventEmitter {
 
     const timer = setTimeout(() => {
       this.bridgeRequestIds.delete(requestId);
+      // The invariant that bounds a correlation: it lives exactly as
+      // long as the id a response could be matched against. Once this
+      // id is forgotten, `consumeBridgeRequestId` can never claim a
+      // response for it, so no refusal can ever arrive and the payload
+      // is dead weight.
+      this.injectionCorrelations.delete(requestId);
     }, CodexAdapter.RESPONSE_TRACKING_TTL_MS);
     timer.unref?.();
     this.bridgeRequestIds.set(requestId, timer);
@@ -1693,6 +1711,12 @@ export class CodexAdapter extends EventEmitter {
 
   private untrackBridgeRequestId(requestId: number) {
     this.clearTrackedId(this.bridgeRequestIds, requestId);
+    // Keeps "a correlation never outlives its bridge request id" true
+    // literally rather than by argument. Nothing is stored yet on the
+    // one path that calls this — the send threw before the correlation
+    // was recorded — and that is precisely why it must not be the thing
+    // the invariant rests on.
+    this.injectionCorrelations.delete(requestId);
   }
 
   private clearTrackedId(store: Map<number, ReturnType<typeof setTimeout>>, id: number) {
@@ -1716,6 +1740,12 @@ export class CodexAdapter extends EventEmitter {
       clearTimeout(timer);
     }
     this.bridgeRequestIds.clear();
+    // Same lifetime, and this is the one place the ids are genuinely
+    // meaningless: they belong to a connection that is gone, so no
+    // response for them is ever coming. Not a refusal — nobody said no —
+    // so nothing is reported; the daemon's exit and turn-abort paths own
+    // that case.
+    this.injectionCorrelations.clear();
 
     // A turn/start reservation is keyed by a bridge request id, so once
     // those are dropped no response can ever release it. Released here so

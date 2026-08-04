@@ -390,6 +390,70 @@ describe("CodexAdapter turn state machine", () => {
     adapter.clearResponseTrackingState();
   });
 
+  test("a refusal is still reported when another turn/started won the race", async () => {
+    // The most likely refusal there is: the app-server says no *because*
+    // another turn is already running, so the winning turn/started
+    // arrives before the refusal does. That turn/started frees the
+    // injection slot — and while the correlation was tied to the slot it
+    // was wiped along with it, so the refusal landed on nothing. The
+    // transport's self-ack has already deleted the mailbox entry by
+    // then, so this is the message gone with nobody told.
+    const adapter = createAdapter();
+    adapter.threadId = "thread-1";
+    adapter.appServerWs = { readyState: WebSocket.OPEN, send: () => {} } as any;
+
+    const rejections: any[] = [];
+    adapter.on("injectionRejected", (r: any) => rejections.push(r));
+
+    expect(adapter.injectMessage("please review", { id: "msg_r", requester: "claude", text: "please review" })).toBe(true);
+    const requestId = adapter.nextInjectionId + 1;
+
+    // The TUI's own turn wins.
+    adapter.handleServerNotification({ method: "turn/started", params: { turn: { id: "tui-turn" } } });
+    expect(adapter.pendingTurnStarts.size).toBe(0);
+    expect(adapter.turnInProgress).toBe(true);
+
+    // ...and only then does the app-server refuse ours.
+    adapter.handleAppServerPayload(JSON.stringify({
+      id: requestId,
+      error: { message: "a turn is already running" },
+    }));
+
+    expect(rejections).toEqual([
+      {
+        correlation: { id: "msg_r", requester: "claude", text: "please review" },
+        error: "a turn is already running",
+      },
+    ]);
+
+    adapter.clearResponseTrackingState();
+  });
+
+  test("a correlation is bounded by the id it is correlated against", async () => {
+    // The lifetime that replaced the injection slot: once the bridge
+    // request id stops being correlatable, no response can ever reach
+    // the correlation, so holding the payload would be a leak.
+    const original = (CodexAdapter as any).RESPONSE_TRACKING_TTL_MS;
+    (CodexAdapter as any).RESPONSE_TRACKING_TTL_MS = 5;
+    try {
+      const adapter = createAdapter();
+      adapter.threadId = "thread-1";
+      adapter.appServerWs = { readyState: WebSocket.OPEN, send: () => {} } as any;
+
+      expect(adapter.injectMessage("hi", { id: "msg_t", requester: "claude", text: "hi" })).toBe(true);
+      expect(adapter.injectionCorrelations.size).toBe(1);
+
+      await new Promise((resolve) => setTimeout(resolve, 40));
+
+      expect(adapter.bridgeRequestIds.size).toBe(0);
+      expect(adapter.injectionCorrelations.size).toBe(0);
+
+      adapter.clearResponseTrackingState();
+    } finally {
+      (CodexAdapter as any).RESPONSE_TRACKING_TTL_MS = original;
+    }
+  });
+
   test("an accepted turn/start reports nothing and forgets the payload", () => {
     const adapter = createAdapter();
     adapter.threadId = "thread-1";

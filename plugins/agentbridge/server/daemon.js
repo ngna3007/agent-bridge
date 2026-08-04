@@ -1210,7 +1210,6 @@ class CodexAdapter extends EventEmitter {
     this.clearTrackedId(this.pendingTurnStarts, requestId);
     const timer = setTimeout(() => {
       this.pendingTurnStarts.delete(requestId);
-      this.injectionCorrelations.delete(requestId);
       this.log(`turn/start ${requestId} was never confirmed; releasing the injection slot`);
     }, CodexAdapter.TURN_START_CONFIRM_TIMEOUT_MS);
     timer.unref?.();
@@ -1220,7 +1219,6 @@ class CodexAdapter extends EventEmitter {
     for (const timer of this.pendingTurnStarts.values())
       clearTimeout(timer);
     this.pendingTurnStarts.clear();
-    this.injectionCorrelations.clear();
   }
   markTurnStarted(turnId) {
     this.clearPendingTurnStarts();
@@ -1298,6 +1296,7 @@ class CodexAdapter extends EventEmitter {
     this.clearTrackedId(this.bridgeRequestIds, requestId);
     const timer = setTimeout(() => {
       this.bridgeRequestIds.delete(requestId);
+      this.injectionCorrelations.delete(requestId);
     }, CodexAdapter.RESPONSE_TRACKING_TTL_MS);
     timer.unref?.();
     this.bridgeRequestIds.set(requestId, timer);
@@ -1307,6 +1306,7 @@ class CodexAdapter extends EventEmitter {
   }
   untrackBridgeRequestId(requestId) {
     this.clearTrackedId(this.bridgeRequestIds, requestId);
+    this.injectionCorrelations.delete(requestId);
   }
   clearTrackedId(store, id) {
     const timer = store.get(id);
@@ -1327,6 +1327,7 @@ class CodexAdapter extends EventEmitter {
       clearTimeout(timer);
     }
     this.bridgeRequestIds.clear();
+    this.injectionCorrelations.clear();
     this.clearPendingTurnStarts();
   }
   clearResponseTrackingState() {
