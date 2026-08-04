@@ -46,6 +46,7 @@ import { isAgentId } from "./agent-id";
 import { Mailbox } from "./mailbox";
 import { MessageIndex } from "./message-index";
 import { MessageBus, SendRejected } from "./message-bus";
+import { PendingRequests } from "./pending-requests";
 import { RoutingError } from "./routing";
 import { TransportRegistry, type WakeupTransport } from "./wakeup-transport";
 import { PROTOCOL_VERSION, normalizeIngress, normalizeProse } from "./normalize-ingress";
@@ -151,10 +152,9 @@ let nextSystemMessageId = 0;
 let codexBootstrapped = false;
 let attentionWindowTimer: ReturnType<typeof setTimeout> | null = null;
 let inAttentionWindow = false;
-let replyRequired = false;
-let replyReceivedDuringTurn = false;
 let shuttingDown = false;
 let idleShutdownTimer: ReturnType<typeof setTimeout> | null = null;
+let pendingRequestsTimer: ReturnType<typeof setInterval> | null = null;
 let claudeDisconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let claudeOnlineNoticeSent = false;
 let claudeOfflineNoticeShown = false;
@@ -195,6 +195,24 @@ const replyOutbox = new ReplyOutbox({
   max: parsePositiveIntEnv("AGENTBRIDGE_REPLY_QUEUE_MAX", 3, log),
   ttlMs: parsePositiveIntEnv("AGENTBRIDGE_REPLY_QUEUE_TTL_MS", 10 * 60_000, log),
 });
+
+/**
+ * Requests waiting on a reply, correlated per-request rather than by one
+ * module-level flag. See `src/pending-requests.ts` for why: with
+ * addressing, a `[REPLY @grok]` must not clear a request Claude is still
+ * waiting on.
+ */
+const pendingRequests = new PendingRequests();
+
+/**
+ * How long a require-reply request may sit unanswered before it is
+ * reported as missing. Same order of magnitude as the reply outbox TTL
+ * above — both bound how long a sender's request may go unaddressed
+ * before AgentBridge says so instead of staying quiet.
+ */
+const PENDING_REQUEST_TTL_MS = parsePositiveIntEnv("AGENTBRIDGE_REPLY_REQUIRED_TTL_MS", 10 * 60_000, log);
+/** How often `checkExpiredRequests` sweeps for requests past their TTL. */
+const PENDING_REQUEST_CHECK_INTERVAL_MS = 30_000;
 
 // ===========================================================================
 // The message bus.
@@ -331,7 +349,7 @@ registerTransport("codex", {
     const requireReply = requireReplyIds.delete(message.id);
     const requester = isAgentId(message.from) ? message.from : null;
 
-    if (deliverToCodex(message.content, requireReply, requester)) {
+    if (deliverToCodex(message.content, requireReply, requester, message.id)) {
       // The sender has answered, so the attention window opened for it is over.
       clearAttentionWindow();
       return;
@@ -434,9 +452,9 @@ function deliveryHintFor(message: BridgeMessage, mode: FilterMode): ClaudeDelive
  * owed.
  */
 type RouteOutcome =
-  | { status: "delivered" }
+  | { status: "delivered"; accepted: AgentId[] }
   /** Accepted by someone, shed by someone else. The sender must hear this. */
-  | { status: "partial"; note: string }
+  | { status: "partial"; note: string; accepted: AgentId[] }
   /** Nobody took it. The sender must hear this. */
   | { status: "failed"; error: string };
 
@@ -464,13 +482,14 @@ function senderFacingText(outcome: RouteOutcome): string | null {
 async function routeThroughBus(envelope: BridgeMessage): Promise<RouteOutcome> {
   try {
     const outcome = await bus.route(envelope, Date.now());
-    if (outcome.rejected.length === 0) return { status: "delivered" };
+    if (outcome.rejected.length === 0) return { status: "delivered", accepted: outcome.accepted };
     log(
       `Message ${envelope.id} rejected by ${outcome.rejected.map((r) => r.agent).join(", ")}`,
     );
     return {
       status: "partial",
       note: outcome.rejected.map((r) => r.reason).join(" "),
+      accepted: outcome.accepted,
     };
   } catch (err: unknown) {
     if (err instanceof RoutingError || err instanceof SendRejected) {
@@ -685,17 +704,6 @@ async function handleCodexMessage(msg: BridgeMessage): Promise<void> {
     return;
   }
 
-  // Track whether Codex sent a [REPLY] during a require_reply turn,
-  // so system_reply_missing fires when it didn't. Only [REPLY] counts
-  // as "actually replied" - [STATUS] / [FYI] / untagged don't
-  // satisfy a required reply. Tracking is the ONLY effect of
-  // replyRequired now; we no longer force-forward every intermediate
-  // message. Routing of each message still goes through
-  // classifyMessage below.
-  if (replyRequired && result.marker === "reply") {
-    replyReceivedDuringTurn = true;
-  }
-
   // During attention window, suppress STATUS to give Claude space to respond.
   // Skipped in full mode: full mode's contract is "forward everything", and
   // classifyMessage now reports the real marker there, so without this guard
@@ -743,29 +751,27 @@ async function handleCodexMessage(msg: BridgeMessage): Promise<void> {
   if (text !== null) tellCodex(text);
   if (outcome.status === "failed") return;
 
-  // [REPLY] message — give the recipient an attention window to respond.
-  if (result.marker === "reply") startAttentionWindow();
+  // Only a [REPLY] satisfies a pending require-reply request — [STATUS] /
+  // [FYI] / untagged don't count as "actually replied". Correlated by
+  // `inReplyTo` when Codex named it, or by delivery to the requester
+  // otherwise (an untagged reply back to whoever opened the turn).
+  if (result.marker === "reply") {
+    pendingRequests.satisfy(envelope.inReplyTo, outcome.accepted);
+    // [REPLY] message — give the recipient an attention window to respond.
+    startAttentionWindow();
+  }
 }
 
 codex.on("turnCompleted", () => {
   log("Codex turn completed");
   statusBuffer.flush("turn completed");
 
-  // Check if reply was required but Codex didn't send any agentMessage
-  if (replyRequired && !replyReceivedDuringTurn) {
-    log("⚠️ Reply was required but Codex did not send any agentMessage");
-    notifyFrontends((to) =>
-      systemMessage(
-        "system_reply_missing",
-        "⚠️ Codex completed the turn without sending a reply (require_reply was set). Codex may not have generated an agentMessage. You may want to retry or rephrase.",
-        to,
-      ),
-    );
-  }
+  // Whether a required reply is missing is now decided by
+  // `checkExpiredRequests` against each request's own TTL, not by
+  // whether this turn happened to end with one still outstanding — a
+  // turn ending is not itself evidence of anything; Codex may open
+  // another turn on the same requirement moments later.
 
-  // Reset reply-required state
-  replyRequired = false;
-  replyReceivedDuringTurn = false;
   // The turn that the requester opened is over, so the reply window it
   // authorised closes with it.
   activeRequester.delete("codex");
@@ -1130,16 +1136,18 @@ async function sendFromFrontend(
  * Decorate a Claude message and inject it as a Codex turn.
  *
  * Every state mutation here happens *after* `injectMessage` returns
- * true. The contract-pin bookkeeping and the require-reply flag used to
- * be set before the attempt, so a rejected injection left the thread
- * marked as already-pinned (the contract would then never be sent) and
- * armed `replyRequired` against Codex's *current* turn — producing a
- * `system_reply_missing` warning for a message Codex never received.
+ * true. The contract-pin bookkeeping and the pending-request bookkeeping
+ * used to be set before the attempt, so a rejected injection left the
+ * thread marked as already-pinned (the contract would then never be
+ * sent) and armed a pending request against Codex's *current* turn —
+ * producing a `system_reply_missing` warning for a message Codex never
+ * received.
  */
 function deliverToCodex(
   content: string,
   requireReply: boolean,
-  requester: AgentId | null = null,
+  requester: AgentId | null,
+  messageId: string,
 ): boolean {
   // Pin contract once per Codex thread. Cuts ~200 tokens per
   // Claude→Codex msg after the first. Falls back to per-msg append
@@ -1161,10 +1169,13 @@ function deliverToCodex(
     lastPinnedContractThreadId = activeThreadId;
     log(`Pinned BRIDGE_CONTRACT_REMINDER for thread ${activeThreadId.slice(0, 8)}; subsequent msgs skip the reminder`);
   }
-  if (requireReply) {
-    replyRequired = true;
-    replyReceivedDuringTurn = false;
-    log(`Reply required flag set for this message`);
+  // Only a requester we can name is worth tracking — with nobody to
+  // notify on expiry there is nothing `checkExpiredRequests` could do
+  // for it anyway. In practice every caller has a requester; this is
+  // the same guard `activeRequester` uses below.
+  if (requireReply && requester) {
+    pendingRequests.add({ requester, messageId, at: Date.now() });
+    log(`Reply required from Codex for ${messageId} (requester: ${requester})`);
   }
   // Codex's turn is now open on this sender's behalf. `resolveRecipients`
   // reads this to let an untagged reply from Codex go back to whoever
@@ -1202,7 +1213,7 @@ function drainReplyOutbox(): void {
 
   // The sender is carried across the deferral so the turn this delivery
   // opens is still attributed to whoever actually asked.
-  if (deliverToCodex(reply.content, reply.requireReply, outboxRequester.get(reply.id) ?? null)) {
+  if (deliverToCodex(reply.content, reply.requireReply, outboxRequester.get(reply.id) ?? null, reply.id)) {
     outboxRequester.delete(reply.id);
     // Same bookkeeping as a live reply: Claude has answered, so the
     // attention window opened moments ago by turnCompleted is over.
@@ -1472,6 +1483,41 @@ function clearAttentionWindow() {
   inAttentionWindow = false;
 }
 
+/**
+ * Sweep for require-reply requests that have sat unanswered past
+ * `PENDING_REQUEST_TTL_MS` and report each one — this is the only place
+ * `PendingRequests.expire` is called, and the governing rule for the
+ * whole bus is that nothing accepted is silently lost, so an expiry
+ * that nobody hears about would just be a slower version of the bug
+ * this replaces.
+ *
+ * Runs on a timer rather than at a turn boundary: a turn ending is not
+ * evidence the requester's question went unanswered (Codex may open
+ * another turn on it moments later), and a single global flag armed
+ * against "the current turn" is exactly the coupling this task removes.
+ *
+ * Routed through the bus (`routeOrLog`), not the wake-only
+ * `notifyFrontends`, so the notice lands in the requester's mailbox and
+ * survives a reconnect the same way any other message does — a request
+ * is not answered just because the requester's socket blipped, and the
+ * notice that it wasn't must not be lost the same way.
+ */
+function checkExpiredRequests(): void {
+  const expired = pendingRequests.expire(Date.now(), PENDING_REQUEST_TTL_MS);
+  for (const req of expired) {
+    log(
+      `Reply required for ${req.messageId} expired after ${PENDING_REQUEST_TTL_MS}ms without a reply (requester: ${req.requester})`,
+    );
+    routeOrLog(
+      systemMessage(
+        "system_reply_missing",
+        "⚠️ Codex did not send a reply before the reply-required window expired. You may want to retry or rephrase.",
+        req.requester,
+      ),
+    );
+  }
+}
+
 function scheduleIdleShutdown() {
   cancelIdleShutdown();
   if (frontends.size > 0) return; // still has a client
@@ -1724,6 +1770,10 @@ function shutdown(reason: string) {
   daemonStatusLine.write(BRIDGE_STOPPED_TAG);
   tuiConnectionState.dispose(`daemon shutdown (${reason})`);
   clearPendingClaudeDisconnect(`daemon shutdown (${reason})`);
+  if (pendingRequestsTimer) {
+    clearInterval(pendingRequestsTimer);
+    pendingRequestsTimer = null;
+  }
   controlServer?.stop();
   controlServer = null;
   codex.stop();
@@ -1792,5 +1842,6 @@ try {
   removePidFile();
   process.exit(1);
 }
+pendingRequestsTimer = setInterval(checkExpiredRequests, PENDING_REQUEST_CHECK_INTERVAL_MS);
 startupComplete = true;
 void bootCodex();
