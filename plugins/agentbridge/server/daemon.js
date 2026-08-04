@@ -213,6 +213,11 @@ class CodexAdapter extends EventEmitter {
   pendingRequests = new Map;
   activeTurnIds = new Set;
   turnInProgress = false;
+  pendingTurnStarts = new Map;
+  static TURN_START_CONFIRM_TIMEOUT_MS = 15000;
+  get turnPending() {
+    return this.turnInProgress || this.pendingTurnStarts.size > 0;
+  }
   nextProxyId = 1e5;
   upstreamToClient = new Map;
   serverRequestToProxy = new Map;
@@ -320,6 +325,10 @@ class CodexAdapter extends EventEmitter {
       this.log(`Rejected injection: Codex turn is in progress (thread ${this.threadId})`);
       return false;
     }
+    if (this.pendingTurnStarts.size > 0) {
+      this.log(`Rejected injection: a turn/start is already in flight (thread ${this.threadId})`);
+      return false;
+    }
     this.log(`Injecting message into Codex (${text.length} chars)`);
     const requestId = this.nextInjectionId--;
     this.trackBridgeRequestId(requestId);
@@ -329,6 +338,7 @@ class CodexAdapter extends EventEmitter {
         id: requestId,
         params: { threadId: this.threadId, input: [{ type: "text", text }] }
       }));
+      this.reserveTurnStart(requestId);
       return true;
     } catch (err) {
       this.untrackBridgeRequestId(requestId);
@@ -1016,6 +1026,7 @@ class CodexAdapter extends EventEmitter {
       return forwarded;
     }
     if (!isNaN(numericId) && this.consumeBridgeRequestId(numericId)) {
+      this.clearTrackedId(this.pendingTurnStarts, numericId);
       if (parsed.error) {
         this.log(`Bridge-originated request failed (id ${responseId}): ${parsed.error.message ?? "unknown error"}`);
       } else {
@@ -1193,7 +1204,22 @@ class CodexAdapter extends EventEmitter {
     this.log(`Thread detected: ${threadId} (${reason})`);
     this.emit("ready", threadId);
   }
+  reserveTurnStart(requestId) {
+    this.clearTrackedId(this.pendingTurnStarts, requestId);
+    const timer = setTimeout(() => {
+      this.pendingTurnStarts.delete(requestId);
+      this.log(`turn/start ${requestId} was never confirmed; releasing the injection slot`);
+    }, CodexAdapter.TURN_START_CONFIRM_TIMEOUT_MS);
+    timer.unref?.();
+    this.pendingTurnStarts.set(requestId, timer);
+  }
+  clearPendingTurnStarts() {
+    for (const timer of this.pendingTurnStarts.values())
+      clearTimeout(timer);
+    this.pendingTurnStarts.clear();
+  }
   markTurnStarted(turnId) {
+    this.clearPendingTurnStarts();
     const wasInProgress = this.turnInProgress;
     if (typeof turnId === "string" && turnId.length > 0) {
       this.activeTurnIds.add(turnId);
@@ -1291,6 +1317,7 @@ class CodexAdapter extends EventEmitter {
       clearTimeout(timer);
     }
     this.bridgeRequestIds.clear();
+    this.clearPendingTurnStarts();
   }
   clearResponseTrackingState() {
     this.clearTransientResponseTrackingState();
@@ -1480,7 +1507,6 @@ var LIFECYCLE_TAGS = {
   system_codex_start_failed: wrap(C_RED, "[CODEX FAILED]"),
   system_turn_started: wrap(C_YELLOW, "[CODEX THINKING]"),
   system_turn_completed: wrap(C_GREEN, "[CODEX READY]"),
-  system_reply_missing: wrap(C_RED, "[CODEX NO REPLY]"),
   system_tui_disconnected: wrap(C_YELLOW, "[CODEX UI OFFLINE]"),
   system_tui_reconnected: wrap(C_GREEN, "[CODEX READY]")
 };
@@ -1490,23 +1516,37 @@ var DAEMON_LIFECYCLE_IDS = new Set([
   "system_codex_start_failed",
   "system_turn_started",
   "system_turn_completed",
-  "system_reply_missing",
   "system_tui_disconnected",
   "system_tui_reconnected"
 ]);
 
+// src/agent-id.ts
+var AGENT_IDS = ["claude", "grok", "codex"];
+function isAgentId(v) {
+  return typeof v === "string" && AGENT_IDS.includes(v);
+}
+function parseAgentId(v) {
+  return isAgentId(v) ? v : null;
+}
+
 // src/message-filter.ts
-var MARKER_REGEX = /^\s*\[(REPLY|IMPORTANT|STATUS|FYI)\]\s*/i;
+class MarkerError extends Error {
+}
+var MARKER_REGEX = /^\s*\[(REPLY|IMPORTANT|STATUS|FYI)(?:\s+@([a-z][a-z0-9_-]*))?\]\s*/i;
 function parseMarker(content) {
   const match = content.match(MARKER_REGEX);
   if (!match)
-    return { marker: "untagged", body: content };
+    return { marker: "untagged", to: null, body: content };
   const raw = match[1].toLowerCase();
   const marker = raw === "important" ? "reply" : raw;
-  return {
-    marker,
-    body: content.slice(match[0].length)
-  };
+  let to = null;
+  if (match[2] !== undefined) {
+    to = parseAgentId(match[2].toLowerCase());
+    if (to === null) {
+      throw new MarkerError(`Unknown address "@${match[2]}". Known agents: claude, grok, codex.`);
+    }
+  }
+  return { marker, to, body: content.slice(match[0].length) };
 }
 function classifyMessage(content, mode) {
   const { marker } = parseMarker(content);
@@ -1527,7 +1567,7 @@ var BRIDGE_CONTRACT_REMINDER = `[Bridge Contract] Markers tell the bridge whethe
 
 - [REPLY] - you actually have something to say to Claude as a peer (a proposal, a disagreement, a completion report, a blocker, an answer to a direct question). Pushed to Claude immediately, interrupts whatever Claude is doing.
 - [STATUS] - progress update for the running task. Buffered + summarized; Claude sees the summary, not each one.
-- [FYI] - background context. Dropped silently.
+- [FYI] - background context. Delivered as low-priority: it reaches Claude, but it is the first thing shed if Claude's queue fills up, and Claude is told when that happens. Not a silent scratchpad \u2014 do not use it for notes you do not want read.
 - (no marker) - queued. Claude only sees it when they call get_messages. Use this for routine output you don't need Claude to react to.
 
 When to use [REPLY] (peer-to-peer rule of thumb):
@@ -1620,7 +1660,9 @@ class StatusBuffer {
 `);
     const summary = {
       id: `status_summary_${Date.now()}`,
-      source: "codex",
+      from: "system",
+      to: null,
+      kind: "status",
       content: `[STATUS summary \u2014 ${this.buffer.length} update(s), flushed: ${reason}]
 ${combined}`,
       timestamp: Date.now()
@@ -2246,6 +2288,18 @@ class ReplyOutbox {
   }
 }
 
+// src/daemon-egress.ts
+function forEgress(message, protocolVersion) {
+  if (protocolVersion !== null && protocolVersion >= 1) {
+    const { source: _dropped, ...rest } = message;
+    return rest;
+  }
+  return {
+    ...message,
+    source: message.from === "claude" ? "claude" : "codex"
+  };
+}
+
 // src/liveness-probe.ts
 var OPEN = 1;
 async function probeLiveness(target, options) {
@@ -2286,7 +2340,6 @@ function parseFrontendAgent(raw) {
 class FrontendRegistry {
   opts;
   slots = new Map;
-  buffers = new Map;
   known = new Set([DEFAULT_FRONTEND_AGENT]);
   probing = new Set;
   constructor(opts) {
@@ -2342,52 +2395,477 @@ class FrontendRegistry {
     }
     return null;
   }
-  recipients(source) {
+  writable() {
     const out = [];
     for (const [agent, socket] of this.slots) {
-      if (agent === source)
-        continue;
       if (!this.opts.isOpen(socket))
         continue;
       out.push({ agent, socket });
     }
     return out;
   }
-  buffer(agent, message) {
-    const queue = this.buffers.get(agent) ?? [];
-    queue.push(message);
-    let dropped = 0;
-    if (queue.length > this.opts.maxBufferedMessages) {
-      dropped = queue.length - this.opts.maxBufferedMessages;
-      queue.splice(0, dropped);
+}
+
+// src/mailbox.ts
+var EMPTY_COUNTS = {
+  reply: 0,
+  status: 0,
+  fyi: 0,
+  untagged: 0
+};
+
+class Mailbox {
+  agent;
+  opts;
+  entries = [];
+  dropped = { ...EMPTY_COUNTS };
+  unreportedDrops = 0;
+  nextId;
+  batchSeq = 0;
+  constructor(agent, opts) {
+    this.agent = agent;
+    this.opts = opts;
+    this.nextId = opts.nextId ?? (() => `gap_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
+  }
+  get size() {
+    return this.entries.length;
+  }
+  droppedCounts() {
+    return { ...this.dropped };
+  }
+  enqueue(message) {
+    if (this.entries.length < this.opts.capacity) {
+      this.push(message);
+      return { accepted: true };
     }
-    this.buffers.set(agent, queue);
-    this.known.add(agent);
-    return { dropped };
+    switch (message.kind) {
+      case "reply": {
+        const allLeased = this.entries.every((e) => e.leasedBy !== null);
+        return {
+          accepted: false,
+          reason: allLeased ? `${this.agent}'s mailbox is full (${this.opts.capacity} messages, all awaiting ack). The reply was not delivered.` : `${this.agent}'s mailbox is full (${this.opts.capacity} messages). The reply was not delivered.`
+        };
+      }
+      case "status": {
+        if (this.opts.capacity < 2) {
+          if (this.dropOldestFree()) {
+            this.push(message);
+          } else {
+            this.dropped[message.kind]++;
+            this.unreportedDrops++;
+          }
+          return { accepted: true };
+        }
+        const collapsed = this.collapseOldest("status");
+        if (this.entries.length > this.opts.capacity - 2) {
+          if (collapsed > 0)
+            this.pushFront(this.statusGapEntry(collapsed, message.timestamp));
+          this.dropped[message.kind]++;
+          this.unreportedDrops++;
+          return { accepted: true };
+        }
+        this.pushFront(this.statusGapEntry(collapsed, message.timestamp));
+        this.push(message);
+        return { accepted: true };
+      }
+      case "fyi":
+        this.dropped.fyi++;
+        this.unreportedDrops++;
+        return { accepted: true };
+      case "untagged":
+        if (this.dropOldestFree()) {
+          this.push(message);
+        } else {
+          this.dropped.untagged++;
+          this.unreportedDrops++;
+        }
+        return { accepted: true };
+    }
   }
-  takeBuffered(agent) {
-    const queue = this.buffers.get(agent);
-    if (!queue || queue.length === 0)
-      return [];
-    this.buffers.set(agent, []);
-    return queue;
+  remove(ids) {
+    const doomed = new Set(ids);
+    for (let i = this.entries.length - 1;i >= 0; i--) {
+      if (doomed.has(this.entries[i].message.id))
+        this.entries.splice(i, 1);
+    }
   }
-  requeue(agent, messages) {
-    if (messages.length === 0)
-      return;
-    const queue = this.buffers.get(agent) ?? [];
-    queue.unshift(...messages);
-    this.buffers.set(agent, queue);
+  drain(now) {
+    const batchId = `${this.agent}_b${++this.batchSeq}_${now}`;
+    const gap = this.takeGapMarker(now);
+    if (gap)
+      this.pushFront(gap);
+    const messages = [];
+    for (const entry of this.entries) {
+      if (entry.leasedBy !== null && entry.leaseExpiresAt > now)
+        continue;
+      entry.leasedBy = batchId;
+      entry.leaseExpiresAt = now + this.opts.leaseTimeoutMs;
+      messages.push(entry.message);
+    }
+    return { batchId, messages };
   }
-  bufferedCount(agent) {
-    if (agent)
-      return this.buffers.get(agent)?.length ?? 0;
-    let total = 0;
-    for (const queue of this.buffers.values())
-      total += queue.length;
-    return total;
+  ack(batchId, ids) {
+    const named = new Set(ids);
+    let deleted = 0;
+    for (let i = this.entries.length - 1;i >= 0; i--) {
+      const entry = this.entries[i];
+      if (entry.leasedBy !== batchId)
+        continue;
+      if (!named.has(entry.message.id))
+        continue;
+      this.entries.splice(i, 1);
+      deleted++;
+    }
+    return deleted;
+  }
+  push(message) {
+    this.entries.push({ message, leasedBy: null, leaseExpiresAt: 0 });
+  }
+  pushFront(message) {
+    this.entries.unshift({ message, leasedBy: null, leaseExpiresAt: 0 });
+  }
+  collapseOldest(kind) {
+    let removed = 0;
+    while (this.entries.length > this.opts.capacity - 2) {
+      const idx = this.entries.findIndex((e) => e.leasedBy === null && e.message.kind === kind);
+      if (idx !== -1) {
+        this.entries.splice(idx, 1);
+        removed++;
+        this.dropped[kind]++;
+        continue;
+      }
+      if (!this.dropOldestFree())
+        break;
+      removed++;
+    }
+    return removed;
+  }
+  dropOldestFree() {
+    const idx = this.entries.findIndex((e) => e.leasedBy === null);
+    if (idx === -1)
+      return false;
+    const victim = this.entries.splice(idx, 1)[0];
+    this.dropped[victim.message.kind]++;
+    this.unreportedDrops++;
+    return true;
+  }
+  statusGapEntry(collapsed, timestamp) {
+    return {
+      id: this.nextId(),
+      from: "system",
+      to: this.agent,
+      kind: "status",
+      content: `[gap] ${collapsed} status message(s) elided \u2014 mailbox at capacity`,
+      timestamp
+    };
+  }
+  takeGapMarker(now) {
+    if (this.unreportedDrops === 0)
+      return null;
+    const content = `[gap] ${this.unreportedDrops} message(s) dropped \u2014 mailbox at capacity`;
+    this.unreportedDrops = 0;
+    return {
+      id: this.nextId(),
+      from: "system",
+      to: this.agent,
+      kind: "untagged",
+      content,
+      timestamp: now
+    };
   }
 }
+
+// src/message-index.ts
+class MessageIndex {
+  opts;
+  entries = new Map;
+  constructor(opts) {
+    this.opts = opts;
+  }
+  get size() {
+    return this.entries.size;
+  }
+  record(id, entry, now) {
+    if (this.entries.has(id))
+      return false;
+    if (this.entries.size >= this.opts.capacity) {
+      this.evictExpired(now);
+      if (this.entries.size >= this.opts.capacity) {
+        return false;
+      }
+    }
+    this.entries.set(id, entry);
+    return true;
+  }
+  delete(id) {
+    this.entries.delete(id);
+  }
+  resolveSender(id, replier, now) {
+    const entry = this.entries.get(id);
+    if (!entry)
+      return null;
+    if (now - entry.at > this.opts.ttlMs)
+      return null;
+    if (!isAgentId(entry.from))
+      return null;
+    if (!entry.recipients.includes(replier))
+      return null;
+    return entry.from;
+  }
+  evictExpired(now) {
+    for (const [id, entry] of this.entries) {
+      if (now - entry.at > this.opts.ttlMs)
+        this.entries.delete(id);
+    }
+  }
+}
+
+// src/routing.ts
+class RoutingError extends Error {
+}
+function resolveRecipients(envelope, state, now) {
+  const everyoneElse = () => state.knownAgents().filter((a) => a !== envelope.from);
+  if (isAgentId(envelope.to)) {
+    if (envelope.to === envelope.from) {
+      throw new RoutingError(`${envelope.from} addressed itself; a sender is never its own recipient`);
+    }
+    return [envelope.to];
+  }
+  if (envelope.to === "*")
+    return everyoneElse();
+  if (envelope.from === "system")
+    return everyoneElse();
+  if (envelope.inReplyTo !== undefined) {
+    const target = state.senderOf(envelope.inReplyTo, envelope.from, now);
+    if (target === null) {
+      throw new RoutingError(`Cannot reply to "${envelope.inReplyTo}" \u2014 unknown, expired, or not addressed to ${envelope.from}.`);
+    }
+    return [target];
+  }
+  const requester = state.activeRequesterFor(envelope.from);
+  if (requester !== null)
+    return [requester];
+  return everyoneElse();
+}
+
+// src/message-bus.ts
+class SendRejected extends Error {
+}
+
+class MessageBus {
+  deps;
+  constructor(deps) {
+    this.deps = deps;
+  }
+  async route(envelope, now) {
+    const recipients = resolveRecipients(envelope, this.deps.state, now);
+    const accepted = [];
+    const rejected = [];
+    for (const agent of recipients) {
+      const result = this.deps.mailboxFor(agent).enqueue(envelope);
+      if (result.accepted)
+        accepted.push(agent);
+      else
+        rejected.push({ agent, reason: result.reason ?? "rejected" });
+    }
+    if (accepted.length === 0) {
+      throw new SendRejected(rejected.length > 0 ? rejected.map((r) => r.reason).join(" ") : `No recipient resolved for message ${envelope.id}.`);
+    }
+    const recorded = this.deps.index.record(envelope.id, { from: envelope.from, recipients: accepted, at: now }, now);
+    if (!recorded) {
+      this.rollback(accepted, envelope.id);
+      throw new SendRejected("The provenance index is full of live entries; the message was not delivered. Retry once older conversations expire.");
+    }
+    for (const agent of accepted) {
+      await this.deps.transports.wake(agent, envelope, this.deps.log);
+    }
+    return { id: envelope.id, accepted, rejected };
+  }
+  rollback(agents, id) {
+    for (const agent of agents)
+      this.deps.mailboxFor(agent).remove([id]);
+    this.deps.log(`Rolled back ${id} from ${agents.join(", ")} \u2014 index insertion failed`);
+  }
+}
+
+// src/pending-requests.ts
+class PendingRequests {
+  requests = [];
+  get size() {
+    return this.requests.length;
+  }
+  add(req) {
+    this.requests.push(req);
+  }
+  satisfy(inReplyTo, recipients) {
+    const satisfied = [];
+    for (let i = this.requests.length - 1;i >= 0; i--) {
+      const req = this.requests[i];
+      const named = inReplyTo !== undefined && inReplyTo === req.messageId;
+      const routed = recipients.includes(req.requester);
+      if (!named && !routed)
+        continue;
+      this.requests.splice(i, 1);
+      satisfied.push(req);
+    }
+    return satisfied.reverse();
+  }
+  expire(now, ttlMs) {
+    const expired = [];
+    for (let i = this.requests.length - 1;i >= 0; i--) {
+      if (now - this.requests[i].at <= ttlMs)
+        continue;
+      expired.push(...this.requests.splice(i, 1));
+    }
+    return expired.reverse();
+  }
+}
+
+// src/wakeup-transport.ts
+class TransportRegistry {
+  transports = new Map;
+  register(agent, transport) {
+    this.transports.set(agent, transport);
+  }
+  unregister(agent) {
+    this.transports.delete(agent);
+  }
+  get(agent) {
+    return this.transports.get(agent) ?? null;
+  }
+  async wake(agent, message, log) {
+    const transport = this.transports.get(agent);
+    if (!transport) {
+      log(`No wake-up transport for ${agent}; ${message.id} waits in the mailbox`);
+      return "no-transport";
+    }
+    try {
+      await transport.wake(message);
+      return "woken";
+    } catch (err) {
+      log(`Wake-up for ${agent} failed (${describeError(err)}); ${message.id} stays in the mailbox`);
+      return "failed";
+    }
+  }
+}
+function describeError(err) {
+  if (err instanceof Error)
+    return err.message;
+  try {
+    return JSON.stringify(err);
+  } catch {
+    return String(err);
+  }
+}
+
+// src/normalize-ingress.ts
+var PROTOCOL_VERSION = 1;
+
+class IngressError extends Error {
+}
+var KINDS = ["reply", "status", "fyi", "untagged"];
+function normalizeIngress(raw, socket, ctx) {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new IngressError("Ingress payload must be an object.");
+  }
+  const p = raw;
+  if (socket.protocolVersion !== null && socket.protocolVersion >= PROTOCOL_VERSION) {
+    const declared = p.from ?? p.source;
+    if (declared !== undefined && declared !== socket.agent) {
+      throw new IngressError(`Payload claims from="${String(declared)}" but the socket is authenticated as "${socket.agent}".`);
+    }
+  }
+  const to = readTo(p.to);
+  const kindPresent = p.kind !== undefined && p.kind !== null;
+  const kind = readKind(p.kind);
+  if (p.content !== undefined && typeof p.content !== "string") {
+    throw new IngressError("`content` must be a string.");
+  }
+  if (p.inReplyTo !== undefined && typeof p.inReplyTo !== "string") {
+    throw new IngressError("`inReplyTo` must be a string.");
+  }
+  if (p.senderRef !== undefined && typeof p.senderRef !== "string") {
+    throw new IngressError("`senderRef` must be a string.");
+  }
+  const content = typeof p.content === "string" ? p.content : "";
+  let body = content;
+  let finalTo = to;
+  let finalKind = kind;
+  let marker;
+  try {
+    marker = parseMarker(content);
+  } catch (err) {
+    if (err instanceof MarkerError)
+      throw new IngressError(err.message);
+    throw err;
+  }
+  if (marker.marker !== "untagged" || marker.to !== null) {
+    if (marker.to !== null && to !== null && marker.to !== to) {
+      throw new IngressError(`Conflict: structured to="${to}" but the content is marked "@${marker.to}". Two sources of truth for one destination.`);
+    }
+    if (kindPresent && marker.marker !== "untagged" && marker.marker !== kind) {
+      throw new IngressError(`Conflict: structured kind="${kind}" but the content is marked "[${marker.marker.toUpperCase()}]".`);
+    }
+    finalTo = to ?? marker.to;
+    if (!kindPresent && marker.marker !== "untagged")
+      finalKind = marker.marker;
+    body = marker.body;
+  }
+  return {
+    id: ctx.id,
+    senderRef: typeof p.senderRef === "string" ? p.senderRef : undefined,
+    from: socket.agent,
+    to: finalTo,
+    inReplyTo: typeof p.inReplyTo === "string" ? p.inReplyTo : undefined,
+    kind: finalKind,
+    content: body,
+    timestamp: ctx.now
+  };
+}
+function normalizeProse(content, socket, ctx) {
+  let marker;
+  try {
+    marker = parseMarker(content);
+  } catch (err) {
+    if (err instanceof MarkerError)
+      throw new IngressError(err.message);
+    throw err;
+  }
+  return {
+    id: ctx.id,
+    from: socket.agent,
+    to: marker.to,
+    kind: marker.marker,
+    content: marker.body,
+    timestamp: ctx.now
+  };
+}
+function readTo(v) {
+  if (v === undefined || v === null)
+    return null;
+  if (v === "*")
+    return "*";
+  if (typeof v !== "string")
+    throw new IngressError("`to` must be a string.");
+  const parsed = parseAgentId(v);
+  if (parsed === null) {
+    throw new IngressError(`Unknown recipient "${v}". Known agents: claude, grok, codex.`);
+  }
+  return parsed;
+}
+function readKind(v) {
+  if (v === undefined || v === null)
+    return "untagged";
+  if (typeof v === "string" && KINDS.includes(v))
+    return v;
+  throw new IngressError(`Unknown kind "${String(v)}". Expected one of ${KINDS.join(", ")}.`);
+}
+
+// src/daemon-constants.ts
+var MAILBOX_CAPACITY = 100;
+var LEASE_TIMEOUT_MS = 30000;
+var INDEX_TTL_MS = 3600000;
+var INDEX_CAPACITY = 5000;
 
 // src/daemon.ts
 var FRONTEND_AGENT_LIST = FRONTEND_AGENTS.join(", ");
@@ -2402,7 +2880,6 @@ var CODEX_PROXY_PORT = parseInt(process.env.CODEX_PROXY_PORT ?? String(config.co
 var CONTROL_PORT = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10);
 var TUI_DISCONNECT_GRACE_MS = parseInt(process.env.TUI_DISCONNECT_GRACE_MS ?? "2500", 10);
 var CLAUDE_DISCONNECT_GRACE_MS = 5000;
-var MAX_BUFFERED_MESSAGES = parseInt(process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES ?? "100", 10);
 var FILTER_MODE = process.env.AGENTBRIDGE_FILTER_MODE === "full" ? "full" : "filtered";
 var IDLE_SHUTDOWN_MS = parseInt(process.env.AGENTBRIDGE_IDLE_SHUTDOWN_MS ?? String(config.idleShutdownSeconds * 1000), 10);
 var ATTENTION_WINDOW_MS = parseInt(process.env.AGENTBRIDGE_ATTENTION_WINDOW_MS ?? String(config.turnCoordination.attentionWindowSeconds * 1000), 10);
@@ -2411,7 +2888,6 @@ var codex = new CodexAdapter(CODEX_APP_PORT, CODEX_PROXY_PORT, stateDir.logFile)
 var attachCmd = `codex --enable tui_app_server --remote ${codex.proxyUrl}`;
 var controlServer = null;
 var frontends = new FrontendRegistry({
-  maxBufferedMessages: MAX_BUFFERED_MESSAGES,
   isOpen: (ws) => ws.readyState === WebSocket.OPEN,
   isClosed: (ws) => ws.readyState === WebSocket.CLOSED
 });
@@ -2423,10 +2899,9 @@ var nextSystemMessageId = 0;
 var codexBootstrapped = false;
 var attentionWindowTimer = null;
 var inAttentionWindow = false;
-var replyRequired = false;
-var replyReceivedDuringTurn = false;
 var shuttingDown = false;
 var idleShutdownTimer = null;
+var pendingRequestsTimer = null;
 var claudeDisconnectTimer = null;
 var claudeOnlineNoticeSent = false;
 var claudeOfflineNoticeShown = false;
@@ -2441,28 +2916,226 @@ var replyOutbox = new ReplyOutbox({
   max: parsePositiveIntEnv("AGENTBRIDGE_REPLY_QUEUE_MAX", 3, log),
   ttlMs: parsePositiveIntEnv("AGENTBRIDGE_REPLY_QUEUE_TTL_MS", 10 * 60000, log)
 });
+var pendingRequests = new PendingRequests;
+var PENDING_REQUEST_TTL_MS = parsePositiveIntEnv("AGENTBRIDGE_REPLY_REQUIRED_TTL_MS", 10 * 60000, log);
+var PENDING_REQUEST_CHECK_INTERVAL_MS = 30000;
+var mailboxes = new Map;
+function mailboxFor(agent) {
+  let box = mailboxes.get(agent);
+  if (!box) {
+    box = new Mailbox(agent, { capacity: MAILBOX_CAPACITY, leaseTimeoutMs: LEASE_TIMEOUT_MS });
+    mailboxes.set(agent, box);
+  }
+  return box;
+}
+var messageIndex = new MessageIndex({ capacity: INDEX_CAPACITY, ttlMs: INDEX_TTL_MS });
+var transports = new TransportRegistry;
+var activeRequester = new Map;
+var bus = new MessageBus({
+  mailboxFor,
+  index: messageIndex,
+  state: {
+    knownAgents: () => ["codex", ...frontends.knownAgents()],
+    senderOf: (id, replier, now) => messageIndex.resolveSender(id, replier, now),
+    activeRequesterFor: (agent) => activeRequester.get(agent) ?? null
+  },
+  transports,
+  log
+});
+var idSeq = 0;
+function nextMessageId() {
+  return `msg_${Date.now()}_${++idSeq}`;
+}
+var requireReplyIds = new Set;
+var codexDeferralNotes = new Map;
+var outboxRequester = new Map;
+function registerTransport(agent, transport) {
+  if (transport.acknowledgementMode !== "none") {
+    transports.register(agent, transport);
+    return;
+  }
+  transports.register(agent, {
+    ...transport,
+    wake: async (message) => {
+      await transport.wake(message);
+      mailboxFor(agent).remove([message.id]);
+    }
+  });
+}
+registerTransport("codex", {
+  payloadMode: "content",
+  acknowledgementMode: "none",
+  wake: (message) => {
+    const requireReply = requireReplyIds.delete(message.id);
+    const requester = isAgentId(message.from) ? message.from : null;
+    if (deliverToCodex(message.content, requireReply, requester, message.id)) {
+      clearAttentionWindow();
+      return;
+    }
+    const { depth, dropped } = replyOutbox.accept({
+      id: message.id,
+      content: message.content,
+      requireReply,
+      queuedAt: Date.now()
+    });
+    if (requester)
+      outboxRequester.set(message.id, requester);
+    log(`Queued reply for Codex while it was busy (depth ${depth}, dropped ${dropped.length})`);
+    let note = codex.turnPending ? depth > 1 ? `Codex is mid-turn. Held for delivery when the turn ends (${depth} replies now queued, sent in order).` : "Codex is mid-turn. Held for delivery when the turn ends." : "Codex has no thread to inject into right now. Held for delivery when one is available.";
+    if (dropped.length > 0) {
+      note += ` ${dropped.length} older queued repl${dropped.length > 1 ? "ies were" : "y was"}` + ` dropped to stay under the ${replyOutbox.capacity}-message limit.`;
+    }
+    codexDeferralNotes.set(message.id, note);
+  }
+});
+function frontendTransport(agent) {
+  return {
+    payloadMode: "content",
+    acknowledgementMode: "explicit",
+    wake: (message) => {
+      const socket = frontends.occupant(agent);
+      if (socket === null || !frontends.isAttached(agent)) {
+        throw new Error(`${agent} is not attached`);
+      }
+      if (!trySendBridgeMessage(socket, message, deliveryHintFor(message, FILTER_MODE))) {
+        throw new Error(`the control socket for ${agent} refused the frame`);
+      }
+    }
+  };
+}
+for (const agent of FRONTEND_AGENTS)
+  registerTransport(agent, frontendTransport(agent));
+function deliveryHintFor(message, mode) {
+  if (mode === "full")
+    return "push";
+  switch (message.kind) {
+    case "reply":
+      return "push";
+    case "status":
+    case "fyi":
+      return "queue";
+    case "untagged":
+      return message.from === "system" ? "push" : "queue";
+  }
+}
+function senderFacingText(outcome) {
+  switch (outcome.status) {
+    case "delivered":
+      return null;
+    case "partial":
+      return outcome.note;
+    case "failed":
+      return outcome.error;
+  }
+}
+async function routeThroughBus(envelope) {
+  try {
+    const outcome = await bus.route(envelope, Date.now());
+    if (outcome.rejected.length === 0)
+      return { status: "delivered", accepted: outcome.accepted };
+    log(`Message ${envelope.id} rejected by ${outcome.rejected.map((r) => r.agent).join(", ")}`);
+    return {
+      status: "partial",
+      note: outcome.rejected.map((r) => r.reason).join(" "),
+      accepted: outcome.accepted
+    };
+  } catch (err) {
+    if (err instanceof RoutingError || err instanceof SendRejected) {
+      log(`Message ${envelope.id} was not delivered: ${err.message}`);
+      return { status: "failed", error: err.message };
+    }
+    log(`Message ${envelope.id} failed to route: ${describeError2(err)}`);
+    return { status: "failed", error: "The daemon could not route this message." };
+  }
+}
+function routeOrLog(envelope) {
+  routeThroughBus(envelope).then((outcome) => {
+    const text = senderFacingText(outcome);
+    if (text !== null)
+      log(`Daemon-authored ${envelope.id}: ${text}`);
+  });
+}
+function emitToFrontends(build) {
+  for (const agent of frontends.knownAgents())
+    routeOrLog(build(agent));
+}
+function notifyFrontends(build) {
+  for (const agent of frontends.attachedAgents()) {
+    transports.wake(agent, build(agent), log);
+  }
+}
+function describeError2(err) {
+  if (err instanceof Error)
+    return err.message;
+  try {
+    return JSON.stringify(err);
+  } catch {
+    return String(err);
+  }
+}
 var tuiConnectionState = new TuiConnectionState({
   disconnectGraceMs: TUI_DISCONNECT_GRACE_MS,
   log,
   onDisconnectPersisted: (connId) => {
-    emitToFrontends(systemMessage("system_tui_disconnected", `\u26A0\uFE0F Codex TUI disconnected (conn #${connId}). Codex is still running in the background \u2014 reconnect the TUI to resume.`));
+    notifyFrontends((to) => systemMessage("system_tui_disconnected", `\u26A0\uFE0F Codex TUI disconnected (conn #${connId}). Codex is still running in the background \u2014 reconnect the TUI to resume.`, to));
   },
   onReconnectAfterNotice: (connId) => {
-    emitToFrontends(systemMessage("system_tui_reconnected", `\u2705 Codex TUI reconnected (conn #${connId}). Bridge restored, communication can continue.`));
+    notifyFrontends((to) => systemMessage("system_tui_reconnected", `\u2705 Codex TUI reconnected (conn #${connId}). Bridge restored, communication can continue.`, to));
     codex.injectMessage("\u2705 Claude Code is still online, bridge restored. Bidirectional communication can continue.");
   }
 });
-var statusBuffer = new StatusBuffer((summary) => emitToFrontends(summary, "queue"));
+var statusBuffer = new StatusBuffer((summary) => emitToFrontends((to) => ({
+  ...summary,
+  id: `status_summary_${++nextSystemMessageId}`,
+  to
+})));
 codex.on("turnStarted", () => {
   log("Codex turn started");
-  emitToFrontends(systemMessage("system_turn_started", "\u23F3 Codex is working on the current task. Wait for completion before sending a reply."));
+  notifyFrontends((to) => systemMessage("system_turn_started", "\u23F3 Codex is working on the current task. Wait for completion before sending a reply.", to));
 });
-codex.on("agentMessage", (msg) => {
-  if (msg.source !== "codex")
+var pendingCodexNotices = [];
+var droppedCodexNotices = 0;
+var PENDING_CODEX_NOTICE_CAP = 20;
+function tellCodex(text) {
+  const framed = `[AgentBridge] ${text}`;
+  if (codex.injectMessage(framed))
     return;
-  const result = classifyMessage(msg.content, FILTER_MODE);
-  if (replyRequired && result.marker === "reply") {
-    replyReceivedDuringTurn = true;
+  pendingCodexNotices.push(framed);
+  while (pendingCodexNotices.length > PENDING_CODEX_NOTICE_CAP) {
+    pendingCodexNotices.shift();
+    droppedCodexNotices++;
+  }
+  log(`Deferred an AgentBridge notice to Codex (${pendingCodexNotices.length} pending)`);
+}
+function flushPendingCodexNotices() {
+  if (pendingCodexNotices.length === 0)
+    return;
+  const parts = [...pendingCodexNotices];
+  if (droppedCodexNotices > 0) {
+    parts.unshift(`[AgentBridge] ${droppedCodexNotices} earlier notice${droppedCodexNotices > 1 ? "s were" : " was"}` + ` dropped to stay under the ${PENDING_CODEX_NOTICE_CAP}-notice limit.`);
+  }
+  if (!codex.injectMessage(parts.join(`
+
+`))) {
+    log(`Could not flush ${pendingCodexNotices.length} held AgentBridge notice(s); keeping them`);
+    return;
+  }
+  log(`Flushed ${pendingCodexNotices.length} held AgentBridge notice(s) to Codex`);
+  pendingCodexNotices.length = 0;
+  droppedCodexNotices = 0;
+}
+codex.on("agentMessage", (msg) => {
+  handleCodexMessage(msg).catch((err) => {
+    log(`agentMessage handler failed for ${msg.id}: ${describeError2(err)}`);
+  });
+});
+async function handleCodexMessage(msg) {
+  let result;
+  try {
+    result = classifyMessage(msg.content, FILTER_MODE);
+  } catch (err) {
+    tellCodex(describeError2(err));
+    return;
   }
   if (FILTER_MODE !== "full" && inAttentionWindow && result.marker === "status") {
     log(`Codex \u2192 Claude [${result.marker}/buffer-attention] (${msg.content.length} chars)`);
@@ -2470,47 +3143,48 @@ codex.on("agentMessage", (msg) => {
     return;
   }
   log(`Codex \u2192 Claude [${result.marker}/${result.action}] (${msg.content.length} chars)`);
-  switch (result.action) {
-    case "forward":
-      if (result.marker === "reply" && statusBuffer.size > 0) {
-        statusBuffer.flush("reply message arrived");
-      }
-      emitToFrontends(msg);
-      if (result.marker === "reply") {
-        startAttentionWindow();
-      }
-      break;
-    case "queue":
-      emitToFrontends(msg, "queue");
-      break;
-    case "buffer":
-      statusBuffer.add(msg);
-      break;
-    case "drop":
-      break;
+  if (result.action === "buffer") {
+    statusBuffer.add(msg);
+    return;
   }
-});
+  let envelope;
+  try {
+    envelope = normalizeProse(msg.content, { agent: "codex", protocolVersion: PROTOCOL_VERSION }, { id: nextMessageId(), now: Date.now() });
+  } catch (err) {
+    tellCodex(describeError2(err));
+    return;
+  }
+  if (result.marker === "reply" && statusBuffer.size > 0) {
+    statusBuffer.flush("reply message arrived");
+  }
+  const outcome = await routeThroughBus(envelope);
+  const text = senderFacingText(outcome);
+  if (text !== null)
+    tellCodex(text);
+  if (outcome.status === "failed")
+    return;
+  if (result.marker === "reply") {
+    pendingRequests.satisfy(envelope.inReplyTo, outcome.accepted);
+    startAttentionWindow();
+  }
+}
 codex.on("turnCompleted", () => {
   log("Codex turn completed");
   statusBuffer.flush("turn completed");
-  if (replyRequired && !replyReceivedDuringTurn) {
-    log("\u26A0\uFE0F Reply was required but Codex did not send any agentMessage");
-    emitToFrontends(systemMessage("system_reply_missing", "\u26A0\uFE0F Codex completed the turn without sending a reply (require_reply was set). Codex may not have generated an agentMessage. You may want to retry or rephrase."));
-  }
-  replyRequired = false;
-  replyReceivedDuringTurn = false;
-  emitToFrontends(systemMessage("system_turn_completed", "\u2705 Codex finished the current turn. You can reply now if needed."));
+  activeRequester.delete("codex");
+  notifyFrontends((to) => systemMessage("system_turn_completed", "\u2705 Codex finished the current turn. You can reply now if needed.", to));
   startAttentionWindow();
   if (claudeSocket() && shouldNotifyCodexClaudeOnline()) {
     notifyCodexClaudeOnline();
   }
+  flushPendingCodexNotices();
   drainReplyOutbox();
 });
 codex.on("ready", (threadId) => {
   tuiConnectionState.markBridgeReady();
   log(`Codex ready \u2014 thread ${threadId}`);
   log("Bridge fully operational");
-  emitToFrontends(systemMessage("system_ready", currentReadyMessage()));
+  notifyFrontends((to) => systemMessage("system_ready", currentReadyMessage(), to));
   if (claudeSocket() && shouldNotifyCodexClaudeOnline()) {
     notifyCodexClaudeOnline();
   }
@@ -2540,7 +3214,7 @@ codex.on("exit", (code) => {
   claudeOfflineNoticeShown = false;
   lastPinnedContractThreadId = null;
   discardOutboxForLostCodex("the Codex app-server exited");
-  emitToFrontends(systemMessage("system_codex_exit", `\u26A0\uFE0F Codex app-server exited (code ${code ?? "unknown"}). AgentBridge daemon is still running, but the Codex side needs to be restarted.`));
+  notifyFrontends((to) => systemMessage("system_codex_exit", `\u26A0\uFE0F Codex app-server exited (code ${code ?? "unknown"}). AgentBridge daemon is still running, but the Codex side needs to be restarted.`, to));
   broadcastStatus();
 });
 function startControlServer() {
@@ -2561,7 +3235,8 @@ function startControlServer() {
           agent: DEFAULT_FRONTEND_AGENT,
           attached: false,
           lastPongAt: Date.now(),
-          pongCount: 0
+          pongCount: 0,
+          protocolVersion: null
         }
       })) {
         return;
@@ -2628,6 +3303,7 @@ function handleControlMessage(ws, raw) {
           return;
         }
         ws.data.agent = agent;
+        ws.data.protocolVersion = message.protocolVersion ?? null;
         attachFrontend(ws, agent).catch((err) => {
           log(`attachFrontend threw for #${ws.data.clientId}: ${err?.message ?? err}`);
         });
@@ -2639,13 +3315,39 @@ function handleControlMessage(ws, raw) {
     case "status":
       sendStatus(ws);
       return;
+    case "drain": {
+      if (!ws.data.attached) {
+        sendProtocolMessage(ws, {
+          type: "drain_result",
+          requestId: message.requestId,
+          batchId: "",
+          messages: []
+        });
+        return;
+      }
+      const batch = mailboxFor(ws.data.agent).drain(Date.now());
+      sendProtocolMessage(ws, {
+        type: "drain_result",
+        requestId: message.requestId,
+        batchId: batch.batchId,
+        messages: batch.messages.map((m) => forEgress(m, ws.data.protocolVersion))
+      });
+      return;
+    }
+    case "ack": {
+      if (!ws.data.attached)
+        return;
+      const deleted = mailboxFor(ws.data.agent).ack(message.batchId, message.ids);
+      log(`Ack from ${ws.data.agent}: ${deleted}/${message.ids.length} entries deleted`);
+      return;
+    }
     case "claude_to_codex": {
-      if (message.message.source !== ws.data.agent) {
+      if (!ws.data.attached) {
         sendProtocolMessage(ws, {
           type: "claude_to_codex_result",
           requestId: message.requestId,
           success: false,
-          error: "Invalid message source"
+          error: "This socket is not attached. Send claude_connect first."
         });
         return;
       }
@@ -2658,51 +3360,50 @@ function handleControlMessage(ws, raw) {
         });
         return;
       }
-      const requireReply = !!message.requireReply;
-      const content = message.message.content;
-      if (deliverToCodex(content, requireReply)) {
-        clearAttentionWindow();
-        sendProtocolMessage(ws, {
-          type: "claude_to_codex_result",
-          requestId: message.requestId,
-          success: true
-        });
-        return;
-      }
-      if (codex.turnInProgress) {
-        const { depth, dropped } = replyOutbox.accept({
-          id: message.message.id,
-          content,
-          requireReply,
-          queuedAt: Date.now()
-        });
-        log(`Queued Claude \u2192 Codex reply while turn in progress (depth ${depth}, dropped ${dropped.length})`);
-        let note = depth > 1 ? `Codex is mid-turn. Held for delivery when the turn ends (${depth} replies now queued, sent in order).` : "Codex is mid-turn. Held for delivery when the turn ends.";
-        if (dropped.length > 0) {
-          note += ` ${dropped.length} older queued repl${dropped.length > 1 ? "ies were" : "y was"}` + ` dropped to stay under the ${replyOutbox.capacity}-message limit.`;
-        }
-        sendProtocolMessage(ws, {
-          type: "claude_to_codex_result",
-          requestId: message.requestId,
-          success: true,
-          queued: true,
-          note
-        });
-        return;
-      }
-      const reason = "Injection failed: no active thread or WebSocket not connected.";
-      log(`Injection rejected: ${reason}`);
-      sendProtocolMessage(ws, {
-        type: "claude_to_codex_result",
-        requestId: message.requestId,
-        success: false,
-        error: reason
-      });
+      sendFromFrontend(ws, message.requestId, message.message, !!message.requireReply);
       return;
     }
   }
 }
-function deliverToCodex(content, requireReply) {
+async function sendFromFrontend(ws, requestId, frame, requireReply) {
+  let envelope;
+  try {
+    envelope = normalizeIngress(frame, { agent: ws.data.agent, protocolVersion: ws.data.protocolVersion }, { id: nextMessageId(), now: Date.now() });
+  } catch (err) {
+    sendProtocolMessage(ws, {
+      type: "claude_to_codex_result",
+      requestId,
+      success: false,
+      error: describeError2(err)
+    });
+    return;
+  }
+  if (requireReply)
+    requireReplyIds.add(envelope.id);
+  const outcome = await routeThroughBus(envelope);
+  requireReplyIds.delete(envelope.id);
+  if (outcome.status === "failed") {
+    sendProtocolMessage(ws, {
+      type: "claude_to_codex_result",
+      requestId,
+      success: false,
+      error: outcome.error
+    });
+    return;
+  }
+  const deferral = codexDeferralNotes.get(envelope.id);
+  codexDeferralNotes.delete(envelope.id);
+  const shed = senderFacingText(outcome);
+  const note = [deferral, shed].filter((t) => t !== null && t !== undefined).join(" ");
+  sendProtocolMessage(ws, {
+    type: "claude_to_codex_result",
+    requestId,
+    success: true,
+    queued: deferral !== undefined ? true : undefined,
+    note: note === "" ? undefined : note
+  });
+}
+function deliverToCodex(content, requireReply, requester, messageId) {
   const activeThreadId = codex.activeThreadId;
   const needsContract = PIN_CONTRACT_MODE === "always" || PIN_CONTRACT_MODE === "once" && activeThreadId !== lastPinnedContractThreadId;
   let contentToSend = content;
@@ -2719,11 +3420,12 @@ function deliverToCodex(content, requireReply) {
     lastPinnedContractThreadId = activeThreadId;
     log(`Pinned BRIDGE_CONTRACT_REMINDER for thread ${activeThreadId.slice(0, 8)}; subsequent msgs skip the reminder`);
   }
-  if (requireReply) {
-    replyRequired = true;
-    replyReceivedDuringTurn = false;
-    log(`Reply required flag set for this message`);
+  if (requireReply && requester) {
+    pendingRequests.add({ requester, messageId, at: Date.now() });
+    log(`Reply required from Codex for ${messageId} (requester: ${requester})`);
   }
+  if (requester)
+    activeRequester.set("codex", requester);
   return true;
 }
 function drainReplyOutbox() {
@@ -2731,29 +3433,32 @@ function drainReplyOutbox() {
   for (const stale of expired) {
     const waitedMin = Math.round((Date.now() - stale.queuedAt) / 60000);
     log(`Dropping expired queued reply ${stale.id} (waited ~${waitedMin}m)`);
-    emitToFrontends(noticeMessage("reply_expired", `\u26A0\uFE0F A reply you sent while Codex was busy waited ~${waitedMin} minutes and was dropped without being delivered. ` + `Codex never saw it. Send it again if it still applies.
+    outboxRequester.delete(stale.id);
+    emitToFrontends((to) => noticeMessage("reply_expired", `\u26A0\uFE0F A reply you sent while Codex was busy waited ~${waitedMin} minutes and was dropped without being delivered. ` + `Codex never saw it. Send it again if it still applies.
 
 Dropped message:
-${truncateForNotice(stale.content)}`));
+${truncateForNotice(stale.content)}`, to));
   }
   if (!reply)
     return;
-  if (deliverToCodex(reply.content, reply.requireReply)) {
+  if (deliverToCodex(reply.content, reply.requireReply, outboxRequester.get(reply.id) ?? null, reply.id)) {
+    outboxRequester.delete(reply.id);
     clearAttentionWindow();
     log(`Delivered queued reply ${reply.id} after turn completion`);
-    emitToFrontends(noticeMessage("reply_delivered", "\uD83D\uDCE4 The reply you sent while Codex was busy has now been delivered \u2014 Codex is starting a turn on it."));
+    emitToFrontends((to) => noticeMessage("reply_delivered", "\uD83D\uDCE4 The reply you sent while Codex was busy has now been delivered \u2014 Codex is starting a turn on it.", to));
     return;
   }
-  if (codex.turnInProgress) {
+  if (codex.turnPending) {
     replyOutbox.requeue(reply);
     log(`Queued reply ${reply.id} still blocked by an in-progress turn; keeping it`);
     return;
   }
   log(`Queued reply ${reply.id} could not be injected (no active thread); dropping`);
-  emitToFrontends(noticeMessage("reply_undeliverable", "\u26A0\uFE0F A reply you sent while Codex was busy could not be delivered \u2014 the Codex thread is gone. " + `Reconnect the Codex TUI and send it again.
+  outboxRequester.delete(reply.id);
+  emitToFrontends((to) => noticeMessage("reply_undeliverable", "\u26A0\uFE0F A reply you sent while Codex was busy could not be delivered \u2014 the Codex thread is gone. " + `Reconnect the Codex TUI and send it again.
 
 Undelivered message:
-${truncateForNotice(reply.content)}`));
+${truncateForNotice(reply.content)}`, to));
   discardOutboxForLostCodex("the Codex thread is gone");
 }
 function discardOutboxForLostCodex(why) {
@@ -2761,11 +3466,13 @@ function discardOutboxForLostCodex(why) {
   if (lost.length === 0)
     return;
   log(`Discarding ${lost.length} queued Claude \u2192 Codex repl(ies): ${why}`);
-  emitToFrontends(noticeMessage("reply_discarded", `\u26A0\uFE0F ${lost.length} repl${lost.length > 1 ? "ies" : "y"} you sent while Codex was busy ` + `${lost.length > 1 ? "were" : "was"} never delivered \u2014 ${why}. ` + `Resend if still relevant.
+  for (const r of lost)
+    outboxRequester.delete(r.id);
+  emitToFrontends((to) => noticeMessage("reply_discarded", `\u26A0\uFE0F ${lost.length} repl${lost.length > 1 ? "ies" : "y"} you sent while Codex was busy ` + `${lost.length > 1 ? "were" : "was"} never delivered \u2014 ${why}. ` + `Resend if still relevant.
 
 ` + lost.map((r, i) => `[${i + 1}] ${truncateForNotice(r.content)}`).join(`
 
-`)));
+`), to));
 }
 function truncateForNotice(content, max = 400) {
   return content.length <= max ? content : `${content.slice(0, max)}\u2026 (${content.length} chars total)`;
@@ -2815,17 +3522,16 @@ async function attachFrontend(ws, agent) {
   ws.data.attached = true;
   cancelIdleShutdown();
   log(`${label} attached (#${ws.data.clientId})`);
+  sendProtocolMessage(ws, { type: "hello", protocolVersion: PROTOCOL_VERSION });
   statusBuffer.flush(`${agent} reconnected`);
   sendStatus(ws);
   const now = Date.now();
   const isRapidReattach = now - lastAttachStatusSentTs < ATTACH_STATUS_COOLDOWN_MS;
-  if (frontends.bufferedCount(agent) > 0) {
-    flushBufferedMessages(agent, ws);
-  } else if (!isRapidReattach) {
+  if (!isRapidReattach) {
     if (tuiConnectionState.canReply()) {
-      sendBridgeMessage(ws, systemMessage("system_ready", currentReadyMessage()));
+      transports.wake(agent, systemMessage("system_ready", currentReadyMessage(), agent), log);
     } else if (codexBootstrapped) {
-      sendBridgeMessage(ws, systemMessage("system_waiting", currentWaitingMessage()));
+      transports.wake(agent, systemMessage("system_waiting", currentWaitingMessage(), agent), log);
     }
   }
   lastAttachStatusSentTs = now;
@@ -2888,6 +3594,13 @@ function clearAttentionWindow() {
   }
   inAttentionWindow = false;
 }
+function checkExpiredRequests() {
+  const expired = pendingRequests.expire(Date.now(), PENDING_REQUEST_TTL_MS);
+  for (const req of expired) {
+    log(`Reply required for ${req.messageId} expired after ${PENDING_REQUEST_TTL_MS}ms without a reply (requester: ${req.requester})`);
+    routeOrLog(noticeMessage("reply_missing", "\u26A0\uFE0F Codex did not send a reply before the reply-required window expired. You may want to retry or rephrase.", req.requester));
+  }
+}
 function scheduleIdleShutdown() {
   cancelIdleShutdown();
   if (frontends.size > 0)
@@ -2941,30 +3654,10 @@ function scheduleClaudeDisconnectNotification(clientId) {
     log(`Claude disconnect persisted past grace window (client #${clientId})`);
   }, CLAUDE_DISCONNECT_GRACE_MS);
 }
-function emitToFrontends(message, deliveryHint) {
-  const delivered = new Set;
-  for (const { agent, socket } of frontends.recipients(message.source)) {
-    if (trySendBridgeMessage(socket, message, deliveryHint)) {
-      delivered.add(agent);
-      continue;
-    }
-    log(`Send to ${agent} failed, buffering message for retry on reconnect`);
-  }
-  if (deliveryHint) {
-    message.__deliveryHint = deliveryHint;
-  }
-  for (const agent of frontends.knownAgents()) {
-    if (delivered.has(agent) || agent === message.source)
-      continue;
-    const { dropped } = frontends.buffer(agent, message);
-    if (dropped > 0) {
-      log(`Message buffer overflow for ${agent}: dropped ${dropped} oldest message(s), ${MAX_BUFFERED_MESSAGES} remaining`);
-    }
-  }
-}
 function trySendBridgeMessage(ws, message, deliveryHint) {
   try {
-    const payload = deliveryHint ? { type: "codex_to_claude", message, deliveryHint } : { type: "codex_to_claude", message };
+    const egressMessage = forEgress(message, ws.data.protocolVersion);
+    const payload = deliveryHint ? { type: "codex_to_claude", message: egressMessage, deliveryHint } : { type: "codex_to_claude", message: egressMessage };
     const result = ws.send(JSON.stringify(payload));
     if (typeof result === "number" && result <= 0) {
       log(`Bridge message send returned ${result} (0=dropped, -1=backpressure)`);
@@ -2976,27 +3669,11 @@ function trySendBridgeMessage(ws, message, deliveryHint) {
     return false;
   }
 }
-function flushBufferedMessages(agent, ws) {
-  const messages = frontends.takeBuffered(agent);
-  for (const message of messages) {
-    const hint = message.__deliveryHint;
-    if (!trySendBridgeMessage(ws, message, hint)) {
-      const failedIndex = messages.indexOf(message);
-      const remaining = messages.slice(failedIndex);
-      frontends.requeue(agent, remaining);
-      log(`Flush interrupted: re-buffered ${remaining.length} message(s) after send failure`);
-      return;
-    }
-  }
-}
-function sendBridgeMessage(ws, message) {
-  trySendBridgeMessage(ws, message);
-}
 function sendStatus(ws) {
   sendProtocolMessage(ws, { type: "status", status: currentStatus() });
 }
 function broadcastStatus() {
-  for (const { socket } of frontends.recipients()) {
+  for (const { socket } of frontends.writable()) {
     sendStatus(socket);
   }
 }
@@ -3013,7 +3690,7 @@ function currentStatus() {
     bridgeReady: tuiConnectionState.canReply(),
     tuiConnected: snapshot.tuiConnected,
     threadId: codex.activeThreadId,
-    queuedMessageCount: frontends.bufferedCount() + statusBuffer.size,
+    queuedMessageCount: [...mailboxes.values()].reduce((n, box) => n + box.size, 0) + statusBuffer.size,
     proxyUrl: codex.proxyUrl,
     appServerUrl: codex.appServerUrl,
     pid: process.pid,
@@ -3052,18 +3729,22 @@ function notifyCodexClaudeOnline() {
 function shouldNotifyCodexClaudeOnline() {
   return !claudeOnlineNoticeSent || claudeOfflineNoticeShown;
 }
-function systemMessage(idPrefix, content) {
+function systemMessage(idPrefix, content, to) {
   return {
     id: `${idPrefix}_${++nextSystemMessageId}`,
-    source: "codex",
+    from: "system",
+    to,
+    kind: "untagged",
     content,
     timestamp: Date.now()
   };
 }
-function noticeMessage(idPrefix, content) {
+function noticeMessage(idPrefix, content, to) {
   return {
     id: `notice_${idPrefix}_${++nextSystemMessageId}`,
-    source: "codex",
+    from: "system",
+    to,
+    kind: "untagged",
     content: `[AgentBridge] ${content}`,
     timestamp: Date.now()
   };
@@ -3094,11 +3775,11 @@ async function bootCodex() {
     await codex.start();
     codexBootstrapped = true;
     writeStatusFile();
-    emitToFrontends(systemMessage("system_waiting", currentWaitingMessage()));
+    notifyFrontends((to) => systemMessage("system_waiting", currentWaitingMessage(), to));
     broadcastStatus();
   } catch (err) {
     log(`Failed to start Codex: ${err.message}`);
-    emitToFrontends(systemMessage("system_codex_start_failed", `\u274C AgentBridge failed to start Codex app-server: ${err.message}`));
+    notifyFrontends((to) => systemMessage("system_codex_start_failed", `\u274C AgentBridge failed to start Codex app-server: ${err.message}`, to));
     broadcastStatus();
   }
 }
@@ -3110,6 +3791,10 @@ function shutdown(reason) {
   daemonStatusLine.write(BRIDGE_STOPPED_TAG);
   tuiConnectionState.dispose(`daemon shutdown (${reason})`);
   clearPendingClaudeDisconnect(`daemon shutdown (${reason})`);
+  if (pendingRequestsTimer) {
+    clearInterval(pendingRequestsTimer);
+    pendingRequestsTimer = null;
+  }
   controlServer?.stop();
   controlServer = null;
   codex.stop();
@@ -3160,5 +3845,6 @@ try {
   removePidFile();
   process.exit(1);
 }
+pendingRequestsTimer = setInterval(checkExpiredRequests, PENDING_REQUEST_CHECK_INTERVAL_MS);
 startupComplete = true;
 bootCodex();

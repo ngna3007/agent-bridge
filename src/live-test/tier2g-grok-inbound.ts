@@ -339,21 +339,29 @@ async function main() {
     `${NONCE_PULL} absent from get_messages`,
   );
 
-  // The finding. A `[REPLY]` leaves the daemon as a channel notification and
-  // is not also queued, because the send did not throw — an MCP client that
-  // does not implement Claude's channel extension simply drops it on the
-  // floor and `get_messages` will never mention it again. Asserted as a
-  // characterization test: this is what the code does today, and a change
-  // in either direction should make someone look.
+  // The fix. A `[REPLY]` is enqueued into every resolved recipient's
+  // mailbox before any wake-up is attempted, so a frontend that ignores
+  // notifications/claude/channel — or a Claude session whose channel is
+  // gated off server-side — still finds it on the next get_messages.
+  // The push is a wake-up; only an ack removes the message.
   check(
-    "a [REPLY] is delivered ONLY as a channel notification, never also queued",
-    !grokQueue.includes(NONCE_PUSH) && !claudeQueue.includes(NONCE_PUSH),
-    `grokQueue has it=${grokQueue.includes(NONCE_PUSH)} claudeQueue has it=${claudeQueue.includes(NONCE_PUSH)}`,
+    "a [REPLY] reaches a non-Claude frontend through the mailbox, not only the channel",
+    grokQueue.includes(NONCE_PUSH),
+    `grokQueue has it=${grokQueue.includes(NONCE_PUSH)}`,
   );
-  console.log(
-    "  NOTE  so any frontend that ignores notifications/claude/channel loses every\n" +
-      "        [REPLY] permanently — the marker Codex is told to use for direct answers.",
-  );
+  // The brief's second half of this step asks for a companion check that
+  // the push notification and the drained mailbox entry carry one
+  // canonical id. `ClaudeAdapter.pushViaChannel` (src/claude-adapter.ts)
+  // does put a canonical id on the wire, at `params.meta.canonical_id` —
+  // not `params.messageId`, which is always undefined on this payload.
+  // But `ClaudeAdapter.handleGetMessages` formats the drained side as
+  // `[${m.from}] ${m.content}` with no id of any kind attached, so there
+  // is nothing on the `get_messages` side to compare the pushed id
+  // against. Adding a `drainIds` sibling to `drain` would not help: the
+  // ids are not in the JSON-RPC tool result to begin with. Asserting
+  // equality against a value the harness cannot observe would pass by
+  // construction, which is worse than no check, so it is left out here.
+  // See task-15-report.md for this deviation from the brief.
 
   console.log("");
   try { tui.close(); } catch {}

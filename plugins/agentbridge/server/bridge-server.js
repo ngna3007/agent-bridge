@@ -13901,9 +13901,7 @@ class ClaudeAdapter extends EventEmitter {
   logFile;
   configuredMode;
   resolvedMode = null;
-  pendingMessages = [];
-  maxBufferedMessages;
-  droppedMessageCount = 0;
+  mailbox = null;
   constructor(logFile = new StateDirResolver().logFile) {
     super();
     this.logFile = logFile;
@@ -13913,7 +13911,6 @@ class ClaudeAdapter extends EventEmitter {
     this.log(`ClaudeAdapter created (instance=${this.instanceId})`);
     const envMode = process.env.AGENTBRIDGE_MODE;
     this.configuredMode = envMode && ["push", "pull", "auto"].includes(envMode) ? envMode : "auto";
-    this.maxBufferedMessages = parseInt(process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES ?? "100", 10);
     this.server = new Server({ name: "agentbridge", version: "0.1.0" }, {
       capabilities: {
         experimental: { "claude/channel": {} },
@@ -13933,11 +13930,11 @@ class ClaudeAdapter extends EventEmitter {
   setReplySender(sender) {
     this.replySender = sender;
   }
+  setMailbox(mailbox) {
+    this.mailbox = mailbox;
+  }
   getDeliveryMode() {
     return this.resolvedMode ?? "pull";
-  }
-  getPendingMessageCount() {
-    return this.pendingMessages.length;
   }
   resolveMode() {
     if (this.resolvedMode)
@@ -13954,8 +13951,6 @@ class ClaudeAdapter extends EventEmitter {
     this.log(`pushNotification (instance=${this.instanceId}, mode=${this.resolvedMode}, msgId=${message.id}, len=${message.content.length})`);
     if (this.resolvedMode === "push") {
       await this.pushViaChannel(message);
-    } else {
-      this.queueForPull(message);
     }
   }
   async pushViaChannel(message) {
@@ -13969,6 +13964,7 @@ class ClaudeAdapter extends EventEmitter {
           meta: {
             chat_id: this.sessionId,
             message_id: msgId,
+            canonical_id: message.id,
             user: "Codex",
             user_id: "codex",
             ts,
@@ -13976,61 +13972,23 @@ class ClaudeAdapter extends EventEmitter {
           }
         }
       });
-      this.log(`Pushed notification: ${msgId}`);
+      this.log(`Pushed notification: ${msgId} (canonical=${message.id})`);
     } catch (e) {
-      this.log(`Push notification failed: ${e.message}`);
-      this.queueForPull(message);
+      this.log(`Push notification failed, message stays in mailbox: ${e.message}`);
     }
   }
-  queueForPull(message) {
-    if (this.pendingMessages.length >= this.maxBufferedMessages) {
-      this.pendingMessages.shift();
-      this.droppedMessageCount++;
-      this.log(`Message queue full, dropped oldest message (total dropped: ${this.droppedMessageCount})`);
-    }
-    this.pendingMessages.push(message);
-    this.log(`Queued message for pull (${this.pendingMessages.length} pending, instance=${this.instanceId})`);
-  }
-  enqueueForPull(message) {
-    this.queueForPull(message);
-  }
-  drainMessages() {
-    this.log(`get_messages called (instance=${this.instanceId}, pending=${this.pendingMessages.length}, dropped=${this.droppedMessageCount})`);
-    if (this.pendingMessages.length === 0 && this.droppedMessageCount === 0) {
-      return {
-        content: [{ type: "text", text: "No new messages from Codex." }]
-      };
-    }
-    const messages = this.pendingMessages;
-    this.pendingMessages = [];
-    const dropped = this.droppedMessageCount;
-    this.droppedMessageCount = 0;
-    const count = messages.length;
-    let header = `[${count} new message${count > 1 ? "s" : ""} from Codex]`;
-    if (dropped > 0) {
-      header += ` (${dropped} older message${dropped > 1 ? "s" : ""} were dropped due to queue overflow)`;
-    }
-    header += `
-chat_id: ${this.sessionId}`;
-    const formatted = messages.map((msg, i) => {
-      const ts = new Date(msg.timestamp).toISOString();
-      return `---
-[${i + 1}] ${ts}
-Codex: ${msg.content}`;
-    }).join(`
+  async handleGetMessages() {
+    this.log(`get_messages called (instance=${this.instanceId})`);
+    if (!this.mailbox)
+      return "AgentBridge is not connected to a daemon.";
+    const { batchId, messages } = await this.mailbox.drain();
+    if (messages.length === 0)
+      return "No new messages.";
+    this.mailbox.ack(batchId, messages.map((m) => m.id));
+    this.log(`get_messages returning ${messages.length} message(s) (instance=${this.instanceId})`);
+    return messages.map((m) => `[${m.from}] ${m.content}`).join(`
 
 `);
-    this.log(`get_messages returning ${count} message(s) (instance=${this.instanceId}, dropped=${dropped})`);
-    return {
-      content: [
-        {
-          type: "text",
-          text: `${header}
-
-${formatted}`
-        }
-      ]
-    };
   }
   setupHandlers() {
     this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
@@ -14074,7 +14032,8 @@ ${formatted}`
         return this.handleReply(args);
       }
       if (name === "get_messages") {
-        return this.drainMessages();
+        const text = await this.handleGetMessages();
+        return { content: [{ type: "text", text }] };
       }
       return {
         content: [{ type: "text", text: `Unknown tool: ${name}` }],
@@ -14093,7 +14052,9 @@ ${formatted}`
     const requireReply = args?.require_reply === true;
     const bridgeMsg = {
       id: args?.chat_id ?? `reply_${Date.now()}`,
-      source: "claude",
+      from: "claude",
+      to: "codex",
+      kind: "reply",
       content: text,
       timestamp: Date.now()
     };
@@ -14112,11 +14073,7 @@ ${formatted}`
         isError: true
       };
     }
-    const pending = this.pendingMessages.length;
-    let responseText = result.queued ? `Reply queued for Codex. ${result.note ?? "Codex is mid-turn; it will be delivered when the turn ends."} You do not need to resend it.` : "Reply sent to Codex.";
-    if (pending > 0) {
-      responseText += ` Note: ${pending} unread Codex message${pending > 1 ? "s" : ""} already waiting \u2014 call get_messages to read them.`;
-    }
+    const responseText = result.queued ? `Reply queued for Codex. ${result.note ?? "Codex is mid-turn; it will be delivered when the turn ends."} You do not need to resend it.` : "Reply sent to Codex.";
     return {
       content: [{ type: "text", text: responseText }]
     };
@@ -14144,7 +14101,6 @@ function parseFrontendAgent(raw) {
 class FrontendRegistry {
   opts;
   slots = new Map;
-  buffers = new Map;
   known = new Set([DEFAULT_FRONTEND_AGENT]);
   probing = new Set;
   constructor(opts) {
@@ -14200,52 +14156,19 @@ class FrontendRegistry {
     }
     return null;
   }
-  recipients(source) {
+  writable() {
     const out = [];
     for (const [agent, socket] of this.slots) {
-      if (agent === source)
-        continue;
       if (!this.opts.isOpen(socket))
         continue;
       out.push({ agent, socket });
     }
     return out;
   }
-  buffer(agent, message) {
-    const queue = this.buffers.get(agent) ?? [];
-    queue.push(message);
-    let dropped = 0;
-    if (queue.length > this.opts.maxBufferedMessages) {
-      dropped = queue.length - this.opts.maxBufferedMessages;
-      queue.splice(0, dropped);
-    }
-    this.buffers.set(agent, queue);
-    this.known.add(agent);
-    return { dropped };
-  }
-  takeBuffered(agent) {
-    const queue = this.buffers.get(agent);
-    if (!queue || queue.length === 0)
-      return [];
-    this.buffers.set(agent, []);
-    return queue;
-  }
-  requeue(agent, messages) {
-    if (messages.length === 0)
-      return;
-    const queue = this.buffers.get(agent) ?? [];
-    queue.unshift(...messages);
-    this.buffers.set(agent, queue);
-  }
-  bufferedCount(agent) {
-    if (agent)
-      return this.buffers.get(agent)?.length ?? 0;
-    let total = 0;
-    for (const queue of this.buffers.values())
-      total += queue.length;
-    return total;
-  }
 }
+
+// src/normalize-ingress.ts
+var PROTOCOL_VERSION = 1;
 
 // src/control-protocol.ts
 var CLOSE_CODE_REPLACED = 4001;
@@ -14253,6 +14176,7 @@ var CLOSE_CODE_EVICTED_STALE = 4002;
 var CLOSE_CODE_PROBE_IN_PROGRESS = 4003;
 
 // src/daemon-client.ts
+var DRAIN_TIMEOUT_MS = 5000;
 var nextSocketId = 0;
 var CONNECT_TIMEOUT_MS = 5000;
 function frontendAgentFromEnv() {
@@ -14265,9 +14189,19 @@ class DaemonClient extends EventEmitter2 {
   wsId = 0;
   nextRequestId = 1;
   pendingReplies = new Map;
+  pendingDrains = new Map;
+  drainSeq = 0;
+  sawHello = false;
+  sawFirstFrame = false;
   constructor(url) {
     super();
     this.url = url;
+  }
+  get isHandshakeConfirmed() {
+    return this.sawHello;
+  }
+  get pendingDrainCount() {
+    return this.pendingDrains.size;
   }
   async connect() {
     if (this.ws?.readyState === WebSocket.OPEN) {
@@ -14325,7 +14259,8 @@ class DaemonClient extends EventEmitter2 {
     this.send({
       type: "claude_connect",
       projectId: process.env.AGENTBRIDGE_PROJECT_ID ?? null,
-      agent: frontendAgentFromEnv()
+      agent: frontendAgentFromEnv(),
+      protocolVersion: PROTOCOL_VERSION
     });
   }
   async attachClaudeAndWaitForStatus(timeoutMs = 1000) {
@@ -14398,7 +14333,25 @@ class DaemonClient extends EventEmitter2 {
       });
     });
   }
+  drain() {
+    const requestId = `d${++this.drainSeq}`;
+    return new Promise((resolve) => {
+      this.send({ type: "drain", requestId });
+      const timer = setTimeout(() => {
+        if (this.pendingDrains.delete(requestId))
+          resolve({ batchId: "", messages: [] });
+      }, DRAIN_TIMEOUT_MS);
+      this.pendingDrains.set(requestId, { resolve, timer });
+    });
+  }
+  ack(batchId, ids) {
+    if (!batchId || ids.length === 0)
+      return;
+    this.send({ type: "ack", batchId, ids });
+  }
   attachSocketHandlers(ws, socketId) {
+    this.sawHello = false;
+    this.sawFirstFrame = false;
     ws.onmessage = (event) => {
       const raw = typeof event.data === "string" ? event.data : event.data.toString();
       let message;
@@ -14407,7 +14360,26 @@ class DaemonClient extends EventEmitter2 {
       } catch {
         return;
       }
+      if (!this.sawFirstFrame) {
+        this.sawFirstFrame = true;
+        if (message.type === "hello") {
+          this.sawHello = true;
+        } else {
+          this.emit("incompatibleDaemon");
+        }
+      }
       switch (message.type) {
+        case "hello":
+          return;
+        case "drain_result": {
+          const pending = this.pendingDrains.get(message.requestId);
+          if (!pending)
+            return;
+          clearTimeout(pending.timer);
+          this.pendingDrains.delete(message.requestId);
+          pending.resolve({ batchId: message.batchId, messages: message.messages });
+          return;
+        }
         case "codex_to_claude":
           this.emit("codexMessage", message.message, message.deliveryHint);
           return;
@@ -14436,6 +14408,7 @@ class DaemonClient extends EventEmitter2 {
       if (isCurrent) {
         this.ws = null;
         this.rejectPendingReplies("AgentBridge daemon disconnected.");
+        this.resolvePendingDrainsOnClose();
         if (event.code === CLOSE_CODE_REPLACED || event.code === CLOSE_CODE_EVICTED_STALE || event.code === CLOSE_CODE_PROBE_IN_PROGRESS) {
           this.emit("rejected", event.code);
         } else {
@@ -14450,6 +14423,13 @@ class DaemonClient extends EventEmitter2 {
       clearTimeout(pending.timer);
       pending.resolve({ success: false, error: error2 });
       this.pendingReplies.delete(requestId);
+    }
+  }
+  resolvePendingDrainsOnClose() {
+    for (const [requestId, pending] of this.pendingDrains.entries()) {
+      clearTimeout(pending.timer);
+      pending.resolve({ batchId: "", messages: [] });
+      this.pendingDrains.delete(requestId);
     }
   }
   send(message) {
@@ -14992,7 +14972,6 @@ var LIFECYCLE_TAGS = {
   system_codex_start_failed: wrap(C_RED, "[CODEX FAILED]"),
   system_turn_started: wrap(C_YELLOW, "[CODEX THINKING]"),
   system_turn_completed: wrap(C_GREEN, "[CODEX READY]"),
-  system_reply_missing: wrap(C_RED, "[CODEX NO REPLY]"),
   system_tui_disconnected: wrap(C_YELLOW, "[CODEX UI OFFLINE]"),
   system_tui_reconnected: wrap(C_GREEN, "[CODEX READY]")
 };
@@ -15007,7 +14986,6 @@ var DAEMON_LIFECYCLE_IDS = new Set([
   "system_codex_start_failed",
   "system_turn_started",
   "system_turn_completed",
-  "system_reply_missing",
   "system_tui_disconnected",
   "system_tui_reconnected"
 ]);
@@ -15040,10 +15018,11 @@ var disabledRecoveryInFlight = false;
 var disabledRecoveryAttempts = 0;
 var DISABLED_RECOVERY_MAX_ATTEMPTS = 6;
 var DISABLED_RECOVERY_CONFIRM_TIMEOUT_MS = 1000;
+claude.setMailbox({
+  drain: () => daemonClient.drain(),
+  ack: (batchId, ids) => daemonClient.ack(batchId, ids)
+});
 claude.setReplySender(async (msg, requireReply) => {
-  if (msg.source !== "claude") {
-    return { success: false, error: "Invalid message source" };
-  }
   if (daemonDisabled) {
     return {
       success: false,
@@ -15052,19 +15031,14 @@ claude.setReplySender(async (msg, requireReply) => {
   }
   return daemonClient.sendReply(msg, requireReply);
 });
-daemonClient.on("codexMessage", (message, deliveryHint) => {
+daemonClient.on("codexMessage", (message) => {
   const tag = isDaemonLifecycle(message.id);
   if (tag) {
     log(`Daemon lifecycle event ${message.id} \u2192 status.line`);
     statusLine.write(tag);
     return;
   }
-  if (deliveryHint === "queue") {
-    log(`Queueing daemon \u2192 Claude (${message.content.length} chars)`);
-    claude.enqueueForPull(message);
-    return;
-  }
-  log(`Pushing daemon \u2192 Claude (${message.content.length} chars)`);
+  log(`Waking Claude for ${message.id} (${message.content.length} chars)`);
   claude.pushNotification(message);
 });
 function isDaemonLifecycle(id) {
