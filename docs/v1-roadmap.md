@@ -468,6 +468,13 @@ If client capability inspection is not reliable, a fallback detection approach i
 
 ### Pull mode design
 
+> **Superseded** (comms-lifecycle rework): the bridge-side queue described
+> below no longer exists. `get_messages` now drains the daemon's per-agent
+> mailbox directly (`ClaudeAdapter.handleGetMessages` in
+> `src/claude-adapter.ts`), and `AGENTBRIDGE_MAX_BUFFERED_MESSAGES` has been
+> removed — mailbox capacity is `MAILBOX_CAPACITY` in
+> `src/daemon-constants.ts`, a compile-time constant with no env override.
+
 #### Message queue
 
 - The bridge maintains an in-memory message queue for pending Codex messages.

@@ -428,7 +428,6 @@ All of these override whatever the project namespace resolved. Setting a port va
 | `AGENTBRIDGE_FILTER_MODE` | `filtered` | `filtered` routes by marker (`[REPLY]` forward, `[STATUS]` buffer, `[FYI]` drop, untagged queue). `full` forwards every Codex message to Claude |
 | `AGENTBRIDGE_ATTENTION_WINDOW_MS` | `15000` | After a `[REPLY]`, how long `[STATUS]` traffic stays suppressed to give Claude room to respond |
 | `AGENTBRIDGE_IDLE_SHUTDOWN_MS` | `30000` | How long the daemon lingers with no attached client before exiting |
-| `AGENTBRIDGE_MAX_BUFFERED_MESSAGES` | `100` | Cap on messages buffered while no Claude client is attached |
 | `TUI_DISCONNECT_GRACE_MS` | `2500` | Grace period before a TUI disconnect is reported to Claude as real |
 | `AGENTBRIDGE_LIVENESS_PROBE_TIMEOUT_MS` | `3000` | Maximum wait for incumbent Claude pong before evicting on contention (issue #68) |
 | `AGENTBRIDGE_STATE_DIR` | Platform default | State directory for pid, status, logs (macOS: `~/Library/Application Support/agentbridge/`, Linux: `$XDG_STATE_HOME/agentbridge/`) |

@@ -205,7 +205,7 @@ The current implementation uses these environment variables as the main runtime 
 | `CODEX_WS_PORT` | Codex app-server listen port |
 | `CODEX_PROXY_PORT` | AgentBridge proxy port used by the Codex TUI |
 | `AGENTBRIDGE_MODE` | Claude delivery mode override: `push`, `pull`, or `auto` |
-| `AGENTBRIDGE_MAX_BUFFERED_MESSAGES` | Pull-mode queue bound and buffering limit |
+| ~~`AGENTBRIDGE_MAX_BUFFERED_MESSAGES`~~ | **Removed** (comms-lifecycle rework): the adapter no longer buffers. Mailbox capacity is `MAILBOX_CAPACITY` in `src/daemon-constants.ts`, a compile-time constant, not env-configurable. |
 | `AGENTBRIDGE_FILTER_MODE` | Codex message filtering mode |
 | `AGENTBRIDGE_IDLE_SHUTDOWN_MS` | Daemon idle shutdown override |
 | `AGENTBRIDGE_ATTENTION_WINDOW_MS` | Claude attention-window override |

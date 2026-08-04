@@ -226,7 +226,7 @@ Push arrives as `notifications/claude/channel` with
 | `AGENTBRIDGE_PROJECT_ID` | derived | Informational |
 | `AGENTBRIDGE_MODE` | `push` | `push` \| `pull` delivery |
 | `AGENTBRIDGE_FILTER_MODE` | — | Marker-filter mode |
-| `AGENTBRIDGE_MAX_BUFFERED_MESSAGES` | 100 | Buffer cap (daemon *and* pull queue) |
+| ~~`AGENTBRIDGE_MAX_BUFFERED_MESSAGES`~~ | — | **Removed** (comms-lifecycle rework): the adapter's own buffer is gone. Mailbox capacity is now `MAILBOX_CAPACITY` in `src/daemon-constants.ts`, a compile-time constant with no env override. |
 | `AGENTBRIDGE_IDLE_SHUTDOWN_MS` | — | Idle shutdown grace |
 | `AGENTBRIDGE_ATTENTION_WINDOW_MS` | — | Status-buffer pause window after a Codex ping |
 | `AGENTBRIDGE_PIN_CONTRACT` | `off` | `off` \| `once` \| `always` |

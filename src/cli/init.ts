@@ -202,7 +202,7 @@ export function printCustomizationSummary(projectRoot: string): void {
     "      AGENTBRIDGE_MODE=pull                deliver via get_messages instead",
     "                                           of push notifications",
     "      AGENTBRIDGE_ATTENTION_WINDOW_MS, AGENTBRIDGE_IDLE_SHUTDOWN_MS,",
-    "      AGENTBRIDGE_MAX_BUFFERED_MESSAGES, AGENTBRIDGE_STATE_DIR",
+    "      AGENTBRIDGE_STATE_DIR",
     "      Full list: README.md → Configuration",
     "",
     "  `abg doctor` checks all of the above for drift.",
