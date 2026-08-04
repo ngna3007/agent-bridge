@@ -126,9 +126,20 @@ export class ClaudeAdapter extends EventEmitter {
   // Dual-mode transport
   private readonly configuredMode: DeliveryMode;
   private resolvedMode: "push" | "pull" | null = null;
-  private pendingMessages: BridgeMessage[] = [];
-  private readonly maxBufferedMessages: number;
-  private droppedMessageCount = 0;
+
+  /**
+   * The daemon's mailbox for this agent, reached over the control socket.
+   *
+   * The adapter used to keep its own `pendingMessages` array, so a
+   * message could sit in either of two queues and a WebSocket send
+   * decided which — a successful send proves bytes were accepted, not
+   * that any agent took custody. There is now one mailbox, owned by the
+   * daemon, and this class is a transport to it.
+   */
+  private mailbox: {
+    drain(): Promise<{ batchId: string; messages: BridgeMessage[] }>;
+    ack(batchId: string, ids: string[]): void;
+  } | null = null;
 
   constructor(logFile = new StateDirResolver().logFile) {
     super();
@@ -140,7 +151,6 @@ export class ClaudeAdapter extends EventEmitter {
 
     const envMode = process.env.AGENTBRIDGE_MODE as DeliveryMode | undefined;
     this.configuredMode = envMode && ["push", "pull", "auto"].includes(envMode) ? envMode : "auto";
-    this.maxBufferedMessages = parseInt(process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES ?? "100", 10);
 
     this.server = new Server(
       { name: "agentbridge", version: "0.1.0" },
@@ -171,14 +181,13 @@ export class ClaudeAdapter extends EventEmitter {
     this.replySender = sender;
   }
 
+  setMailbox(mailbox: NonNullable<ClaudeAdapter["mailbox"]>): void {
+    this.mailbox = mailbox;
+  }
+
   /** Returns the resolved delivery mode. */
   getDeliveryMode(): "push" | "pull" {
     return this.resolvedMode ?? "pull";
-  }
-
-  /** Returns the number of messages waiting in the pull queue. */
-  getPendingMessageCount(): number {
-    return this.pendingMessages.length;
   }
 
   // ── Mode Detection ─────────────────────────────────────────
@@ -192,8 +201,9 @@ export class ClaudeAdapter extends EventEmitter {
     } else {
       // Default to push — AgentBridge always runs as a Claude Code plugin
       // with --dangerously-load-development-channels, so channel delivery
-      // is available. If push fails, pushViaChannel already falls back to
-      // queueForPull per-message.
+      // is available. A failed push no longer needs a fallback store: the
+      // message never left the daemon's mailbox, so Claude reaches it on
+      // the next get_messages instead.
       this.resolvedMode = "push";
       this.log("Delivery mode defaulting to push (set AGENTBRIDGE_MODE=pull to use polling instead)");
     }
@@ -205,9 +215,10 @@ export class ClaudeAdapter extends EventEmitter {
     this.log(`pushNotification (instance=${this.instanceId}, mode=${this.resolvedMode}, msgId=${message.id}, len=${message.content.length})`);
     if (this.resolvedMode === "push") {
       await this.pushViaChannel(message);
-    } else {
-      this.queueForPull(message);
     }
+    // In pull mode there is nothing else to do here: the message already
+    // lives in the daemon's mailbox, and Claude reaches it by calling
+    // get_messages, which drains the mailbox directly.
   }
 
   private async pushViaChannel(message: BridgeMessage) {
@@ -222,6 +233,11 @@ export class ClaudeAdapter extends EventEmitter {
           meta: {
             chat_id: this.sessionId,
             message_id: msgId,
+            // The daemon-assigned canonical id. It appears here and in the
+            // drained payload identically — that is what makes a duplicate
+            // (e.g. a working push seen again on a later unacked drain)
+            // recognisable rather than confusing.
+            canonical_id: message.id,
             user: "Codex",
             user_id: "codex",
             ts,
@@ -229,71 +245,34 @@ export class ClaudeAdapter extends EventEmitter {
           },
         },
       });
-      this.log(`Pushed notification: ${msgId}`);
+      this.log(`Pushed notification: ${msgId} (canonical=${message.id})`);
     } catch (e: any) {
-      this.log(`Push notification failed: ${e.message}`);
-      this.queueForPull(message);
+      // A push is a wake-up, not the delivery: a successful send proves
+      // only that bytes were accepted, not that any agent took custody.
+      // The message never left the daemon's mailbox, so a failed send
+      // costs latency (redelivered on the next drain / lease expiry),
+      // not the message — there is no second store to fall back to.
+      this.log(`Push notification failed, message stays in mailbox: ${e.message}`);
     }
-  }
-
-  private queueForPull(message: BridgeMessage) {
-    if (this.pendingMessages.length >= this.maxBufferedMessages) {
-      this.pendingMessages.shift();
-      this.droppedMessageCount++;
-      this.log(`Message queue full, dropped oldest message (total dropped: ${this.droppedMessageCount})`);
-    }
-    this.pendingMessages.push(message);
-    this.log(`Queued message for pull (${this.pendingMessages.length} pending, instance=${this.instanceId})`);
-  }
-
-  /**
-   * Public entry point for delivery_hint="queue" messages: skip the
-   * MCP channel and park the message in the pull queue so Claude
-   * only sees it on the next get_messages call.
-   */
-  enqueueForPull(message: BridgeMessage) {
-    this.queueForPull(message);
   }
 
   // ── get_messages ───────────────────────────────────────────
 
-  private drainMessages(): { content: Array<{ type: "text"; text: string }> } {
-    this.log(`get_messages called (instance=${this.instanceId}, pending=${this.pendingMessages.length}, dropped=${this.droppedMessageCount})`);
-    if (this.pendingMessages.length === 0 && this.droppedMessageCount === 0) {
-      return {
-        content: [{ type: "text" as const, text: "No new messages from Codex." }],
-      };
-    }
-
-    // Snapshot and clear atomically to avoid issues with concurrent writes
-    const messages = this.pendingMessages;
-    this.pendingMessages = [];
-    const dropped = this.droppedMessageCount;
-    this.droppedMessageCount = 0;
-
-    const count = messages.length;
-    let header = `[${count} new message${count > 1 ? "s" : ""} from Codex]`;
-    if (dropped > 0) {
-      header += ` (${dropped} older message${dropped > 1 ? "s" : ""} were dropped due to queue overflow)`;
-    }
-    header += `\nchat_id: ${this.sessionId}`;
-
-    const formatted = messages
-      .map((msg, i) => {
-        const ts = new Date(msg.timestamp).toISOString();
-        return `---\n[${i + 1}] ${ts}\nCodex: ${msg.content}`;
-      })
-      .join("\n\n");
-
-    this.log(`get_messages returning ${count} message(s) (instance=${this.instanceId}, dropped=${dropped})`);
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: `${header}\n\n${formatted}`,
-        },
-      ],
-    };
+  /**
+   * `get_messages` is a transport to the daemon's mailbox, not a store.
+   * Every drained message is acked immediately before returning — an
+   * unacked entry is redelivered once its lease expires, which costs a
+   * duplicate the canonical id makes cheap to recognise. There is no
+   * "ack only after the model confirms" step; no such signal exists.
+   */
+  async handleGetMessages(): Promise<string> {
+    this.log(`get_messages called (instance=${this.instanceId})`);
+    if (!this.mailbox) return "AgentBridge is not connected to a daemon.";
+    const { batchId, messages } = await this.mailbox.drain();
+    if (messages.length === 0) return "No new messages.";
+    this.mailbox.ack(batchId, messages.map((m) => m.id));
+    this.log(`get_messages returning ${messages.length} message(s) (instance=${this.instanceId})`);
+    return messages.map((m) => `[${m.from}] ${m.content}`).join("\n\n");
   }
 
   // ── MCP Tool Handlers ─────────────────────────────────────
@@ -345,7 +324,8 @@ export class ClaudeAdapter extends EventEmitter {
       }
 
       if (name === "get_messages") {
-        return this.drainMessages();
+        const text = await this.handleGetMessages();
+        return { content: [{ type: "text" as const, text }] };
       }
 
       return {
@@ -367,8 +347,12 @@ export class ClaudeAdapter extends EventEmitter {
     const requireReply = args?.require_reply === true;
 
     const bridgeMsg: BridgeMessage = {
+      // Overwritten by the daemon at ingress (`normalizeIngress` assigns
+      // the canonical id); this value is never read back.
       id: (args?.chat_id as string) ?? `reply_${Date.now()}`,
-      source: "claude",
+      from: "claude",
+      to: "codex",
+      kind: "reply",
       content: text,
       timestamp: Date.now(),
     };
@@ -390,17 +374,17 @@ export class ClaudeAdapter extends EventEmitter {
       };
     }
 
-    // Include pending message hint
-    const pending = this.pendingMessages.length;
     // A queued reply is a success with a delay, not an error. Saying
     // "sent" would be a lie Claude cannot detect, and returning an
     // error would provoke the manual retry the outbox exists to remove.
-    let responseText = result.queued
+    //
+    // There used to be an "N unread messages waiting" hint here, sourced
+    // from the adapter's own pull queue. That queue is gone \u2014 the daemon's
+    // mailbox is the only store now, and peeking its depth would mean
+    // draining it, which would ack messages Claude never asked to read.
+    const responseText = result.queued
       ? `Reply queued for Codex. ${result.note ?? "Codex is mid-turn; it will be delivered when the turn ends."} You do not need to resend it.`
       : "Reply sent to Codex.";
-    if (pending > 0) {
-      responseText += ` Note: ${pending} unread Codex message${pending > 1 ? "s" : ""} already waiting \u2014 call get_messages to read them.`;
-    }
 
     return {
       content: [{ type: "text" as const, text: responseText }],

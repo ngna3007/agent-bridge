@@ -62,6 +62,11 @@ let disabledRecoveryAttempts = 0;
 const DISABLED_RECOVERY_MAX_ATTEMPTS = 6;
 const DISABLED_RECOVERY_CONFIRM_TIMEOUT_MS = 1000;
 
+claude.setMailbox({
+  drain: () => daemonClient.drain(),
+  ack: (batchId, ids) => daemonClient.ack(batchId, ids),
+});
+
 claude.setReplySender(async (msg: BridgeMessage, requireReply?: boolean) => {
   // The `msg.source !== "claude"` check that used to live here was
   // client-side — in the very process that would be doing the spoofing.
@@ -82,21 +87,19 @@ claude.setReplySender(async (msg: BridgeMessage, requireReply?: boolean) => {
 // what bridge.ts emits.
 import { tagForLifecycle } from "./lifecycle-tags";
 
-daemonClient.on("codexMessage", (message, deliveryHint) => {
+daemonClient.on("codexMessage", (message) => {
   const tag = isDaemonLifecycle(message.id);
   if (tag) {
     log(`Daemon lifecycle event ${message.id} → status.line`);
     statusLine.write(tag);
     return;
   }
-  if (deliveryHint === "queue") {
-    // Untagged Codex output: hold in the adapter's pull queue.
-    // Claude only sees it on the next get_messages call.
-    log(`Queueing daemon → Claude (${message.content.length} chars)`);
-    claude.enqueueForPull(message);
-    return;
-  }
-  log(`Pushing daemon → Claude (${message.content.length} chars)`);
+  // A push is a wake-up. It never consumes — the message stays in the
+  // daemon's mailbox until an ack, so a channel that silently drops it
+  // costs latency rather than the message. The daemon's delivery hint
+  // no longer changes this: every non-lifecycle message wakes Claude,
+  // and get_messages is what actually drains the mailbox.
+  log(`Waking Claude for ${message.id} (${message.content.length} chars)`);
   void claude.pushNotification(message);
 });
 
