@@ -426,8 +426,7 @@ class CodexAdapter extends EventEmitter {
       } catch {}
     }
     this.clearResponseTrackingStateForAppServerReconnect();
-    this.activeTurnIds.clear();
-    this.turnInProgress = false;
+    this.abandonTurns("the app-server was reconnected for a new TUI session");
     try {
       await this.connectToAppServer(false);
       this.log("App-server reconnected for new TUI session \u2014 replaying buffered messages");
@@ -481,8 +480,7 @@ class CodexAdapter extends EventEmitter {
     this.log(`App-server connection closed (intentional=${intentional}, tuiConnected=${tuiConnected}, turnInProgress=${this.turnInProgress})`);
     this.appServerWs = null;
     this.clearResponseTrackingState();
-    this.activeTurnIds.clear();
-    this.turnInProgress = false;
+    this.abandonTurns("the app-server connection closed");
     if (!intentional) {
       this.scheduleReconnect();
     }
@@ -1236,6 +1234,12 @@ class CodexAdapter extends EventEmitter {
     if (!wasInProgress && this.turnInProgress) {
       this.emit("turnStarted");
     }
+  }
+  abandonTurns(why) {
+    this.activeTurnIds.clear();
+    this.turnInProgress = false;
+    this.log(`Abandoning any running Codex turn: ${why}`);
+    this.emit("turnAborted", why);
   }
   markTurnCompleted(turnId) {
     if (typeof turnId === "string" && turnId.length > 0) {
@@ -3242,6 +3246,9 @@ codex.on("tuiDisconnected", (connId) => {
 });
 codex.on("error", (err) => {
   log(`Codex error: ${err.message}`);
+});
+codex.on("turnAborted", (why) => {
+  endCodexTurn(why);
 });
 codex.on("injectionRejected", ({ correlation, error }) => {
   log(`Codex refused the turn for ${correlation.id}: ${error}`);

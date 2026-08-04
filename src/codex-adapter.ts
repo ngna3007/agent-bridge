@@ -473,8 +473,7 @@ export class CodexAdapter extends EventEmitter {
     // pendingServerRequests — those must survive the intentional reconnect
     // so they can be replayed after the TUI completes thread/resume.
     this.clearResponseTrackingStateForAppServerReconnect();
-    this.activeTurnIds.clear();
-    this.turnInProgress = false;
+    this.abandonTurns("the app-server was reconnected for a new TUI session");
 
     try {
       await this.connectToAppServer(false);
@@ -553,8 +552,7 @@ export class CodexAdapter extends EventEmitter {
     // Approval request/response ids are scoped to the current app-server session.
     // If the socket reconnects, replaying old approval state would forward stale ids.
     this.clearResponseTrackingState();
-    this.activeTurnIds.clear();
-    this.turnInProgress = false;
+    this.abandonTurns("the app-server connection closed");
     if (!intentional) {
       this.scheduleReconnect();
     }
@@ -1595,6 +1593,24 @@ export class CodexAdapter extends EventEmitter {
     if (!wasInProgress && this.turnInProgress) {
       this.emit("turnStarted");
     }
+  }
+
+  /**
+   * Drop every running turn because the connection carrying it is gone.
+   *
+   * Distinct from `markTurnCompleted`: nothing completed. No
+   * `turn/completed` will ever arrive for these, so `turnCompleted` does
+   * not fire — and anything the daemon scopes to a turn (the requester
+   * that opened it, above all) would otherwise outlive the thread and
+   * keep steering Codex's next output at one agent while every other
+   * attached frontend silently received nothing. `turnAborted` is the
+   * event that says "this turn ended badly", which is still an ending.
+   */
+  private abandonTurns(why: string) {
+    this.activeTurnIds.clear();
+    this.turnInProgress = false;
+    this.log(`Abandoning any running Codex turn: ${why}`);
+    this.emit("turnAborted", why);
   }
 
   private markTurnCompleted(turnId?: string) {

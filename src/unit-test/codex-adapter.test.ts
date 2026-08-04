@@ -314,6 +314,29 @@ describe("CodexAdapter turn state machine", () => {
     adapter.clearResponseTrackingState();
   });
 
+  test("a turn killed by the connection announces itself as aborted", () => {
+    // turnCompleted never fires for a turn whose app-server went away —
+    // no turn/completed is coming. Without a separate ending event the
+    // daemon's turn-scoped requester survives the thread that opened it,
+    // and Codex's next spontaneous output routes to that one stale agent
+    // while every other attached frontend silently receives nothing.
+    const adapter = createAdapter();
+    const aborted: string[] = [];
+    const completed: number[] = [];
+    adapter.on("turnAborted", (why: string) => aborted.push(why));
+    adapter.on("turnCompleted", () => completed.push(1));
+
+    adapter.handleServerNotification({ method: "turn/started", params: { turn: { id: "t1" } } });
+    expect(adapter.turnInProgress).toBe(true);
+
+    adapter.handleAppServerClose();
+
+    expect(adapter.turnInProgress).toBe(false);
+    expect(aborted.length).toBe(1);
+    // Not a completion. Nothing completed.
+    expect(completed).toEqual([]);
+  });
+
   test("injectMessage asks turnPending, not its two current terms", () => {
     // The drift this pins: turnPending is the definition of "Codex is
     // occupied", and injectMessage used to restate its two terms instead

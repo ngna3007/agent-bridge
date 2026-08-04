@@ -747,6 +747,13 @@ codex.on("error", (err: Error) => {
   log(`Codex error: ${err.message}`);
 });
 
+// A turn the app-server connection took down with it. No `turn/completed`
+// is ever coming for it, so `turnCompleted` never fires and only this
+// event closes the turn-scoped state.
+codex.on("turnAborted", (why: string) => {
+  endCodexTurn(why);
+});
+
 /**
  * The app-server refused a turn the daemon already reported as sent.
  *
