@@ -415,7 +415,34 @@ registerTransport(
  * the mailbox is the whole point — and this is the only thing that
  * hands them over.
  */
+let grokDrainRunning = false;
+let grokDrainAgain = false;
+
 async function drainGrokBacklog(why: string): Promise<void> {
+  // Coalesced, never concurrent. `injectionCapacity` fires synchronously
+  // from inside the adapter, which can happen while this function is
+  // between its `wake` and its `nack` — a second drain there would lease
+  // nothing (the entry is still held by this batch), see an empty
+  // mailbox, and return, and the nack that follows would arrive with no
+  // signal left to act on it. The rerun flag is what makes that
+  // impossible: a request that lands mid-drain is served after the
+  // current batch has been fully accounted for.
+  if (grokDrainRunning) {
+    grokDrainAgain = true;
+    return;
+  }
+  grokDrainRunning = true;
+  try {
+    do {
+      grokDrainAgain = false;
+      await drainGrokBatch(why);
+    } while (grokDrainAgain);
+  } finally {
+    grokDrainRunning = false;
+  }
+}
+
+async function drainGrokBatch(why: string): Promise<void> {
   const box = mailboxFor("grok");
   const batch = box.drain(Date.now());
   if (batch.messages.length === 0) return;

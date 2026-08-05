@@ -169,9 +169,6 @@ export class GrokAdapter extends EventEmitter {
   private turnSeq = 0;
 
   private nextRequestId = 1;
-  private readonly injectionCorrelations = new Map<number, GrokInjectionCorrelation>();
-  /** Ids of our own in-flight prompts, so their responses are recognised. */
-  private readonly ourPrompts = new Set<number>();
 
   /**
    * The one injected turn the adapter is tracking, from the moment its
@@ -188,6 +185,15 @@ export class GrokAdapter extends EventEmitter {
    * Deriving it later meant every flush that beat the verdict — the
    * human's next prompt, a TUI disconnect — emitted the answer with no
    * owner at all.
+   *
+   * Owning it is not the same as being allowed to spend it. Grok's
+   * leader queues an injected prompt behind whatever the human is
+   * already doing, so between the write and the turn there can be one or
+   * more turns that are none of our business. `pendingEcho` is how the
+   * turn recognises itself: the leader echoes an injected prompt back
+   * down the proxy leg as a user message before answering it, so the
+   * correlation is claimable only once the text this adapter wrote has
+   * come back verbatim.
    */
   private activeInjection: {
     correlation: GrokInjectionCorrelation | null;
@@ -199,6 +205,19 @@ export class GrokAdapter extends EventEmitter {
     reason: string;
     /** The prose for this turn has gone to the bus. */
     emitted: boolean;
+    /**
+     * The part of our prompt's echo not yet seen, or `null` once the
+     * whole of it has come back and this turn has therefore started.
+     */
+    pendingEcho: string | null;
+    /** Text of the echo matched so far in the current candidate turn. */
+    echoSeen: string;
+    /**
+     * The deadline passed with nothing to show, the sender has been told
+     * `unknown`, and the slot is held until something authoritative says
+     * the prompt cannot still run.
+     */
+    abandoned: boolean;
     /** Absolute give-up point, from write time. */
     deadline: number;
     timer: ReturnType<typeof setTimeout> | null;
@@ -317,7 +336,13 @@ export class GrokAdapter extends EventEmitter {
    * needs one because a second `turn/start` mid-turn is an error. Grok's
    * leader queues the prompt and runs it at the next turn boundary, so
    * refusing there would re-implement, worse, something the server
-   * already does.
+   * already does — and refusing would strand the message, because the
+   * retry signal is `injectionCapacity` and no injection would be
+   * outstanding to emit it.
+   *
+   * What that costs is one turn's worth of ambiguity: between this write
+   * and our answer there can be human turns whose prose is not ours to
+   * claim. `pendingEcho` is what separates them.
    */
   injectMessage(text: string, correlation?: GrokInjectionCorrelation): boolean {
     const sessionId = this.sessionIdValue;
@@ -343,6 +368,9 @@ export class GrokAdapter extends EventEmitter {
       verdictSeen: false,
       reason: "",
       emitted: false,
+      pendingEcho: text,
+      echoSeen: "",
+      abandoned: false,
       deadline: Date.now() + this.deadlineMs,
       timer: null,
     };
@@ -401,15 +429,39 @@ export class GrokAdapter extends EventEmitter {
       return;
     }
     if (expired) {
-      if (injection.correlation) {
-        this.log(
-          `Giving up on the turn for ${injection.correlation.messageId}: nothing streamed within ${this.deadlineMs}ms`,
-        );
-      }
-      this.endInjection();
+      this.abandonInjection(
+        `no answer streamed within ${this.deadlineMs}ms of the prompt being written`,
+      );
       return;
     }
     this.armInjectionTimer();
+  }
+
+  /**
+   * Give up waiting, tell the sender, and keep holding the slot.
+   *
+   * A deadline that passes with nothing streamed proves only that this
+   * side stopped waiting. The prompt was written; the leader may be
+   * queueing it behind a long human turn and may answer it in a minute.
+   * So the sender is told `unknown` — the transport self-acked, so
+   * without this the message is simply never mentioned again — and the
+   * slot stays held. Freeing it would emit `injectionCapacity`, send the
+   * next prompt, and leave two turns in flight with one correlation
+   * between them: exactly the ambiguity serialising exists to prevent.
+   *
+   * The slot is released by evidence, not by time: the leader's verdict
+   * for this prompt, a different session, or the session going away.
+   */
+  private abandonInjection(reason: string): void {
+    const injection = this.activeInjection;
+    if (!injection || injection.abandoned) return;
+    if (injection.timer) clearTimeout(injection.timer);
+    injection.timer = null;
+    injection.abandoned = true;
+    // Nothing further may claim this correlation: it has been reported.
+    injection.emitted = true;
+    this.log(`Giving up on the injected turn: ${reason}`);
+    this.reportUndelivered(injection.correlation, reason, "unknown");
   }
 
   /**
@@ -588,7 +640,11 @@ export class GrokAdapter extends EventEmitter {
     // a turn boundary the TUI never announced, because the prompt that
     // opened it came from us.
     if (kind === "user_message_chunk") {
+      // Flushed *before* the echo is matched, so the turn this event
+      // ends — which may be the human's — cannot claim a correlation
+      // whose own turn has not started yet.
       this.flush("a user message started a new turn");
+      this.matchInjectionEcho(updateText(update));
       // Deliberately no timer change. The echo of our own injected
       // prompt arrives here, *before* the answer to it — so an
       // outstanding injection is waiting on prose that has not started,
@@ -673,7 +729,12 @@ export class GrokAdapter extends EventEmitter {
     if (acp.error) {
       const reason = acp.error.message || "Grok refused the prompt";
       this.log(`Injection rejected: ${reason}`);
-      this.reportUndelivered(injection.correlation, reason, "rejected");
+      // An abandoned injection has already been reported `unknown`. The
+      // verdict is still what frees the slot — it is the evidence that
+      // the prompt cannot still be waiting to run.
+      if (!injection.abandoned) {
+        this.reportUndelivered(injection.correlation, reason, "rejected");
+      }
       this.endInjection();
       return;
     }
@@ -688,6 +749,41 @@ export class GrokAdapter extends EventEmitter {
       return;
     }
     this.armInjectionTimer();
+  }
+
+  /**
+   * Recognise our own prompt coming back, and start its turn.
+   *
+   * The leader queues an injected prompt behind whatever the human is
+   * already doing, so the turns between the write and the answer are not
+   * ours. The echo is the only marker that distinguishes them: the text
+   * this adapter wrote, returned verbatim as a user message, immediately
+   * before the answer to it. Until the whole of it has come back the
+   * correlation is owned but unclaimable, which is what stops a human
+   * turn ending in between from walking off with it.
+   *
+   * Matched as a prefix across chunks, because the leader is free to
+   * split it. A chunk that does not continue the match resets it — that
+   * is a different prompt — but is still tried as a fresh start, since
+   * the human's prompt and ours arrive through the same event.
+   */
+  private matchInjectionEcho(text: string | null): void {
+    const injection = this.activeInjection;
+    if (!injection || injection.pendingEcho === null || text === null) return;
+    const expected = injection.pendingEcho;
+    const continued = injection.echoSeen + text;
+    if (expected.startsWith(continued)) {
+      injection.echoSeen = continued;
+    } else if (expected.startsWith(text)) {
+      injection.echoSeen = text;
+    } else {
+      injection.echoSeen = "";
+      return;
+    }
+    if (injection.echoSeen.length < expected.length) return;
+    injection.pendingEcho = null;
+    injection.echoSeen = "";
+    this.log("Our injected prompt came back on the proxy leg; its turn has started");
   }
 
   /** Tell the daemon an injected prompt did not visibly run. */
@@ -738,6 +834,20 @@ export class GrokAdapter extends EventEmitter {
 
   private bindSession(sessionId: string): void {
     if (this.sessionIdValue === sessionId) return;
+    // Whatever was outstanding was addressed to the session being left.
+    // It cannot run here now, which is the evidence an abandoned
+    // injection was holding its slot waiting for.
+    if (this.sessionIdValue !== null) {
+      const injection = this.activeInjection;
+      if (injection && !injection.emitted) {
+        this.reportUndelivered(
+          injection.correlation,
+          "the Grok session changed before the injected turn's answer arrived",
+          "unknown",
+        );
+      }
+      this.endInjection();
+    }
     this.sessionIdValue = sessionId;
     this.log(`Attached to Grok session ${sessionId}`);
     this.emit("sessionAttached", sessionId);
@@ -759,13 +869,16 @@ export class GrokAdapter extends EventEmitter {
     if (!this.turnActive && this.chunks.length === 0) return;
 
     // Whatever is buffered belongs to the outstanding injected turn, if
-    // there is one, whether or not its verdict has arrived — the
-    // correlation has been owned since the prompt was written precisely
-    // so that a flush arriving first does not have to guess. Claimed
-    // once: a second turn's prose is not this injection's answer.
+    // that turn has started, whether or not its verdict has arrived —
+    // the correlation has been owned since the prompt was written
+    // precisely so that a flush arriving first does not have to guess.
+    // Claimed once: a second turn's prose is not this injection's answer.
     const injection = this.activeInjection;
     let respondingTo: GrokInjectionCorrelation | null = null;
-    if (injection && !injection.emitted) {
+    // `pendingEcho === null` is the whole gate: our prompt has come back,
+    // so what is buffered is the answer to it and not a human turn the
+    // leader ran first.
+    if (injection && injection.pendingEcho === null && !injection.emitted) {
       injection.emitted = true;
       respondingTo = injection.correlation;
     }

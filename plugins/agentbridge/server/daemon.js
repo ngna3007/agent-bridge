@@ -1573,8 +1573,6 @@ class GrokAdapter extends EventEmitter2 {
   chunks = [];
   turnSeq = 0;
   nextRequestId = 1;
-  injectionCorrelations = new Map;
-  ourPrompts = new Set;
   activeInjection = null;
   stopped = false;
   listening = false;
@@ -1656,6 +1654,9 @@ class GrokAdapter extends EventEmitter2 {
       verdictSeen: false,
       reason: "",
       emitted: false,
+      pendingEcho: text,
+      echoSeen: "",
+      abandoned: false,
       deadline: Date.now() + this.deadlineMs,
       timer: null
     };
@@ -1698,13 +1699,22 @@ class GrokAdapter extends EventEmitter2 {
       return;
     }
     if (expired) {
-      if (injection.correlation) {
-        this.log(`Giving up on the turn for ${injection.correlation.messageId}: nothing streamed within ${this.deadlineMs}ms`);
-      }
-      this.endInjection();
+      this.abandonInjection(`no answer streamed within ${this.deadlineMs}ms of the prompt being written`);
       return;
     }
     this.armInjectionTimer();
+  }
+  abandonInjection(reason) {
+    const injection = this.activeInjection;
+    if (!injection || injection.abandoned)
+      return;
+    if (injection.timer)
+      clearTimeout(injection.timer);
+    injection.timer = null;
+    injection.abandoned = true;
+    injection.emitted = true;
+    this.log(`Giving up on the injected turn: ${reason}`);
+    this.reportUndelivered(injection.correlation, reason, "unknown");
   }
   endInjection() {
     const injection = this.activeInjection;
@@ -1819,6 +1829,7 @@ class GrokAdapter extends EventEmitter2 {
     const kind = update?.sessionUpdate;
     if (kind === "user_message_chunk") {
       this.flush("a user message started a new turn");
+      this.matchInjectionEcho(updateText(update));
       return;
     }
     if (kind !== "agent_message_chunk")
@@ -1876,7 +1887,9 @@ class GrokAdapter extends EventEmitter2 {
     if (acp.error) {
       const reason = acp.error.message || "Grok refused the prompt";
       this.log(`Injection rejected: ${reason}`);
-      this.reportUndelivered(injection.correlation, reason, "rejected");
+      if (!injection.abandoned) {
+        this.reportUndelivered(injection.correlation, reason, "rejected");
+      }
       this.endInjection();
       return;
     }
@@ -1887,6 +1900,26 @@ class GrokAdapter extends EventEmitter2 {
       return;
     }
     this.armInjectionTimer();
+  }
+  matchInjectionEcho(text) {
+    const injection = this.activeInjection;
+    if (!injection || injection.pendingEcho === null || text === null)
+      return;
+    const expected = injection.pendingEcho;
+    const continued = injection.echoSeen + text;
+    if (expected.startsWith(continued)) {
+      injection.echoSeen = continued;
+    } else if (expected.startsWith(text)) {
+      injection.echoSeen = text;
+    } else {
+      injection.echoSeen = "";
+      return;
+    }
+    if (injection.echoSeen.length < expected.length)
+      return;
+    injection.pendingEcho = null;
+    injection.echoSeen = "";
+    this.log("Our injected prompt came back on the proxy leg; its turn has started");
   }
   reportUndelivered(correlation, reason, delivery) {
     if (!correlation)
@@ -1907,6 +1940,13 @@ class GrokAdapter extends EventEmitter2 {
   bindSession(sessionId) {
     if (this.sessionIdValue === sessionId)
       return;
+    if (this.sessionIdValue !== null) {
+      const injection = this.activeInjection;
+      if (injection && !injection.emitted) {
+        this.reportUndelivered(injection.correlation, "the Grok session changed before the injected turn's answer arrived", "unknown");
+      }
+      this.endInjection();
+    }
     this.sessionIdValue = sessionId;
     this.log(`Attached to Grok session ${sessionId}`);
     this.emit("sessionAttached", sessionId);
@@ -1923,7 +1963,7 @@ class GrokAdapter extends EventEmitter2 {
       return;
     const injection = this.activeInjection;
     let respondingTo = null;
-    if (injection && !injection.emitted) {
+    if (injection && injection.pendingEcho === null && !injection.emitted) {
       injection.emitted = true;
       respondingTo = injection.correlation;
     }
@@ -3716,7 +3756,24 @@ registerTransport2("grok", grokWakeTransport({
   expectReply: (requester, messageId) => pendingRequests.add({ requester, responder: "grok", messageId, at: Date.now() }),
   log
 }));
+var grokDrainRunning = false;
+var grokDrainAgain = false;
 async function drainGrokBacklog(why) {
+  if (grokDrainRunning) {
+    grokDrainAgain = true;
+    return;
+  }
+  grokDrainRunning = true;
+  try {
+    do {
+      grokDrainAgain = false;
+      await drainGrokBatch(why);
+    } while (grokDrainAgain);
+  } finally {
+    grokDrainRunning = false;
+  }
+}
+async function drainGrokBatch(why) {
   const box = mailboxFor("grok");
   const batch = box.drain(Date.now());
   if (batch.messages.length === 0)
