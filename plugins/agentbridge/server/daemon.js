@@ -1707,6 +1707,16 @@ class GrokAdapter extends EventEmitter2 {
   canSettle(injection) {
     return injection.ownsTurn && injection.verdictSeen && (this.turnActive || this.chunks.length > 0);
   }
+  reconcileInjection() {
+    const injection = this.activeInjection;
+    if (!injection)
+      return;
+    if (injection.verdictSeen && injection.proseEmitted && !injection.abandoned) {
+      this.endInjection();
+      return;
+    }
+    this.armInjectionTimer();
+  }
   onInjectionTimer() {
     const injection = this.activeInjection;
     if (!injection)
@@ -1722,7 +1732,6 @@ class GrokAdapter extends EventEmitter2 {
     }
     if (this.canSettle(injection)) {
       this.flush(injection.reason || "the injected turn settled");
-      this.endInjection();
       return;
     }
     if (Date.now() >= injection.deadline) {
@@ -1922,11 +1931,7 @@ class GrokAdapter extends EventEmitter2 {
     }
     injection.verdictSeen = true;
     injection.reason = "the leader answered our injected prompt";
-    if (injection.proseEmitted && !injection.abandoned) {
-      this.endInjection();
-      return;
-    }
-    this.armInjectionTimer();
+    this.reconcileInjection();
   }
   matchInjectionEcho(text) {
     const injection = this.activeInjection;
@@ -2001,6 +2006,7 @@ class GrokAdapter extends EventEmitter2 {
       this.emit("agentMessage", { senderRef, content, respondingTo });
     }
     this.emit("turnCompleted");
+    this.reconcileInjection();
   }
   log(msg) {
     const line = `[${new Date().toISOString()}] [GrokAdapter] ${msg}

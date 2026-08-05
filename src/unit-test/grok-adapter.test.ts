@@ -593,6 +593,47 @@ describe("GrokAdapter injection", () => {
     ).toBe(true);
   });
 
+  test("a verdict that arrives before the prose is flushed still ends the turn", async () => {
+    // Both halves of "this turn is accounted for" — the verdict and the
+    // prose reaching the bus — cross different sockets in either order.
+    // When the verdict came first and the human's next prompt flushed
+    // the prose, nothing asked again whether the turn was finished: the
+    // slot sat held until the deadline reported an `unknown` that was
+    // not true.
+    const { adapter, tui, upstreams, leader } = harness({ injectedTurnDeadlineMs: SETTLE_MS * 2 });
+    tuiPrompts(tui, 1);
+    leader.deliverAcp({ jsonrpc: "2.0", id: 1, result: {} });
+
+    const seen: GrokProseIngress[] = [];
+    const failures: any[] = [];
+    const capacity: number[] = [];
+    adapter.on("agentMessage", (m: GrokProseIngress) => seen.push(m));
+    adapter.on("injectionRejected", (r: any) => failures.push(r));
+    adapter.on("injectionCapacity", () => capacity.push(1));
+    adapter.injectMessage("what is 2+2", { messageId: "m1", requester: "claude", text: "q" });
+
+    const injector = upstreams[1]!;
+    echoInjected(leader, injector);
+    chunk(leader, "four");
+    const promptId = injector.acpSent().find((m: any) => m.method === "session/prompt").id;
+    injector.deliverAcp({ jsonrpc: "2.0", id: promptId, result: { stopReason: "end_turn" } });
+    // The human prompts before the settle window closes, so the prose
+    // goes to the bus on their boundary rather than on the timer.
+    userChunk(leader, "next question");
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.respondingTo?.messageId).toBe("m1");
+    expect(capacity).toHaveLength(1);
+
+    // Well past the old deadline: no `unknown` for a turn that finished.
+    await settle();
+    expect(failures).toEqual([]);
+    // And the freed slot is real.
+    expect(
+      adapter.injectMessage("what is 3+3", { messageId: "m2", requester: "claude", text: "q2" }),
+    ).toBe(true);
+  });
+
   test("an abandoned turn that did start does not claim the human's next one", async () => {
     // The marker matched, so this injection owned *its* turn — and then
     // its deadline passed with no answer. Ownership was a fact about

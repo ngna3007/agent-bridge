@@ -493,6 +493,36 @@ export class GrokAdapter extends EventEmitter {
     return injection.ownsTurn && injection.verdictSeen && (this.turnActive || this.chunks.length > 0);
   }
 
+  /**
+   * Re-decide what happens to the outstanding injection, after anything
+   * that changes what is known about it.
+   *
+   * The two facts that account for an injected turn — the leader's
+   * verdict, and its prose reaching the bus — arrive on different
+   * sockets in either order, and each used to be checked only where it
+   * happened to be set. So a verdict that landed first checked for prose
+   * and found none, the human's next prompt then flushed that prose, and
+   * nothing asked the question again: the turn was fully accounted for
+   * and the slot sat held until the deadline reported an `unknown` that
+   * was not true.
+   *
+   * Both mutations now end here, and this is the only place that decides
+   * a non-abandoned injection is finished.
+   */
+  private reconcileInjection(): void {
+    const injection = this.activeInjection;
+    if (!injection) return;
+    if (injection.verdictSeen && injection.proseEmitted && !injection.abandoned) {
+      this.endInjection();
+      return;
+    }
+    // Not accounted for yet: the other half may still be crossing the
+    // other socket — including for an abandoned injection, whose slot
+    // its verdict is the evidence to release. How long that is worth
+    // waiting for is the scheduler's question.
+    this.armInjectionTimer();
+  }
+
   /** The outstanding injected turn either settled or ran out of time. */
   private onInjectionTimer(): void {
     const injection = this.activeInjection;
@@ -517,8 +547,12 @@ export class GrokAdapter extends EventEmitter {
       return;
     }
     if (this.canSettle(injection)) {
+      // No `endInjection` here: the flush emits the prose, which
+      // reconciles, which ends this injection and frees the slot — and
+      // the daemon fills that slot synchronously on the capacity event.
+      // Ending again after the flush would end the *next* injection,
+      // moments after it was written.
       this.flush(injection.reason || "the injected turn settled");
-      this.endInjection();
       return;
     }
     if (Date.now() >= injection.deadline) {
@@ -841,18 +875,7 @@ export class GrokAdapter extends EventEmitter {
 
     injection.verdictSeen = true;
     injection.reason = "the leader answered our injected prompt";
-    // The prose may already have gone to the bus — the human's next
-    // prompt can end this turn before its verdict crosses the other
-    // socket. Nothing is left to wait for in that case.
-    if (injection.proseEmitted && !injection.abandoned) {
-      this.endInjection();
-      return;
-    }
-    // Otherwise the answer may still be crossing the other socket —
-    // including for an abandoned injection, whose slot this verdict is
-    // the evidence to release. `armInjectionTimer` decides how long that
-    // is worth waiting for.
-    this.armInjectionTimer();
+    this.reconcileInjection();
   }
 
   /**
@@ -1010,6 +1033,10 @@ export class GrokAdapter extends EventEmitter {
       this.emit("agentMessage", { senderRef, content, respondingTo } satisfies GrokProseIngress);
     }
     this.emit("turnCompleted");
+    // Emitted after the buffer is clear and the message is out, so the
+    // injection this flush may have just completed is released against
+    // settled state rather than half-reset state.
+    this.reconcileInjection();
   }
 
   private log(msg: string): void {
