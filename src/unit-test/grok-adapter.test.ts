@@ -593,6 +593,20 @@ describe("GrokAdapter injection", () => {
     ).toBe(true);
   });
 
+  test("a stopped adapter refuses to inject", () => {
+    // `injectMessage` and `injectionCapacity` answer the same question,
+    // so they ask it in the same place. `stopped` is a clause of that
+    // question the call site used not to have at all.
+    const { adapter, tui, leader } = harness();
+    tuiPrompts(tui, 1);
+    leader.deliverAcp({ jsonrpc: "2.0", id: 1, result: {} });
+    adapter.stop();
+
+    expect(
+      adapter.injectMessage("what is 2+2", { messageId: "m1", requester: "claude", text: "q" }),
+    ).toBe(false);
+  });
+
   test("a TUI teardown frees a slot without offering it", () => {
     // The daemon injects synchronously on `injectionCapacity`, so the
     // event has to mean "there is somewhere to put the next prompt".
