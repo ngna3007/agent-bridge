@@ -16,7 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Grok gains a proxy transport of the same shape as Codex's, and message
 delivery stops being a per-transport improvisation.
 
-> Grok's proxy is verified against unit and Tier-2 harnesses only. The
+> The proxy has unit coverage. Separate Tier-2 harnesses verify leader
+> attachment and non-Claude bus delivery, but neither drives the proxy
+> itself, so the full proxy path is unverified. In particular, the
 > end-to-end path through a real Grok leader is not yet verified — the
 > account's API balance is exhausted (HTTP 402) — so marker survival on
 > the real leader remains an open item rather than a shipped guarantee.
