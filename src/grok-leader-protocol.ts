@@ -60,10 +60,16 @@ export function encodeAcpFrame(message: unknown): Buffer {
  * emitting a payload shape we cannot read should cost us that message,
  * not the connection carrying the human's session.
  */
-export function readAcpFrame(frame: LeaderFrame): unknown | null {
-  if (frame.type !== "acp" || typeof frame.payload !== "string") return null;
+export function readAcpFrame(frame: unknown): unknown | null {
+  // `unknown`, not `LeaderFrame`: the argument comes from `JSON.parse`
+  // of whatever the peer sent, and `null`, `7`, and `[]` are all valid
+  // JSON. Asserting the shape at the parse site would only move the
+  // property access onto a value that still is not a record.
+  if (typeof frame !== "object" || frame === null) return null;
+  const { type, payload } = frame as LeaderFrame;
+  if (type !== "acp" || typeof payload !== "string") return null;
   try {
-    return JSON.parse(frame.payload);
+    return JSON.parse(payload);
   } catch {
     return null;
   }

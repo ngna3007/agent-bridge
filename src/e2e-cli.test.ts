@@ -437,8 +437,7 @@ describe("E2E: CLI surface", () => {
     // slot is the bug this replaced.
     await withHarness(async (harness) => {
       const result = await harness.runCli(["grok", "--model", "grok-code"]);
-
-      expect(result.code).toBe(0);
+            expect(result.code).toBe(0);
 
       const invocations = harness.readShimCalls("grok");
       expect(invocations.length).toBe(1);
@@ -452,19 +451,37 @@ describe("E2E: CLI surface", () => {
     });
   });
 
-  test("agentbridge grok leaves a caller-chosen leader socket alone", async () => {
-    // The one flag that decides which backend the TUI talks to. Silently
-    // rewriting it would make the command a lie.
+  test("agentbridge grok refuses a caller-chosen leader socket", async () => {
+    // Honouring it would produce a Grok with no bridge behind it, and the
+    // failure would be silent — no turn boundaries, no messages, no
+    // injection, and nothing on screen to say so. Overriding it would
+    // make the flag a lie. Neither: refuse, and launch nothing.
     await withHarness(async (harness) => {
       const result = await harness.runCli(["grok", "--leader-socket", "/tmp/mine.sock"]);
 
-      expect(result.code).toBe(0);
-      expect(harness.readShimCalls("grok")[0]?.args).toEqual([
-        "--leader-socket",
-        "/tmp/mine.sock",
-      ]);
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("--leader-socket is owned by AgentBridge");
+      expect(harness.readShimCalls("grok")).toEqual([]);
     });
   });
+
+  test("agentbridge grok refuses to launch when the daemon owns no proxy socket", async () => {
+    // A daemon that predates the proxy — or whose `listen` failed — is
+    // healthy and answers `/readyz`, so `ensureRunning` is satisfied while
+    // nothing is bound. Launching Grok at that path hangs it on connect
+    // with no explanation, so the launcher checks and says what to do.
+    await withHarness(async (harness) => {
+      await harness.startManagedFakeDaemon();
+      rmSync(join(harness.stateDir, "grok.sock"), { force: true });
+
+      const result = await harness.runCli(["grok"]);
+
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("the bridge is not listening on");
+      expect(harness.readShimCalls("grok")).toEqual([]);
+    });
+    // The launcher waits out its full socket grace period before giving up.
+  }, 20_000);
 
   test("agentbridge grok clears the killed sentinel before launching", async () => {
     await withHarness(async (harness) => {
@@ -937,6 +954,11 @@ if (!stateDir || !launchLog) {
 const pidFile = join(stateDir, "daemon.pid");
 const statusFile = join(stateDir, "status.json");
 const killedFile = join(stateDir, "killed");
+// The real daemon owns the Grok proxy socket, and \`abg grok\` refuses to
+// launch until it exists — a daemon predating the proxy is healthy
+// without one, and pointing Grok at a socket nobody is listening on just
+// hangs. The stand-in has to honour the same contract.
+const grokSocket = join(stateDir, "grok.sock");
 const proxyUrl = \`ws://127.0.0.1:\${proxyPort}\`;
 const appServerUrl = \`ws://127.0.0.1:\${appPort}\`;
 
@@ -952,6 +974,12 @@ if (delayMs > 0) {
 }
 
 writeFileSync(pidFile, \`\${process.pid}\\n\`, "utf-8");
+
+try { unlinkSync(grokSocket); } catch {}
+const grokProxy = Bun.listen({
+  unix: grokSocket,
+  socket: { data() {}, open() {}, close() {} },
+});
 
 function currentStatus() {
   return {
@@ -980,6 +1008,8 @@ function cleanupFiles() {
   cleanedUp = true;
   try { unlinkSync(pidFile); } catch {}
   try { unlinkSync(statusFile); } catch {}
+  try { grokProxy.stop(true); } catch {}
+  try { unlinkSync(grokSocket); } catch {}
 }
 
 const server = Bun.serve({

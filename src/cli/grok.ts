@@ -1,6 +1,17 @@
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { DaemonLifecycle } from "../daemon-lifecycle";
 import { StateDirResolver } from "../state-dir";
+
+/** Poll for the daemon's proxy socket. Returns false once `timeoutMs` is up. */
+async function waitForSocket(path: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (existsSync(path)) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
 
 /**
  * Start Grok Build attached to this project's bridge.
@@ -45,14 +56,33 @@ export async function runGrok(args: string[]) {
   // be up *before* the TUI tries to connect — not merely eventually.
   await lifecycle.ensureRunning();
 
-  // A caller-supplied --leader-socket wins. Overriding it would be the
-  // wrong call in both directions: it is the one flag that decides
-  // which backend this TUI talks to, and silently rewriting it makes
-  // `abg grok --leader-socket /some/path` a lie.
-  const hasOwnSocket = args.some(
-    (a) => a === "--leader-socket" || a.startsWith("--leader-socket="),
-  );
-  const leaderArgs = hasOwnSocket ? [] : ["--leader-socket", stateDir.grokLeaderSocket];
+  // `ensureRunning` is satisfied by a *healthy* daemon, and a daemon
+  // started before this feature existed — or one whose `listen` failed —
+  // is healthy without owning this socket. Grok would then connect to
+  // nothing and hang. Wait for the socket to appear, and if it does not,
+  // say what to do rather than handing the failure to the TUI.
+  if (!(await waitForSocket(stateDir.grokLeaderSocket, 5_000))) {
+    console.error(`Error: the bridge is not listening on ${stateDir.grokLeaderSocket}.`);
+    console.error("Run `abg kill` to restart the daemon, then try again.");
+    console.error("If it persists, check `abg doctor` and the daemon log.");
+    process.exit(1);
+  }
+
+  // `--leader-socket` is the one flag that decides which backend this
+  // TUI talks to, and pointing it anywhere but the daemon means the
+  // bridge sees nothing: no turn boundaries, no messages, no injection.
+  // Honouring it would produce a plain `grok` wearing an `abg` name —
+  // the failure would be silent and would look like the bridge being
+  // broken. Overriding it would make the flag a lie. So: refuse, and say
+  // which command does what.
+  if (args.some((a) => a === "--leader-socket" || a.startsWith("--leader-socket="))) {
+    console.error(
+      "Error: --leader-socket is owned by AgentBridge; `abg grok` points Grok at this project's bridge.",
+    );
+    console.error("Run `grok` directly to choose your own leader.");
+    process.exit(1);
+  }
+  const leaderArgs = ["--leader-socket", stateDir.grokLeaderSocket];
 
   // Grok loads Claude Code's plugin registry, so it spawns our MCP
   // server whether or not we want it to. `AGENTBRIDGE_ACTIVE` is the

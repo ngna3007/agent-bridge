@@ -29,6 +29,15 @@ import {
 export interface GrokProseIngress {
   senderRef: string;
   content: string;
+  /**
+   * The injected prompt this turn is an answer to, when it is one.
+   *
+   * Null for a turn the human started. Set, the daemon knows two things
+   * it cannot otherwise recover: who is owed this reply (so an untagged
+   * one goes back to the requester instead of being broadcast), and
+   * which `require_reply` it settles.
+   */
+  respondingTo: GrokInjectionCorrelation | null;
 }
 
 /** Why an injected turn did not run. */
@@ -128,7 +137,12 @@ export class GrokAdapter extends EventEmitter {
     this.socketPath = options.socketPath;
     this.upstreamPath = options.upstreamPath ?? defaultLeaderSocket();
     this.logFile = options.logFile ?? null;
-    this.makeServer = options.createServer ?? (() => listenUnix(this.socketPath));
+    this.makeServer =
+      options.createServer ??
+      (() =>
+        listenUnix(this.socketPath, (err) =>
+          this.log(`Cannot listen on ${this.socketPath}: ${describe(err)}`),
+        ));
     this.makeUpstream = options.createUpstream ?? (() => connectUnix(this.upstreamPath));
   }
 
@@ -393,6 +407,9 @@ export class GrokAdapter extends EventEmitter {
     conn.onClose(() => {
       if (this.injector === conn) this.injector = null;
       this.log("Injection connection to the leader closed");
+      this.failInflightInjections(
+        "the bridge's connection to the Grok leader closed before the prompt was answered",
+      );
     });
     try {
       conn.write(registerFrame("agentbridge (bus injector)"));
@@ -420,18 +437,53 @@ export class GrokAdapter extends EventEmitter {
    * Deliberately ignores `session/update` on this leg: the leader fans
    * the same updates to every client, and the proxy leg already
    * accumulates them. Reading both would double every message.
+   *
+   * Both outcomes are turn boundaries, and both have to be acted on. A
+   * refusal is a delivery the daemon already reported as sent. A success
+   * closes a turn the TUI never opened — the prompt came from here, so
+   * the TUI has no `session/prompt` of its own outstanding and nothing
+   * on the proxy leg will ever end this turn. Without the flush, an
+   * injected turn's answer sits in `chunks` until the human happens to
+   * type again.
    */
   private observeInjectorReply(acp: unknown): void {
     if (!isJsonRpcResponse(acp)) return;
     if (typeof acp.id !== "number" || !this.ourPrompts.has(acp.id)) return;
     this.ourPrompts.delete(acp.id);
-    const correlation = this.injectionCorrelations.get(acp.id);
+    const correlation = this.injectionCorrelations.get(acp.id) ?? null;
     this.injectionCorrelations.delete(acp.id);
-    if (!acp.error) return;
+    if (!acp.error) {
+      this.flush("the leader answered our injected prompt", correlation);
+      return;
+    }
     const reason = acp.error.message || "Grok refused the prompt";
     this.log(`Injection rejected: ${reason}`);
     if (correlation) {
       this.emit("injectionRejected", { ...correlation, reason } satisfies GrokInjectionRejection);
+    }
+  }
+
+  /**
+   * Fail every prompt still in flight when the injection connection dies.
+   *
+   * The transport self-acks (`acknowledgementMode: "none"`), so by the
+   * time a prompt is on this connection the mailbox copy is gone. A
+   * connection that closes mid-flight is therefore indistinguishable, to
+   * everything downstream, from a delivery that worked — the message is
+   * simply never mentioned again. Reporting each one as a rejection is
+   * what keeps that from being a silent loss.
+   */
+  private failInflightInjections(reason: string): void {
+    if (this.ourPrompts.size === 0) return;
+    this.log(`Failing ${this.ourPrompts.size} in-flight injection(s): ${reason}`);
+    const inflight = [...this.ourPrompts];
+    this.ourPrompts.clear();
+    for (const id of inflight) {
+      const correlation = this.injectionCorrelations.get(id);
+      this.injectionCorrelations.delete(id);
+      if (correlation) {
+        this.emit("injectionRejected", { ...correlation, reason } satisfies GrokInjectionRejection);
+      }
     }
   }
 
@@ -451,7 +503,7 @@ export class GrokAdapter extends EventEmitter {
     this.emit("turnStarted");
   }
 
-  private flush(reason: string): void {
+  private flush(reason: string, respondingTo: GrokInjectionCorrelation | null = null): void {
     if (!this.turnActive && this.chunks.length === 0) return;
     const content = this.chunks.join("");
     const senderRef = `${this.sessionIdValue ?? "grok"}#${this.turnSeq}`;
@@ -459,7 +511,7 @@ export class GrokAdapter extends EventEmitter {
     this.turnActive = false;
     if (content.trim()) {
       this.log(`Grok message completed (${content.length} chars, ${reason})`);
-      this.emit("agentMessage", { senderRef, content } satisfies GrokProseIngress);
+      this.emit("agentMessage", { senderRef, content, respondingTo } satisfies GrokProseIngress);
     }
     this.emit("turnCompleted");
   }
@@ -515,7 +567,7 @@ function connectUnix(path: string): LeaderConnection {
  * daemon owns: a *live* daemon holds the control port, and the caller
  * has already lost that race by the time it gets here.
  */
-function listenUnix(path: string): ProxyServer {
+function listenUnix(path: string, onError: (err: unknown) => void): ProxyServer {
   if (existsSync(path)) {
     try {
       unlinkSync(path);
@@ -525,7 +577,11 @@ function listenUnix(path: string): ProxyServer {
   }
   const server: Server = createServer();
   server.listen(path);
-  server.on("error", () => {});
+  // `listen` fails asynchronously, so `start`'s try/catch cannot see it.
+  // Swallowing it here left the daemon believing it was proxying Grok
+  // while nothing was bound — and the only symptom was `abg grok`
+  // hanging on connect. The error has to reach the log.
+  server.on("error", onError);
   return {
     onConnection(cb) {
       server.on("connection", (socket: Socket) => cb(wrapSocket(socket)));

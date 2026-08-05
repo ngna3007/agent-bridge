@@ -436,6 +436,77 @@ describe("GrokAdapter injection", () => {
     expect(rejections).toHaveLength(0);
   });
 
+  test("an injected turn's answer is flushed when the leader answers our prompt", () => {
+    // Nothing on the proxy leg can end this turn: the prompt came from
+    // here, so the TUI has no `session/prompt` of its own outstanding.
+    // Without this boundary the answer sits buffered until the human
+    // happens to type again — which may be never.
+    const { adapter, tui, upstreams, leader } = harness();
+    tuiPrompts(tui, 1);
+    leader.deliverAcp({ jsonrpc: "2.0", id: 1, result: {} });
+
+    const seen: GrokProseIngress[] = [];
+    adapter.on("agentMessage", (m: GrokProseIngress) => seen.push(m));
+    adapter.injectMessage("what is 2+2", { messageId: "m1", requester: "claude", text: "q" });
+
+    const injector = upstreams[1]!;
+    const promptId = injector.acpSent().find((m) => m.method === "session/prompt").id;
+    chunk(leader, "four");
+    expect(seen).toHaveLength(0);
+
+    injector.deliverAcp({ jsonrpc: "2.0", id: promptId, result: { stopReason: "end_turn" } });
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.content).toBe("four");
+    // And it says whose turn it was, so the daemon can route the answer
+    // back to the requester instead of broadcasting it.
+    expect(seen[0]?.respondingTo).toEqual({ messageId: "m1", requester: "claude", text: "q" });
+  });
+
+  test("a turn the human started is not attributed to anyone", () => {
+    const { adapter, tui, leader } = harness();
+    const seen: GrokProseIngress[] = [];
+    adapter.on("agentMessage", (m: GrokProseIngress) => seen.push(m));
+
+    tuiPrompts(tui, 1);
+    chunk(leader, "thinking out loud");
+    leader.deliverAcp({ jsonrpc: "2.0", id: 1, result: {} });
+
+    expect(seen[0]?.respondingTo).toBeNull();
+  });
+
+  test("a lost injection connection fails its in-flight prompts", () => {
+    // The transport self-acks, so the mailbox copy is already gone by the
+    // time the prompt is on the wire. A connection that dies mid-flight
+    // would otherwise be indistinguishable from a delivery that worked.
+    const { adapter, tui, upstreams } = harness();
+    tuiPrompts(tui, 1);
+    const rejections: any[] = [];
+    adapter.on("injectionRejected", (r) => rejections.push(r));
+
+    adapter.injectMessage("hi", { messageId: "m1", requester: "claude", text: "hi" });
+    upstreams[1]!.hangUp();
+
+    expect(rejections).toHaveLength(1);
+    expect(rejections[0].messageId).toBe("m1");
+    expect(rejections[0].reason).toContain("closed before the prompt was answered");
+  });
+
+  test("a close after the answer arrived fails nothing", () => {
+    const { adapter, tui, upstreams } = harness();
+    tuiPrompts(tui, 1);
+    const rejections: any[] = [];
+    adapter.on("injectionRejected", (r) => rejections.push(r));
+
+    adapter.injectMessage("hi", { messageId: "m1", requester: "claude", text: "hi" });
+    const injector = upstreams[1]!;
+    const promptId = injector.acpSent().find((m) => m.method === "session/prompt").id;
+    injector.deliverAcp({ jsonrpc: "2.0", id: promptId, result: { stopReason: "end_turn" } });
+    injector.hangUp();
+
+    expect(rejections).toHaveLength(0);
+  });
+
   test("does not double-count updates that arrive on both connections", () => {
     const { adapter, tui, upstreams, leader } = harness();
     tuiPrompts(tui, 1);

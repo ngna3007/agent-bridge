@@ -1509,10 +1509,13 @@ function encodeAcpFrame(message) {
   return encodeLeaderFrame({ type: "acp", payload: JSON.stringify(message) });
 }
 function readAcpFrame(frame) {
-  if (frame.type !== "acp" || typeof frame.payload !== "string")
+  if (typeof frame !== "object" || frame === null)
+    return null;
+  const { type, payload } = frame;
+  if (type !== "acp" || typeof payload !== "string")
     return null;
   try {
-    return JSON.parse(frame.payload);
+    return JSON.parse(payload);
   } catch {
     return null;
   }
@@ -1580,7 +1583,7 @@ class GrokAdapter extends EventEmitter2 {
     this.socketPath = options.socketPath;
     this.upstreamPath = options.upstreamPath ?? defaultLeaderSocket();
     this.logFile = options.logFile ?? null;
-    this.makeServer = options.createServer ?? (() => listenUnix(this.socketPath));
+    this.makeServer = options.createServer ?? (() => listenUnix(this.socketPath, (err) => this.log(`Cannot listen on ${this.socketPath}: ${describe(err)}`)));
     this.makeUpstream = options.createUpstream ?? (() => connectUnix(this.upstreamPath));
   }
   get proxySocketPath() {
@@ -1764,6 +1767,7 @@ class GrokAdapter extends EventEmitter2 {
       if (this.injector === conn)
         this.injector = null;
       this.log("Injection connection to the leader closed");
+      this.failInflightInjections("the bridge's connection to the Grok leader closed before the prompt was answered");
     });
     try {
       conn.write(registerFrame("agentbridge (bus injector)"));
@@ -1790,14 +1794,30 @@ class GrokAdapter extends EventEmitter2 {
     if (typeof acp.id !== "number" || !this.ourPrompts.has(acp.id))
       return;
     this.ourPrompts.delete(acp.id);
-    const correlation = this.injectionCorrelations.get(acp.id);
+    const correlation = this.injectionCorrelations.get(acp.id) ?? null;
     this.injectionCorrelations.delete(acp.id);
-    if (!acp.error)
+    if (!acp.error) {
+      this.flush("the leader answered our injected prompt", correlation);
       return;
+    }
     const reason = acp.error.message || "Grok refused the prompt";
     this.log(`Injection rejected: ${reason}`);
     if (correlation) {
       this.emit("injectionRejected", { ...correlation, reason });
+    }
+  }
+  failInflightInjections(reason) {
+    if (this.ourPrompts.size === 0)
+      return;
+    this.log(`Failing ${this.ourPrompts.size} in-flight injection(s): ${reason}`);
+    const inflight = [...this.ourPrompts];
+    this.ourPrompts.clear();
+    for (const id of inflight) {
+      const correlation = this.injectionCorrelations.get(id);
+      this.injectionCorrelations.delete(id);
+      if (correlation) {
+        this.emit("injectionRejected", { ...correlation, reason });
+      }
     }
   }
   bindSession(sessionId) {
@@ -1814,7 +1834,7 @@ class GrokAdapter extends EventEmitter2 {
     this.turnSeq += 1;
     this.emit("turnStarted");
   }
-  flush(reason) {
+  flush(reason, respondingTo = null) {
     if (!this.turnActive && this.chunks.length === 0)
       return;
     const content = this.chunks.join("");
@@ -1823,7 +1843,7 @@ class GrokAdapter extends EventEmitter2 {
     this.turnActive = false;
     if (content.trim()) {
       this.log(`Grok message completed (${content.length} chars, ${reason})`);
-      this.emit("agentMessage", { senderRef, content });
+      this.emit("agentMessage", { senderRef, content, respondingTo });
     }
     this.emit("turnCompleted");
   }
@@ -1864,7 +1884,7 @@ function wrapSocket(socket) {
 function connectUnix(path) {
   return wrapSocket(connect(path));
 }
-function listenUnix(path) {
+function listenUnix(path, onError) {
   if (existsSync2(path)) {
     try {
       unlinkSync2(path);
@@ -1872,7 +1892,7 @@ function listenUnix(path) {
   }
   const server = createServer();
   server.listen(path);
-  server.on("error", () => {});
+  server.on("error", onError);
   return {
     onConnection(cb) {
       server.on("connection", (socket) => cb(wrapSocket(socket)));
@@ -1971,6 +1991,9 @@ function isAgentId(v) {
 }
 function parseAgentId(v) {
   return isAgentId(v) ? v : null;
+}
+function agentLabel(agent) {
+  return { claude: "Claude", grok: "Grok", codex: "Codex" }[agent];
 }
 
 // src/message-filter.ts
@@ -3145,10 +3168,12 @@ class PendingRequests {
   add(req) {
     this.requests.push(req);
   }
-  satisfy(inReplyTo, recipients) {
+  satisfy(inReplyTo, recipients, responder) {
     const satisfied = [];
     for (let i = this.requests.length - 1;i >= 0; i--) {
       const req = this.requests[i];
+      if (req.responder !== responder)
+        continue;
       const named = inReplyTo !== undefined && inReplyTo === req.messageId;
       const routed = recipients.includes(req.requester);
       if (!named && !routed)
@@ -3510,16 +3535,25 @@ registerTransport2("grok", {
   payloadMode: "content",
   acknowledgementMode: "none",
   wake: (message) => {
+    const requireReply = requireReplyIds.delete(message.id);
     const requester = isAgentId(message.from) ? message.from : "system";
-    const accepted = grok.injectMessage(message.content, {
+    const content = requireReply ? message.content + REPLY_REQUIRED_INSTRUCTION : message.content;
+    const accepted = grok.injectMessage(content, {
       messageId: message.id,
       requester,
       text: message.content
     });
     if (!accepted)
       throw new Error("Grok has no live session to inject into");
-    if (isAgentId(message.from))
-      activeRequester.set("grok", message.from);
+    if (requireReply && isAgentId(message.from)) {
+      pendingRequests.add({
+        requester: message.from,
+        responder: "grok",
+        messageId: message.id,
+        at: Date.now()
+      });
+      log(`Reply required from Grok for ${message.id} (requester: ${message.from})`);
+    }
   }
 });
 function drainGrokBacklog(why) {
@@ -3627,32 +3661,32 @@ function flushPendingCodexNotices() {
   pendingCodexNotices.length = 0;
   droppedCodexNotices = 0;
 }
-codex.on("agentMessage", (msg) => {
-  handleCodexMessage(msg).catch((err) => {
-    log(`agentMessage handler failed for ${msg.senderRef}: ${describeError2(err)}`);
-  });
-});
-async function handleCodexMessage(msg) {
+async function handleProxiedMessage(msg) {
+  const { agent, tell } = msg;
+  const label = agentLabel(agent);
+  if (msg.respondingTo && isAgentId(msg.respondingTo.requester)) {
+    activeRequester.set(agent, msg.respondingTo.requester);
+  }
   let result;
   try {
     result = classifyMessage(msg.content, FILTER_MODE);
   } catch (err) {
-    tellCodex(describeError2(err));
+    tell(describeError2(err));
     return;
   }
   let envelope;
   try {
-    envelope = normalizeProse(msg.content, { agent: "codex", protocolVersion: PROTOCOL_VERSION }, { id: nextMessageId(), now: Date.now(), senderRef: msg.senderRef });
+    envelope = normalizeProse(msg.content, { agent, protocolVersion: PROTOCOL_VERSION }, { id: nextMessageId(), now: Date.now(), senderRef: msg.senderRef });
   } catch (err) {
-    tellCodex(describeError2(err));
+    tell(describeError2(err));
     return;
   }
   if (FILTER_MODE !== "full" && inAttentionWindow && result.marker === "status") {
-    log(`Codex \u2192 Claude [${result.marker}/buffer-attention] (${msg.content.length} chars)`);
+    log(`${label} \u2192 bus [${result.marker}/buffer-attention] (${msg.content.length} chars)`);
     statusBuffer.add(envelope);
     return;
   }
-  log(`Codex \u2192 Claude [${result.marker}/${result.action}] (${msg.content.length} chars)`);
+  log(`${label} \u2192 bus [${result.marker}/${result.action}] (${msg.content.length} chars)`);
   if (result.action === "buffer") {
     statusBuffer.add(envelope);
     return;
@@ -3663,24 +3697,38 @@ async function handleCodexMessage(msg) {
   const outcome = await routeThroughBus2(envelope);
   const text = senderFacingText(outcome);
   if (text !== null)
-    tellCodex(text);
+    tell(text);
   if (outcome.status === "failed")
     return;
   if (result.marker === "reply") {
-    pendingRequests.satisfy(envelope.inReplyTo, outcome.accepted);
+    pendingRequests.satisfy(envelope.inReplyTo ?? msg.respondingTo?.messageId, outcome.accepted, agent);
     startAttentionWindow();
   }
 }
-function endCodexTurn(why) {
-  if (!activeRequester.has("codex"))
+function receiveProxiedMessage(msg) {
+  handleProxiedMessage(msg).catch((err) => {
+    log(`${msg.agent} agentMessage handler failed for ${msg.senderRef}: ${describeError2(err)}`);
+  });
+}
+codex.on("agentMessage", (msg) => {
+  receiveProxiedMessage({
+    agent: "codex",
+    senderRef: msg.senderRef,
+    content: msg.content,
+    respondingTo: null,
+    tell: tellCodex
+  });
+});
+function endAgentTurn(agent, why) {
+  if (!activeRequester.has(agent))
     return;
-  log(`Clearing Codex's turn-scoped requester: ${why}`);
-  activeRequester.delete("codex");
+  log(`Clearing ${agentLabel(agent)}'s turn-scoped requester: ${why}`);
+  activeRequester.delete(agent);
 }
 codex.on("turnCompleted", () => {
   log("Codex turn completed");
   statusBuffer.flush("turn completed");
-  endCodexTurn("the turn completed");
+  endAgentTurn("codex", "the turn completed");
   notifyFrontends((to) => systemMessage("system_turn_completed", "\u2705 Codex finished the current turn. You can reply now if needed.", to));
   startAttentionWindow();
   if (claudeSocket() && shouldNotifyCodexClaudeOnline()) {
@@ -3714,30 +3762,44 @@ codex.on("error", (err) => {
   log(`Codex error: ${err.message}`);
 });
 codex.on("turnAborted", (why) => {
-  endCodexTurn(why);
+  endAgentTurn("codex", why);
 });
-codex.on("injectionRejected", ({ correlation, error }) => {
-  log(`Codex refused the turn for ${correlation.id}: ${error}`);
-  endCodexTurn("Codex refused the turn");
-  if (pendingRequests.cancel(correlation.id)) {
-    log(`Cancelled the pending reply request for refused message ${correlation.id}`);
+function reportInjectionRejected(rejection) {
+  const { agent, messageId, unit, reason } = rejection;
+  const label = agentLabel(agent);
+  log(`${label} refused the ${unit} for ${messageId}: ${reason}`);
+  endAgentTurn(agent, `${label} refused the ${unit}`);
+  if (pendingRequests.cancel(messageId)) {
+    log(`Cancelled the pending reply request for refused message ${messageId}`);
   }
-  lastPinnedContractThreadId = null;
-  const notice = (to) => noticeMessage("turn_start_rejected", `\u26A0\uFE0F Codex refused the turn carrying your message \u2014 it was not delivered and Codex never saw it. ` + `The app-server said: ${error}
+  const notice = (to) => noticeMessage(rejection.kind, `\u26A0\uFE0F ${label} refused the ${unit} carrying your message \u2014 it was not delivered and ${label} never saw it. ` + `The ${rejection.backend} said: ${reason}
 
 Undelivered message:
-${truncateForNotice(correlation.text)}`, to);
-  const requester = isAgentId(correlation.requester) ? correlation.requester : null;
-  if (requester)
-    routeOrLog(notice(requester));
+${truncateForNotice(rejection.text)}`, to);
+  const sender = isAgentId(rejection.requester) ? rejection.requester : null;
+  if (sender)
+    routeOrLog(notice(sender));
   else
     emitToFrontends(notice);
+}
+codex.on("injectionRejected", ({ correlation, error }) => {
+  lastPinnedContractThreadId = null;
+  reportInjectionRejected({
+    agent: "codex",
+    kind: "turn_start_rejected",
+    unit: "turn",
+    backend: "app-server",
+    messageId: correlation.id,
+    requester: correlation.requester,
+    text: correlation.text,
+    reason: error
+  });
 });
 codex.on("exit", (code) => {
   log(`Codex process exited (code ${code})`);
   codexBootstrapped = false;
   statusBuffer.flush("codex exited");
-  endCodexTurn("the Codex app-server exited");
+  endAgentTurn("codex", "the Codex app-server exited");
   tuiConnectionState.handleCodexExit();
   clearPendingClaudeDisconnect("Codex process exited");
   claudeOnlineNoticeSent = false;
@@ -3753,50 +3815,14 @@ function tellGrok(text) {
   }
 }
 grok.on("agentMessage", (msg) => {
-  handleGrokMessage(msg).catch((err) => {
-    log(`Grok agentMessage handler failed for ${msg.senderRef}: ${describeError2(err)}`);
+  receiveProxiedMessage({
+    agent: "grok",
+    senderRef: msg.senderRef,
+    content: msg.content,
+    respondingTo: msg.respondingTo,
+    tell: tellGrok
   });
 });
-async function handleGrokMessage(msg) {
-  let result;
-  try {
-    result = classifyMessage(msg.content, FILTER_MODE);
-  } catch (err) {
-    tellGrok(describeError2(err));
-    return;
-  }
-  let envelope;
-  try {
-    envelope = normalizeProse(msg.content, { agent: "grok", protocolVersion: PROTOCOL_VERSION }, { id: nextMessageId(), now: Date.now(), senderRef: msg.senderRef });
-  } catch (err) {
-    tellGrok(describeError2(err));
-    return;
-  }
-  log(`Grok \u2192 bus [${result.marker}/${result.action}] (${msg.content.length} chars)`);
-  if (result.action === "buffer") {
-    statusBuffer.add(envelope);
-    return;
-  }
-  if (result.marker === "reply" && statusBuffer.size > 0) {
-    statusBuffer.flush("reply message arrived");
-  }
-  const outcome = await routeThroughBus2(envelope);
-  const text = senderFacingText(outcome);
-  if (text !== null)
-    tellGrok(text);
-  if (outcome.status === "failed")
-    return;
-  if (result.marker === "reply") {
-    pendingRequests.satisfy(envelope.inReplyTo, outcome.accepted);
-    startAttentionWindow();
-  }
-}
-function endGrokTurn(why) {
-  if (!activeRequester.has("grok"))
-    return;
-  log(`Clearing Grok's turn-scoped requester: ${why}`);
-  activeRequester.delete("grok");
-}
 grok.on("sessionAttached", (sessionId) => {
   log(`Grok session attached: ${sessionId}`);
   grokEverAttached = true;
@@ -3805,28 +3831,30 @@ grok.on("sessionAttached", (sessionId) => {
 });
 grok.on("turnCompleted", () => {
   log("Grok turn completed");
-  endGrokTurn("the turn completed");
+  endAgentTurn("grok", "the turn completed");
+});
+grok.on("tuiConnected", () => {
+  log("Grok TUI connected through the proxy");
+  cancelIdleShutdown();
+  broadcastStatus();
 });
 grok.on("tuiDisconnected", () => {
   log("Grok TUI disconnected");
-  endGrokTurn("the Grok TUI disconnected");
+  endAgentTurn("grok", "the Grok TUI disconnected");
+  scheduleIdleShutdown();
   broadcastStatus();
 });
 grok.on("injectionRejected", ({ messageId, requester, text, reason }) => {
-  log(`Grok refused the prompt for ${messageId}: ${reason}`);
-  endGrokTurn("Grok refused the prompt");
-  if (pendingRequests.cancel(messageId)) {
-    log(`Cancelled the pending reply request for refused message ${messageId}`);
-  }
-  const notice = (to) => noticeMessage("grok_prompt_rejected", `\u26A0\uFE0F Grok refused the prompt carrying your message \u2014 it was not delivered and Grok never saw it. ` + `The leader said: ${reason}
-
-Undelivered message:
-${truncateForNotice(text)}`, to);
-  const sender = isAgentId(requester) ? requester : null;
-  if (sender)
-    routeOrLog(notice(sender));
-  else
-    emitToFrontends(notice);
+  reportInjectionRejected({
+    agent: "grok",
+    kind: "grok_prompt_rejected",
+    unit: "prompt",
+    backend: "leader",
+    messageId,
+    requester,
+    text,
+    reason
+  });
 });
 function startControlServer() {
   controlServer = Bun.serve({
@@ -4032,7 +4060,7 @@ function deliverToCodex(content, requireReply, requester, messageId) {
     log(`Pinned BRIDGE_CONTRACT_REMINDER for thread ${activeThreadId.slice(0, 8)}; subsequent msgs skip the reminder`);
   }
   if (requireReply && requester) {
-    pendingRequests.add({ requester, messageId, at: Date.now() });
+    pendingRequests.add({ requester, responder: "codex", messageId, at: Date.now() });
     log(`Reply required from Codex for ${messageId} (requester: ${requester})`);
   }
   if (requester)
@@ -4209,19 +4237,19 @@ function checkExpiredRequests() {
   const expired = pendingRequests.expire(Date.now(), PENDING_REQUEST_TTL_MS);
   for (const req of expired) {
     log(`Reply required for ${req.messageId} expired after ${PENDING_REQUEST_TTL_MS}ms without a reply (requester: ${req.requester})`);
-    routeOrLog(noticeMessage("reply_missing", "\u26A0\uFE0F Codex did not send a reply before the reply-required window expired. You may want to retry or rephrase.", req.requester));
+    routeOrLog(noticeMessage("reply_missing", `\u26A0\uFE0F ${agentLabel(req.responder)} did not send a reply before the reply-required window expired. You may want to retry or rephrase.`, req.requester));
   }
+}
+function hasLiveClients() {
+  return frontends.size > 0 || tuiConnectionState.snapshot().tuiConnected || grok.tuiConnected;
 }
 function scheduleIdleShutdown() {
   cancelIdleShutdown();
-  if (frontends.size > 0)
-    return;
-  const snapshot = tuiConnectionState.snapshot();
-  if (snapshot.tuiConnected)
+  if (hasLiveClients())
     return;
   log(`No clients connected. Daemon will shut down in ${IDLE_SHUTDOWN_MS}ms if no one reconnects.`);
   idleShutdownTimer = setTimeout(() => {
-    if (frontends.size > 0 || tuiConnectionState.snapshot().tuiConnected) {
+    if (hasLiveClients()) {
       log("Idle shutdown cancelled: client reconnected during grace period");
       return;
     }
