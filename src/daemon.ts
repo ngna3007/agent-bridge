@@ -415,13 +415,22 @@ registerTransport(
  * the mailbox is the whole point — and this is the only thing that
  * hands them over.
  */
-function drainGrokBacklog(why: string): void {
-  const batch = mailboxFor("grok").drain(Date.now());
+async function drainGrokBacklog(why: string): Promise<void> {
+  const box = mailboxFor("grok");
+  const batch = box.drain(Date.now());
   if (batch.messages.length === 0) return;
   log(`Delivering ${batch.messages.length} held message(s) to Grok (${why})`);
+  // Grok takes one injected turn at a time, so a batch of held messages
+  // is mostly refusals: the first goes out, the rest throw. A refused
+  // entry has to be handed straight back — the drain leased it, and a
+  // lease outlives the refusal by `LEASE_TIMEOUT_MS`, so the retry this
+  // function exists to be would find nothing to retry. `injectionCapacity`
+  // calls it again the moment the slot frees.
+  const refused: string[] = [];
   for (const message of batch.messages) {
-    void transports.wake("grok", message, log);
+    if ((await transports.wake("grok", message, log)) === "failed") refused.push(message.id);
   }
+  if (refused.length > 0) box.nack(batch.batchId, refused);
 }
 
 /**
@@ -1042,8 +1051,16 @@ grok.on("agentMessage", (msg: GrokProseIngress) => {
 grok.on("sessionAttached", (sessionId: string) => {
   log(`Grok session attached: ${sessionId}`);
   grokEverAttached = true;
-  drainGrokBacklog("a Grok session became available");
+  void drainGrokBacklog("a Grok session became available");
   broadcastStatus();
+});
+
+// The adapter refuses an injection while one is outstanding, so the
+// message stays in the mailbox. This is the signal that it can go now —
+// without it the retry waits on a lease expiry, and a connected Grok can
+// leave a message held indefinitely.
+grok.on("injectionCapacity", () => {
+  void drainGrokBacklog("Grok can take another injected turn");
 });
 
 grok.on("turnCompleted", () => {
@@ -1315,20 +1332,6 @@ async function sendFromFrontend(
       requestId,
       success: false,
       error: describeError(err),
-    });
-    return;
-  }
-
-  // The other half of the `require_reply` contract; the bus enforces the
-  // recipient count. Only `reply` refuses a full mailbox — every other
-  // kind sheds under pressure and still reports `accepted`, which would
-  // leave an obligation recorded for a message that no longer exists.
-  if (requireReply && envelope.kind !== "reply") {
-    sendProtocolMessage(ws, {
-      type: "claude_to_codex_result",
-      requestId,
-      success: false,
-      error: `require_reply is only available on reply-kind messages; ${envelope.id} is ${envelope.kind}. A ${envelope.kind} may be shed when a mailbox fills, which would leave the reply owed by nobody.`,
     });
     return;
   }

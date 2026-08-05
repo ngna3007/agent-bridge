@@ -1561,8 +1561,7 @@ class LeaderFramer {
 
 // src/grok-adapter.ts
 var INJECTED_TURN_SETTLE_MS = 250;
-var ORPHANED_INJECTION_WINDOW_MS = 60000;
-var MAX_QUEUED_INJECTIONS = 32;
+var INJECTED_TURN_DEADLINE_MS = 60000;
 
 class GrokAdapter extends EventEmitter2 {
   server = null;
@@ -1576,14 +1575,13 @@ class GrokAdapter extends EventEmitter2 {
   nextRequestId = 1;
   injectionCorrelations = new Map;
   ourPrompts = new Set;
-  injectedCompletion = null;
-  injectionQueue = [];
+  activeInjection = null;
   stopped = false;
   listening = false;
   socketPath;
   upstreamPath;
   settleMs;
-  orphanWindowMs;
+  deadlineMs;
   logFile;
   makeServer;
   makeUpstream;
@@ -1592,7 +1590,7 @@ class GrokAdapter extends EventEmitter2 {
     this.socketPath = options.socketPath;
     this.upstreamPath = options.upstreamPath ?? defaultLeaderSocket();
     this.settleMs = options.injectedTurnSettleMs ?? INJECTED_TURN_SETTLE_MS;
-    this.orphanWindowMs = options.orphanedInjectionWindowMs ?? ORPHANED_INJECTION_WINDOW_MS;
+    this.deadlineMs = options.injectedTurnDeadlineMs ?? INJECTED_TURN_DEADLINE_MS;
     this.logFile = options.logFile ?? null;
     this.makeServer = options.createServer ?? (() => listenUnix(this.socketPath, (err) => this.log(`Cannot listen on ${this.socketPath}: ${describe(err)}`)));
     this.makeUpstream = options.createUpstream ?? (() => connectUnix(this.upstreamPath));
@@ -1628,10 +1626,7 @@ class GrokAdapter extends EventEmitter2 {
   stop() {
     this.stopped = true;
     this.listening = false;
-    for (const q of this.injectionQueue.splice(0)) {
-      this.reportUndelivered(q.correlation, "the bridge stopped before the prompt was sent", "rejected");
-    }
-    this.takeInjectedCompletion();
+    this.endInjection();
     this.tui?.close();
     this.injector?.close();
     this.server?.close();
@@ -1641,39 +1636,13 @@ class GrokAdapter extends EventEmitter2 {
     this.sessionIdValue = null;
   }
   injectMessage(text, correlation) {
-    if (this.sessionIdValue === null) {
-      this.log("Cannot inject: no Grok session to inject into");
-      return false;
-    }
-    if (this.injectionBusy) {
-      if (this.injectionQueue.length >= MAX_QUEUED_INJECTIONS) {
-        this.log(`Cannot inject: ${MAX_QUEUED_INJECTIONS} prompts already queued`);
-        return false;
-      }
-      this.injectionQueue.push({ text, correlation });
-      this.log(`Queued injection behind the turn in flight (${this.injectionQueue.length} waiting)`);
-      return true;
-    }
-    return this.writeInjection(text, correlation);
-  }
-  get injectionBusy() {
-    return this.ourPrompts.size > 0 || this.injectedCompletion !== null;
-  }
-  pumpInjectionQueue() {
-    if (this.stopped || this.injectionBusy)
-      return;
-    const next = this.injectionQueue.shift();
-    if (!next)
-      return;
-    if (!this.writeInjection(next.text, next.correlation)) {
-      this.reportUndelivered(next.correlation, "the prompt could not be written to the Grok leader", "rejected");
-      this.pumpInjectionQueue();
-    }
-  }
-  writeInjection(text, correlation) {
     const sessionId = this.sessionIdValue;
     if (sessionId === null) {
       this.log("Cannot inject: no Grok session to inject into");
+      return false;
+    }
+    if (this.activeInjection !== null) {
+      this.log("Cannot inject: an injected turn is still outstanding");
       return false;
     }
     const injector = this.ensureInjector();
@@ -1681,9 +1650,16 @@ class GrokAdapter extends EventEmitter2 {
       return false;
     const id = this.nextRequestId++;
     this.log(`Injecting message into Grok (${text.length} chars)`);
-    if (correlation)
-      this.injectionCorrelations.set(id, correlation);
-    this.ourPrompts.add(id);
+    this.activeInjection = {
+      correlation: correlation ?? null,
+      id,
+      verdictSeen: false,
+      reason: "",
+      emitted: false,
+      deadline: Date.now() + this.deadlineMs,
+      timer: null
+    };
+    this.armInjectionTimer();
     try {
       injector.write(encodeAcpFrame({
         jsonrpc: "2.0",
@@ -1692,12 +1668,53 @@ class GrokAdapter extends EventEmitter2 {
         params: { sessionId, prompt: [{ type: "text", text }] }
       }));
     } catch (err) {
-      this.injectionCorrelations.delete(id);
-      this.ourPrompts.delete(id);
+      this.endInjection();
       this.log(`Injection send failed: ${describe(err)}`);
       return false;
     }
     return true;
+  }
+  armInjectionTimer() {
+    const injection = this.activeInjection;
+    if (!injection)
+      return;
+    if (injection.timer)
+      clearTimeout(injection.timer);
+    const remaining = Math.max(0, injection.deadline - Date.now());
+    const settling = injection.verdictSeen && (this.turnActive || this.chunks.length > 0);
+    const wait = settling ? Math.min(this.settleMs, remaining) : remaining;
+    injection.timer = setTimeout(() => this.onInjectionTimer(), wait);
+    injection.timer.unref?.();
+  }
+  onInjectionTimer() {
+    const injection = this.activeInjection;
+    if (!injection)
+      return;
+    const expired = Date.now() >= injection.deadline;
+    const hasProse = this.turnActive || this.chunks.length > 0;
+    if (hasProse && (injection.verdictSeen || expired)) {
+      this.flush(injection.reason || "the injected turn settled");
+      this.endInjection();
+      return;
+    }
+    if (expired) {
+      if (injection.correlation) {
+        this.log(`Giving up on the turn for ${injection.correlation.messageId}: nothing streamed within ${this.deadlineMs}ms`);
+      }
+      this.endInjection();
+      return;
+    }
+    this.armInjectionTimer();
+  }
+  endInjection() {
+    const injection = this.activeInjection;
+    if (!injection)
+      return;
+    if (injection.timer)
+      clearTimeout(injection.timer);
+    this.activeInjection = null;
+    if (!this.stopped)
+      this.emit("injectionCapacity");
   }
   attachTui(client) {
     if (this.stopped) {
@@ -1737,6 +1754,11 @@ class GrokAdapter extends EventEmitter2 {
       client.close();
       upstream.close();
       this.flush("the Grok TUI disconnected");
+      const injection = this.activeInjection;
+      if (injection && !injection.emitted) {
+        this.reportUndelivered(injection.correlation, "the Grok TUI disconnected before the injected turn's answer arrived", "unknown");
+      }
+      this.endInjection();
       this.sessionIdValue = null;
       this.log("Grok TUI disconnected");
       this.emit("tuiDisconnected");
@@ -1797,7 +1819,6 @@ class GrokAdapter extends EventEmitter2 {
     const kind = update?.sessionUpdate;
     if (kind === "user_message_chunk") {
       this.flush("a user message started a new turn");
-      this.rearmInjectedCompletion();
       return;
     }
     if (kind !== "agent_message_chunk")
@@ -1807,7 +1828,7 @@ class GrokAdapter extends EventEmitter2 {
       return;
     this.beginTurn();
     this.chunks.push(text);
-    this.rearmInjectedCompletion();
+    this.armInjectionTimer();
   }
   ensureInjector() {
     if (this.injector !== null)
@@ -1849,19 +1870,23 @@ class GrokAdapter extends EventEmitter2 {
   observeInjectorReply(acp) {
     if (!isJsonRpcResponse(acp))
       return;
-    if (typeof acp.id !== "number" || !this.ourPrompts.has(acp.id))
+    const injection = this.activeInjection;
+    if (!injection || acp.id !== injection.id)
       return;
-    this.ourPrompts.delete(acp.id);
-    const correlation = this.injectionCorrelations.get(acp.id) ?? null;
-    this.injectionCorrelations.delete(acp.id);
-    if (!acp.error) {
-      this.armInjectedCompletion("the leader answered our injected prompt", correlation);
+    if (acp.error) {
+      const reason = acp.error.message || "Grok refused the prompt";
+      this.log(`Injection rejected: ${reason}`);
+      this.reportUndelivered(injection.correlation, reason, "rejected");
+      this.endInjection();
       return;
     }
-    const reason = acp.error.message || "Grok refused the prompt";
-    this.log(`Injection rejected: ${reason}`);
-    this.reportUndelivered(correlation, reason, "rejected");
-    this.pumpInjectionQueue();
+    injection.verdictSeen = true;
+    injection.reason = "the leader answered our injected prompt";
+    if (injection.emitted) {
+      this.endInjection();
+      return;
+    }
+    this.armInjectionTimer();
   }
   reportUndelivered(correlation, reason, delivery) {
     if (!correlation)
@@ -1872,80 +1897,12 @@ class GrokAdapter extends EventEmitter2 {
       delivery
     });
   }
-  armInjectedCompletion(reason, correlation, windowMs = this.settleMs) {
-    if (this.injectedCompletion) {
-      this.log("BUG: a second injected completion armed while one was pending");
-      this.settleInjectedCompletion();
-    }
-    this.injectedCompletion = {
-      correlation,
-      reason,
-      deadline: Date.now() + windowMs,
-      timer: setTimeout(() => this.settleInjectedCompletion(), windowMs)
-    };
-    this.injectedCompletion.timer.unref?.();
-  }
-  rearmInjectedCompletion() {
-    const pending = this.injectedCompletion;
-    if (!pending)
-      return;
-    clearTimeout(pending.timer);
-    pending.timer = setTimeout(() => this.settleInjectedCompletion(), this.settleMs);
-    pending.timer.unref?.();
-  }
-  settleInjectedCompletion() {
-    const pending = this.injectedCompletion;
-    if (!pending)
-      return;
-    if (!this.turnActive && this.chunks.length === 0) {
-      const remaining = pending.deadline - Date.now();
-      if (remaining > 0) {
-        clearTimeout(pending.timer);
-        pending.timer = setTimeout(() => this.settleInjectedCompletion(), Math.min(this.settleMs, remaining));
-        pending.timer.unref?.();
-        return;
-      }
-      this.takeInjectedCompletion();
-      if (pending.correlation) {
-        this.log(`Giving up on the turn for ${pending.correlation.messageId}: ${pending.reason}`);
-      }
-      this.pumpInjectionQueue();
-      return;
-    }
-    this.takeInjectedCompletion();
-    this.flush(pending.reason, pending.correlation);
-    this.pumpInjectionQueue();
-  }
-  takeInjectedCompletion() {
-    const pending = this.injectedCompletion;
-    if (!pending)
-      return null;
-    clearTimeout(pending.timer);
-    this.injectedCompletion = null;
-    return pending;
-  }
   failInflightInjections(reason) {
-    const queued = this.injectionQueue.splice(0);
-    for (const q of queued) {
-      this.reportUndelivered(q.correlation, "the prompt was never sent to the Grok leader", "rejected");
-    }
-    if (this.ourPrompts.size === 0)
+    const injection = this.activeInjection;
+    if (!injection || injection.verdictSeen)
       return;
-    this.log(`Failing ${this.ourPrompts.size} in-flight injection(s): ${reason}`);
-    const inflight = [...this.ourPrompts];
-    this.ourPrompts.clear();
-    for (const id of inflight) {
-      const correlation = this.injectionCorrelations.get(id);
-      this.injectionCorrelations.delete(id);
-      if (correlation) {
-        this.emit("injectionRejected", {
-          ...correlation,
-          reason,
-          delivery: "unknown"
-        });
-        this.armInjectedCompletion(reason, correlation, this.orphanWindowMs);
-      }
-    }
+    this.log(`Failing the in-flight injection: ${reason}`);
+    this.reportUndelivered(injection.correlation, reason, "unknown");
   }
   bindSession(sessionId) {
     if (this.sessionIdValue === sessionId)
@@ -1961,11 +1918,15 @@ class GrokAdapter extends EventEmitter2 {
     this.turnSeq += 1;
     this.emit("turnStarted");
   }
-  flush(reason, respondingTo = null) {
+  flush(reason) {
     if (!this.turnActive && this.chunks.length === 0)
       return;
-    const held = this.takeInjectedCompletion();
-    respondingTo ??= held?.correlation ?? null;
+    const injection = this.activeInjection;
+    let respondingTo = null;
+    if (injection && !injection.emitted) {
+      injection.emitted = true;
+      respondingTo = injection.correlation;
+    }
     const content = this.chunks.join("");
     const senderRef = `${this.sessionIdValue ?? "grok"}#${this.turnSeq}`;
     this.chunks = [];
@@ -1975,8 +1936,6 @@ class GrokAdapter extends EventEmitter2 {
       this.emit("agentMessage", { senderRef, content, respondingTo });
     }
     this.emit("turnCompleted");
-    if (held)
-      this.pumpInjectionQueue();
   }
   log(msg) {
     const line = `[${new Date().toISOString()}] [GrokAdapter] ${msg}
@@ -3104,6 +3063,20 @@ class Mailbox {
         return { accepted: true };
     }
   }
+  nack(batchId, ids) {
+    const named = new Set(ids);
+    let released = 0;
+    for (const entry of this.entries) {
+      if (entry.leasedBy !== batchId)
+        continue;
+      if (!named.has(entry.message.id))
+        continue;
+      entry.leasedBy = null;
+      entry.leaseExpiresAt = 0;
+      released++;
+    }
+    return released;
+  }
   remove(ids) {
     const doomed = new Set(ids);
     for (let i = this.entries.length - 1;i >= 0; i--) {
@@ -3284,8 +3257,13 @@ class MessageBus {
   }
   async route(envelope, now, opts = {}) {
     const recipients = resolveRecipients(envelope, this.deps.state, now);
-    if (opts.requireReply && recipients.length !== 1) {
-      throw new SendRejected(`require_reply needs exactly one recipient; ${envelope.id} resolved to ${recipients.length} (${recipients.join(", ") || "none"}). Address one agent directly.`);
+    if (opts.requireReply) {
+      if (envelope.kind !== "reply") {
+        throw new SendRejected(`require_reply is only available on reply-kind messages; ${envelope.id} is ${envelope.kind}. A ${envelope.kind} may be shed when a mailbox fills, which would leave the reply owed by nobody.`);
+      }
+      if (recipients.length !== 1) {
+        throw new SendRejected(`require_reply needs exactly one recipient; ${envelope.id} resolved to ${recipients.length} (${recipients.join(", ") || "none"}). Address one agent directly.`);
+      }
     }
     const accepted = [];
     const rejected = [];
@@ -3738,14 +3716,19 @@ registerTransport2("grok", grokWakeTransport({
   expectReply: (requester, messageId) => pendingRequests.add({ requester, responder: "grok", messageId, at: Date.now() }),
   log
 }));
-function drainGrokBacklog(why) {
-  const batch = mailboxFor("grok").drain(Date.now());
+async function drainGrokBacklog(why) {
+  const box = mailboxFor("grok");
+  const batch = box.drain(Date.now());
   if (batch.messages.length === 0)
     return;
   log(`Delivering ${batch.messages.length} held message(s) to Grok (${why})`);
+  const refused = [];
   for (const message of batch.messages) {
-    transports.wake("grok", message, log);
+    if (await transports.wake("grok", message, log) === "failed")
+      refused.push(message.id);
   }
+  if (refused.length > 0)
+    box.nack(batch.batchId, refused);
 }
 function frontendTransport(agent) {
   return {
@@ -4017,6 +4000,9 @@ grok.on("sessionAttached", (sessionId) => {
   drainGrokBacklog("a Grok session became available");
   broadcastStatus();
 });
+grok.on("injectionCapacity", () => {
+  drainGrokBacklog("Grok can take another injected turn");
+});
 grok.on("turnCompleted", () => {
   log("Grok turn completed");
   endAgentTurn("grok", "the turn completed");
@@ -4194,15 +4180,6 @@ async function sendFromFrontend(ws, requestId, frame, requireReply) {
       requestId,
       success: false,
       error: describeError2(err)
-    });
-    return;
-  }
-  if (requireReply && envelope.kind !== "reply") {
-    sendProtocolMessage(ws, {
-      type: "claude_to_codex_result",
-      requestId,
-      success: false,
-      error: `require_reply is only available on reply-kind messages; ${envelope.id} is ${envelope.kind}. A ${envelope.kind} may be shed when a mailbox fills, which would leave the reply owed by nobody.`
     });
     return;
   }

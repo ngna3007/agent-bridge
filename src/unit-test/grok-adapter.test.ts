@@ -90,7 +90,7 @@ class FakeServer implements ProxyServer {
  * order: the TUI's proxied leg first, then the injection leg when it is
  * first needed.
  */
-function harness(options: { orphanedInjectionWindowMs?: number } = {}) {
+function harness(options: { injectedTurnDeadlineMs?: number } = {}) {
   const server = new FakeServer();
   const upstreams: FakeConnection[] = [];
   const adapter = new GrokAdapter({
@@ -100,7 +100,7 @@ function harness(options: { orphanedInjectionWindowMs?: number } = {}) {
     // would make the settle fire between two synchronous deliveries and
     // hide the very race it exists to close.
     injectedTurnSettleMs: SETTLE_MS,
-    orphanedInjectionWindowMs: options.orphanedInjectionWindowMs,
+    injectedTurnDeadlineMs: options.injectedTurnDeadlineMs,
     createServer: () => server,
     createUpstream: () => {
       const conn = new FakeConnection();
@@ -526,7 +526,7 @@ describe("GrokAdapter injection", () => {
     // finally streamed, belonged to nobody. An empty window now waits out
     // its own deadline instead.
     const { adapter, tui, upstreams, leader } = harness({
-      orphanedInjectionWindowMs: SETTLE_MS * 20,
+      injectedTurnDeadlineMs: SETTLE_MS * 6,
     });
     tuiPrompts(tui, 1);
     leader.deliverAcp({ jsonrpc: "2.0", id: 1, result: {} });
@@ -548,23 +548,26 @@ describe("GrokAdapter injection", () => {
     expect(seen[0]?.respondingTo).toEqual({ messageId: "m1", requester: "claude", text: "q" });
   });
 
-  test("a second injection waits for the first turn instead of racing it", async () => {
+  test("a second injection is refused, not queued, while one is outstanding", async () => {
     // Two verdicts can both land before any prose does, and the proxy
     // leg's prose carries no prompt id — so with two turns outstanding
-    // nothing in the stream says which is streaming. The second used to
-    // close the first against an empty buffer and take its correlation.
+    // nothing in the stream says which is streaming. The refusal is what
+    // keeps that from arising; the mailbox, not the adapter, holds the
+    // message meanwhile.
     const { adapter, tui, upstreams, leader } = harness();
     tuiPrompts(tui, 1);
     leader.deliverAcp({ jsonrpc: "2.0", id: 1, result: {} });
 
     const seen: GrokProseIngress[] = [];
+    const capacity: number[] = [];
     adapter.on("agentMessage", (m: GrokProseIngress) => seen.push(m));
+    adapter.on("injectionCapacity", () => capacity.push(1));
+
     expect(adapter.injectMessage("first", { messageId: "m1", requester: "claude", text: "q1" })).toBe(true);
-    expect(adapter.injectMessage("second", { messageId: "m2", requester: "claude", text: "q2" })).toBe(true);
+    expect(adapter.injectMessage("second", { messageId: "m2", requester: "claude", text: "q2" })).toBe(false);
 
     const injector = upstreams[1]!;
     const prompts = () => injector.acpSent().filter((m: any) => m.method === "session/prompt");
-    // Only the first is on the wire.
     expect(prompts()).toHaveLength(1);
 
     injector.deliverAcp({ jsonrpc: "2.0", id: prompts()[0].id, result: { stopReason: "end_turn" } });
@@ -573,40 +576,72 @@ describe("GrokAdapter injection", () => {
     await settle();
 
     expect(seen).toHaveLength(1);
-    expect(seen[0]?.content).toBe("four");
     expect(seen[0]?.respondingTo?.messageId).toBe("m1");
-
-    // The first turn closed, so the second went out.
+    // The slot freed, and said so — that signal is what makes the
+    // refusal a deferral rather than a loss.
+    expect(capacity).toHaveLength(1);
+    expect(adapter.injectMessage("second", { messageId: "m2", requester: "claude", text: "q2" })).toBe(true);
     expect(prompts()).toHaveLength(2);
-    injector.deliverAcp({ jsonrpc: "2.0", id: prompts()[1].id, result: { stopReason: "end_turn" } });
-    userChunk(leader, "second");
-    chunk(leader, "five");
-    await settle();
-
-    expect(seen).toHaveLength(2);
-    expect(seen[1]?.content).toBe("five");
-    expect(seen[1]?.respondingTo?.messageId).toBe("m2");
   });
 
-  test("an injector death reports the queued prompt as never sent", async () => {
-    // The one in flight is `unknown` — the bytes were written. The one
-    // still queued never reached the wire, so its fate is knowable and a
-    // resend cannot duplicate anything.
+  test("prose flushed by the human's next prompt still owns its correlation", async () => {
+    // The opposite ordering to the settle race: the answer streams and
+    // the human types again, all before the verdict crosses the injector
+    // leg. The correlation is owned from write time precisely so that
+    // this flush does not have to guess, and the late verdict then has
+    // nothing left to attribute.
+    const { adapter, tui, upstreams, leader } = harness();
+    tuiPrompts(tui, 1);
+    leader.deliverAcp({ jsonrpc: "2.0", id: 1, result: {} });
+
+    const seen: GrokProseIngress[] = [];
+    const capacity: number[] = [];
+    adapter.on("agentMessage", (m: GrokProseIngress) => seen.push(m));
+    adapter.on("injectionCapacity", () => capacity.push(1));
+    adapter.injectMessage("what is 2+2", { messageId: "m1", requester: "claude", text: "q" });
+
+    userChunk(leader, "what is 2+2");
+    chunk(leader, "four");
+    userChunk(leader, "and 3+3?");
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.content).toBe("four");
+    expect(seen[0]?.respondingTo).toEqual({ messageId: "m1", requester: "claude", text: "q" });
+    expect(capacity).toEqual([]);
+
+    const injector = upstreams[1]!;
+    const promptId = injector.acpSent().find((m: any) => m.method === "session/prompt").id;
+    injector.deliverAcp({ jsonrpc: "2.0", id: promptId, result: { stopReason: "end_turn" } });
+
+    // Fully accounted for, so the slot frees immediately rather than
+    // holding a settle window over the next turn's prose.
+    expect(capacity).toHaveLength(1);
+    await settle();
+    expect(seen).toHaveLength(1);
+  });
+
+  test("a TUI disconnect ends an injected turn nobody can observe any more", async () => {
+    // The observer leg is the only way an injected turn's answer is ever
+    // seen. Holding the slot after it closes would refuse injections for
+    // a session that no longer exists.
     const { adapter, tui, upstreams, leader } = harness();
     tuiPrompts(tui, 1);
     leader.deliverAcp({ jsonrpc: "2.0", id: 1, result: {} });
 
     const failures: any[] = [];
+    const capacity: number[] = [];
     adapter.on("injectionRejected", (r: any) => failures.push(r));
-    adapter.injectMessage("first", { messageId: "m1", requester: "claude", text: "q1" });
-    adapter.injectMessage("second", { messageId: "m2", requester: "claude", text: "q2" });
+    adapter.on("injectionCapacity", () => capacity.push(1));
+    adapter.injectMessage("what is 2+2", { messageId: "m1", requester: "claude", text: "q" });
 
-    upstreams[1]!.hangUp();
+    tui.hangUp();
 
-    expect(failures.map((f) => [f.messageId, f.delivery])).toEqual([
-      ["m2", "rejected"],
-      ["m1", "unknown"],
-    ]);
+    expect(failures).toHaveLength(1);
+    expect(failures[0].messageId).toBe("m1");
+    // The prompt was written; the leader may have run it where this
+    // bridge can no longer watch.
+    expect(failures[0].delivery).toBe("unknown");
+    expect(capacity).toHaveLength(1);
   });
 
   test("the echo of our own prompt does not eat the answer's correlation", async () => {
@@ -643,7 +678,7 @@ describe("GrokAdapter injection", () => {
     // socket died and be answering right now. Dropping the correlation
     // with the connection left that answer unattributed, so the
     // `require_reply` it settles could never be satisfied.
-    const { adapter, tui, upstreams, leader } = harness({ orphanedInjectionWindowMs: SETTLE_MS * 6 });
+    const { adapter, tui, upstreams, leader } = harness({ injectedTurnDeadlineMs: SETTLE_MS * 6 });
     tuiPrompts(tui, 1);
     leader.deliverAcp({ jsonrpc: "2.0", id: 1, result: {} });
 
@@ -654,6 +689,10 @@ describe("GrokAdapter injection", () => {
     upstreams[1]!.hangUp();
     chunk(leader, "four");
 
+    // No verdict is coming — the connection it would arrive on is gone —
+    // so the deadline is the only boundary left, and it is deliberately
+    // longer than a settle interval.
+    await settle();
     await settle();
     expect(seen).toHaveLength(1);
     expect(seen[0]?.content).toBe("four");
