@@ -124,6 +124,18 @@ function tuiPrompts(tui: FakeConnection, id: number | string, sessionId = SID): 
   });
 }
 
+/**
+ * Echo an injected prompt back the way the leader does, marker and all.
+ *
+ * The adapter recognises its own turn by an invisible per-injection
+ * marker it appends to the prompt, so a test that echoes the bare text
+ * is echoing somebody else's prompt.
+ */
+function echoInjected(leader: FakeConnection, injector: FakeConnection, nth = 0): void {
+  const prompts = injector.acpSent().filter((m: any) => m.method === "session/prompt");
+  userChunk(leader, prompts[nth].params.prompt[0].text);
+}
+
 /** The echo of a prompt, the way the leader fans it back to every client. */
 function userChunk(leader: FakeConnection, text: string, sessionId = SID): void {
   leader.deliverAcp({
@@ -382,7 +394,10 @@ describe("GrokAdapter injection", () => {
     const injector = upstreams[1]!;
     const prompt = injector.acpSent().find((m) => m.method === "session/prompt");
     expect(prompt.params.sessionId).toBe(SID);
-    expect(prompt.params.prompt).toEqual([{ type: "text", text: "[REPLY] ship it" }]);
+    // The marker is appended, and is zero-width — the human sees exactly
+    // what was sent.
+    expect(prompt.params.prompt[0].text.startsWith("[REPLY] ship it")).toBe(true);
+    expect(prompt.params.prompt[0].text.replace(/[\u200b-\u200d]/g, "")).toBe("[REPLY] ship it");
     // The human's leg carries only what the human's TUI sent — the
     // injected text never enters their id space.
     const onHumanLeg = leader.acpSent().filter((m) => m.method === "session/prompt");
@@ -411,7 +426,7 @@ describe("GrokAdapter injection", () => {
     const injector = upstreams[1]!;
     const first = injector.acpSent().find((m: any) => m.method === "session/prompt").id;
     injector.deliverAcp({ jsonrpc: "2.0", id: first, result: { stopReason: "end_turn" } });
-    userChunk(leader, "one");
+    echoInjected(leader, injector);
     chunk(leader, "1");
     await settle();
 
@@ -445,7 +460,7 @@ describe("GrokAdapter injection", () => {
     // Then the leader gets to ours: the echo, then the answer.
     const injector = upstreams[1]!;
     const promptId = injector.acpSent().find((m: any) => m.method === "session/prompt").id;
-    userChunk(leader, "what is 2+2");
+    echoInjected(leader, injector);
     chunk(leader, "four");
     injector.deliverAcp({ jsonrpc: "2.0", id: promptId, result: { stopReason: "end_turn" } });
     await settle();
@@ -455,11 +470,103 @@ describe("GrokAdapter injection", () => {
     expect(seen[1]?.respondingTo).toEqual({ messageId: "m1", requester: "claude", text: "q" });
   });
 
+  test("a verdict that beats the echo cannot settle the human's turn", () => {
+    // The verdict crosses the injector leg while the leader is still
+    // streaming the turn it was already running. Settling on "verdict
+    // plus buffered prose" ended the human's turn against our
+    // correlation — the same cross-socket race, moved into the timer.
+    const { adapter, tui, upstreams, leader } = harness();
+    tuiPrompts(tui, 1);
+    chunk(leader, "still answering the human");
+
+    const seen: GrokProseIngress[] = [];
+    adapter.on("agentMessage", (m: GrokProseIngress) => seen.push(m));
+    adapter.injectMessage("what is 2+2", { messageId: "m1", requester: "claude", text: "q" });
+
+    const injector = upstreams[1]!;
+    const promptId = injector.acpSent().find((m: any) => m.method === "session/prompt").id;
+    injector.deliverAcp({ jsonrpc: "2.0", id: promptId, result: { stopReason: "end_turn" } });
+
+    // The human's turn ends on its own boundary, unowned.
+    leader.deliverAcp({ jsonrpc: "2.0", id: 1, result: {} });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.respondingTo).toBeNull();
+
+    // Ours starts afterwards and still has its correlation to spend.
+    echoInjected(leader, injector);
+    chunk(leader, "four");
+    userChunk(leader, "next question");
+    expect(seen).toHaveLength(2);
+    expect(seen[1]?.respondingTo?.messageId).toBe("m1");
+  });
+
+  test("a human prompt identical to the injected one does not claim its turn", () => {
+    // Text is not identity. A human who types the same string — the
+    // message they are answering, or just "continue" — produces an echo
+    // indistinguishable from ours unless the marker is what is matched.
+    const { adapter, tui, upstreams, leader } = harness();
+    tuiPrompts(tui, 1);
+    leader.deliverAcp({ jsonrpc: "2.0", id: 1, result: {} });
+
+    const seen: GrokProseIngress[] = [];
+    adapter.on("agentMessage", (m: GrokProseIngress) => seen.push(m));
+    adapter.injectMessage("continue", { messageId: "m1", requester: "claude", text: "continue" });
+
+    // The human types the same word first.
+    userChunk(leader, "continue");
+    chunk(leader, "their answer");
+    userChunk(leader, "continue");
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.content).toBe("their answer");
+    expect(seen[0]?.respondingTo).toBeNull();
+
+    // Ours is still waiting, and is recognised when its own echo lands.
+    echoInjected(leader, upstreams[1]!);
+    chunk(leader, "our answer");
+    userChunk(leader, "and again");
+    expect(seen).toHaveLength(2);
+    expect(seen[1]?.respondingTo?.messageId).toBe("m1");
+  });
+
+  test("an abandoned injection releases its slot only after its verdict settles", async () => {
+    // The verdict is the evidence that frees the slot, but the answer it
+    // describes may still be crossing the proxy leg — so the release
+    // waits out one settle interval rather than starting the next prompt
+    // on top of a turn still streaming.
+    const { adapter, tui, upstreams, leader } = harness({ injectedTurnDeadlineMs: SETTLE_MS * 2 });
+    tuiPrompts(tui, 1);
+    leader.deliverAcp({ jsonrpc: "2.0", id: 1, result: {} });
+
+    const seen: GrokProseIngress[] = [];
+    const capacity: number[] = [];
+    adapter.on("agentMessage", (m: GrokProseIngress) => seen.push(m));
+    adapter.on("injectionCapacity", () => capacity.push(1));
+    adapter.injectMessage("what is 2+2", { messageId: "m1", requester: "claude", text: "q" });
+    await settle();
+
+    const injector = upstreams[1]!;
+    const promptId = injector.acpSent().find((m: any) => m.method === "session/prompt").id;
+    injector.deliverAcp({ jsonrpc: "2.0", id: promptId, result: { stopReason: "end_turn" } });
+    // The echo and the answer arrive after the verdict — the ordering
+    // that used to free the slot with output still in flight.
+    echoInjected(leader, injector);
+    chunk(leader, "four");
+    expect(capacity).toEqual([]);
+
+    await settle();
+    expect(capacity).toHaveLength(1);
+    // On the bus, but unowned: the sender was already told `unknown`.
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.content).toBe("four");
+    expect(seen[0]?.respondingTo).toBeNull();
+  });
+
   test("an echo split across chunks still starts the turn", () => {
     // The leader is free to split a user message however it likes; a
     // match that only worked on whole chunks would silently never fire
     // and cost every long injected prompt its correlation.
-    const { adapter, tui, leader } = harness();
+    const { adapter, tui, upstreams, leader } = harness();
     tuiPrompts(tui, 1);
     leader.deliverAcp({ jsonrpc: "2.0", id: 1, result: {} });
 
@@ -467,8 +574,12 @@ describe("GrokAdapter injection", () => {
     adapter.on("agentMessage", (m: GrokProseIngress) => seen.push(m));
     adapter.injectMessage("what is 2+2", { messageId: "m1", requester: "claude", text: "q" });
 
-    userChunk(leader, "what is ");
-    userChunk(leader, "2+2");
+    const written = upstreams[1]!.acpSent()
+      .find((m: any) => m.method === "session/prompt").params.prompt[0].text;
+    // Split through the middle of the marker, which is where a chunk-by-
+    // chunk match would silently stop working.
+    userChunk(leader, written.slice(0, written.length - 2));
+    userChunk(leader, written.slice(written.length - 2));
     chunk(leader, "four");
     // A later user message is the boundary; by then the turn has started.
     userChunk(leader, "next question");
@@ -504,6 +615,11 @@ describe("GrokAdapter injection", () => {
     const injector = upstreams[1]!;
     const promptId = injector.acpSent().find((m: any) => m.method === "session/prompt").id;
     injector.deliverAcp({ jsonrpc: "2.0", id: promptId, result: { stopReason: "end_turn" } });
+    // One settle interval, not zero: an answer may still be crossing the
+    // proxy leg, and it should reach the bus before the next prompt goes
+    // out.
+    expect(capacity).toEqual([]);
+    await settle();
     expect(capacity).toHaveLength(1);
     // Reported once, not again on release.
     expect(failures).toHaveLength(1);
@@ -566,7 +682,7 @@ describe("GrokAdapter injection", () => {
 
     const injector = upstreams[1]!;
     const promptId = injector.acpSent().find((m) => m.method === "session/prompt").id;
-    userChunk(leader, "what is 2+2");
+    echoInjected(leader, injector);
     chunk(leader, "four");
     expect(seen).toHaveLength(0);
 
@@ -600,7 +716,7 @@ describe("GrokAdapter injection", () => {
     const promptId = injector.acpSent().find((m) => m.method === "session/prompt").id;
     // Response first, prose second — the ordering that used to lose it.
     injector.deliverAcp({ jsonrpc: "2.0", id: promptId, result: { stopReason: "end_turn" } });
-    userChunk(leader, "what is 2+2");
+    echoInjected(leader, injector);
     chunk(leader, "four");
     expect(seen).toHaveLength(0);
 
@@ -610,15 +726,14 @@ describe("GrokAdapter injection", () => {
     expect(seen[0]?.respondingTo).toEqual({ messageId: "m1", requester: "claude", text: "q" });
   });
 
-  test("a slow first token does not cost an orphaned turn its attribution", async () => {
-    // The unknown-delivery window is sized against a model's thinking
-    // time, but the echo of our own prompt re-arms it at the *settle*
-    // interval — 250ms of socket skew. Firing in that gap used to consume
-    // the correlation against an empty buffer, and the answer, when it
-    // finally streamed, belonged to nobody. An empty window now waits out
-    // its own deadline instead.
+  test("an empty settle window does not consume the correlation", async () => {
+    // The window that decides "the stream has stopped" is socket skew,
+    // not thinking time. Arming it before the first token — which the
+    // echo of our own prompt used to do — fired it against an empty
+    // buffer and spent the correlation, so the answer, when it finally
+    // streamed, belonged to nobody.
     const { adapter, tui, upstreams, leader } = harness({
-      injectedTurnDeadlineMs: SETTLE_MS * 6,
+      injectedTurnDeadlineMs: SETTLE_MS * 40,
     });
     tuiPrompts(tui, 1);
     leader.deliverAcp({ jsonrpc: "2.0", id: 1, result: {} });
@@ -627,15 +742,18 @@ describe("GrokAdapter injection", () => {
     adapter.on("agentMessage", (m: GrokProseIngress) => seen.push(m));
     adapter.injectMessage("what is 2+2", { messageId: "m1", requester: "claude", text: "q" });
 
-    upstreams[1]!.hangUp();
-    userChunk(leader, "what is 2+2");
-    // Longer than settleMs, well inside the orphan window: the model is
-    // still thinking.
+    const injector = upstreams[1]!;
+    echoInjected(leader, injector);
+    // Longer than a settle interval, well inside the deadline: the model
+    // is still thinking.
     await settle();
     expect(seen).toEqual([]);
 
     chunk(leader, "four");
+    const promptId = injector.acpSent().find((m: any) => m.method === "session/prompt").id;
+    injector.deliverAcp({ jsonrpc: "2.0", id: promptId, result: { stopReason: "end_turn" } });
     await settle();
+
     expect(seen).toHaveLength(1);
     expect(seen[0]?.respondingTo).toEqual({ messageId: "m1", requester: "claude", text: "q" });
   });
@@ -663,7 +781,7 @@ describe("GrokAdapter injection", () => {
     expect(prompts()).toHaveLength(1);
 
     injector.deliverAcp({ jsonrpc: "2.0", id: prompts()[0].id, result: { stopReason: "end_turn" } });
-    userChunk(leader, "first");
+    echoInjected(leader, injector);
     chunk(leader, "four");
     await settle();
 
@@ -692,7 +810,8 @@ describe("GrokAdapter injection", () => {
     adapter.on("injectionCapacity", () => capacity.push(1));
     adapter.injectMessage("what is 2+2", { messageId: "m1", requester: "claude", text: "q" });
 
-    userChunk(leader, "what is 2+2");
+    const injector = upstreams[1]!;
+    echoInjected(leader, injector);
     chunk(leader, "four");
     userChunk(leader, "and 3+3?");
 
@@ -701,7 +820,6 @@ describe("GrokAdapter injection", () => {
     expect(seen[0]?.respondingTo).toEqual({ messageId: "m1", requester: "claude", text: "q" });
     expect(capacity).toEqual([]);
 
-    const injector = upstreams[1]!;
     const promptId = injector.acpSent().find((m: any) => m.method === "session/prompt").id;
     injector.deliverAcp({ jsonrpc: "2.0", id: promptId, result: { stopReason: "end_turn" } });
 
@@ -754,7 +872,7 @@ describe("GrokAdapter injection", () => {
     const injector = upstreams[1]!;
     const promptId = injector.acpSent().find((m) => m.method === "session/prompt").id;
     injector.deliverAcp({ jsonrpc: "2.0", id: promptId, result: { stopReason: "end_turn" } });
-    userChunk(leader, "what is 2+2");
+    echoInjected(leader, injector);
     chunk(leader, "four");
 
     await settle();
@@ -763,33 +881,56 @@ describe("GrokAdapter injection", () => {
     expect(seen[0]?.respondingTo).toEqual({ messageId: "m1", requester: "claude", text: "q" });
   });
 
-  test("a turn the leader ran anyway is still attributed after the injector dies", async () => {
-    // "Unknown" delivery cuts both ways. The verdict that would have
-    // closed this turn is never coming — the socket it would arrive on
-    // is gone — but the leader may have read the prompt before the
-    // socket died and be answering right now. Dropping the correlation
-    // with the connection left that answer unattributed, so the
-    // `require_reply` it settles could never be satisfied.
-    const { adapter, tui, upstreams, leader } = harness({ injectedTurnDeadlineMs: SETTLE_MS * 6 });
+  test("an injector death frees the slot and spends the correlation once", async () => {
+    // A deadline is this side giving up on evidence that may still
+    // arrive, so it holds the slot. A closed injector is different: the
+    // verdict has no socket left to arrive on, so holding would wedge
+    // every later injection until the session ended. The sender is told
+    // `unknown` — once — and an answer the leader streams anyway reaches
+    // the bus owned by nobody, which is exactly what they were told.
+    const { adapter, tui, upstreams, leader } = harness();
     tuiPrompts(tui, 1);
     leader.deliverAcp({ jsonrpc: "2.0", id: 1, result: {} });
 
     const seen: GrokProseIngress[] = [];
+    const failures: any[] = [];
+    const capacity: number[] = [];
     adapter.on("agentMessage", (m: GrokProseIngress) => seen.push(m));
+    adapter.on("injectionRejected", (r: any) => failures.push(r));
+    adapter.on("injectionCapacity", () => capacity.push(1));
     adapter.injectMessage("what is 2+2", { messageId: "m1", requester: "claude", text: "q" });
 
-    upstreams[1]!.hangUp();
-    userChunk(leader, "what is 2+2");
-    chunk(leader, "four");
+    const injector = upstreams[1]!;
+    echoInjected(leader, injector);
+    injector.hangUp();
 
-    // No verdict is coming — the connection it would arrive on is gone —
-    // so the deadline is the only boundary left, and it is deliberately
-    // longer than a settle interval.
-    await settle();
-    await settle();
+    expect(failures).toHaveLength(1);
+    expect(failures[0].delivery).toBe("unknown");
+    expect(capacity).toHaveLength(1);
+
+    // The leader answers anyway; the prose is real and goes to the bus.
+    chunk(leader, "four");
+    userChunk(leader, "next question");
     expect(seen).toHaveLength(1);
     expect(seen[0]?.content).toBe("four");
-    expect(seen[0]?.respondingTo).toEqual({ messageId: "m1", requester: "claude", text: "q" });
+    expect(seen[0]?.respondingTo).toBeNull();
+  });
+
+  test("an abandoned injection is not reported twice when the injector dies", async () => {
+    const { adapter, tui, upstreams, leader } = harness({ injectedTurnDeadlineMs: SETTLE_MS * 2 });
+    tuiPrompts(tui, 1);
+    leader.deliverAcp({ jsonrpc: "2.0", id: 1, result: {} });
+
+    const failures: any[] = [];
+    adapter.on("injectionRejected", (r: any) => failures.push(r));
+    adapter.injectMessage("what is 2+2", { messageId: "m1", requester: "claude", text: "q" });
+
+    await settle();
+    expect(failures).toHaveLength(1);
+
+    upstreams[1]!.hangUp();
+    // One message, one outcome. Two would have the sender act on it twice.
+    expect(failures).toHaveLength(1);
   });
 
   test("prose still streaming holds the injected turn open", async () => {
@@ -803,6 +944,7 @@ describe("GrokAdapter injection", () => {
 
     const injector = upstreams[1]!;
     const promptId = injector.acpSent().find((m) => m.method === "session/prompt").id;
+    echoInjected(leader, injector);
     injector.deliverAcp({ jsonrpc: "2.0", id: promptId, result: { stopReason: "end_turn" } });
 
     // Each chunk restarts the settle window, so a slow stream cannot be

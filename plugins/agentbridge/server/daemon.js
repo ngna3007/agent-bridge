@@ -1562,6 +1562,14 @@ class LeaderFramer {
 // src/grok-adapter.ts
 var INJECTED_TURN_SETTLE_MS = 250;
 var INJECTED_TURN_DEADLINE_MS = 60000;
+var ECHO_SCAN_WINDOW = 512;
+function echoMarker(id) {
+  const bits = id.toString(2);
+  let encoded = "";
+  for (const bit of bits)
+    encoded += bit === "1" ? "\u200D" : "\u200C";
+  return `\u200B${encoded}\u200B`;
+}
 
 class GrokAdapter extends EventEmitter2 {
   server = null;
@@ -1647,14 +1655,16 @@ class GrokAdapter extends EventEmitter2 {
     if (injector === null)
       return false;
     const id = this.nextRequestId++;
+    const marker = echoMarker(id);
     this.log(`Injecting message into Grok (${text.length} chars)`);
     this.activeInjection = {
       correlation: correlation ?? null,
       id,
       verdictSeen: false,
       reason: "",
-      emitted: false,
-      pendingEcho: text,
+      proseEmitted: false,
+      marker,
+      started: false,
       echoSeen: "",
       abandoned: false,
       deadline: Date.now() + this.deadlineMs,
@@ -1666,7 +1676,7 @@ class GrokAdapter extends EventEmitter2 {
         jsonrpc: "2.0",
         id,
         method: "session/prompt",
-        params: { sessionId, prompt: [{ type: "text", text }] }
+        params: { sessionId, prompt: [{ type: "text", text: text + marker }] }
       }));
     } catch (err) {
       this.endInjection();
@@ -1681,24 +1691,39 @@ class GrokAdapter extends EventEmitter2 {
       return;
     if (injection.timer)
       clearTimeout(injection.timer);
-    const remaining = Math.max(0, injection.deadline - Date.now());
-    const settling = injection.verdictSeen && (this.turnActive || this.chunks.length > 0);
-    const wait = settling ? Math.min(this.settleMs, remaining) : remaining;
+    let wait;
+    if (injection.abandoned) {
+      if (!injection.verdictSeen)
+        return;
+      wait = this.settleMs;
+    } else if (this.canSettle(injection)) {
+      wait = Math.min(this.settleMs, Math.max(0, injection.deadline - Date.now()));
+    } else {
+      wait = Math.max(0, injection.deadline - Date.now());
+    }
     injection.timer = setTimeout(() => this.onInjectionTimer(), wait);
     injection.timer.unref?.();
+  }
+  canSettle(injection) {
+    return injection.started && injection.verdictSeen && (this.turnActive || this.chunks.length > 0);
   }
   onInjectionTimer() {
     const injection = this.activeInjection;
     if (!injection)
       return;
-    const expired = Date.now() >= injection.deadline;
-    const hasProse = this.turnActive || this.chunks.length > 0;
-    if (hasProse && (injection.verdictSeen || expired)) {
+    if (injection.abandoned) {
+      if (injection.verdictSeen) {
+        this.flush("the abandoned injected turn's answer arrived late");
+        this.endInjection();
+      }
+      return;
+    }
+    if (this.canSettle(injection)) {
       this.flush(injection.reason || "the injected turn settled");
       this.endInjection();
       return;
     }
-    if (expired) {
+    if (Date.now() >= injection.deadline) {
       this.abandonInjection(`no answer streamed within ${this.deadlineMs}ms of the prompt being written`);
       return;
     }
@@ -1712,7 +1737,6 @@ class GrokAdapter extends EventEmitter2 {
       clearTimeout(injection.timer);
     injection.timer = null;
     injection.abandoned = true;
-    injection.emitted = true;
     this.log(`Giving up on the injected turn: ${reason}`);
     this.reportUndelivered(injection.correlation, reason, "unknown");
   }
@@ -1765,7 +1789,7 @@ class GrokAdapter extends EventEmitter2 {
       upstream.close();
       this.flush("the Grok TUI disconnected");
       const injection = this.activeInjection;
-      if (injection && !injection.emitted) {
+      if (injection && !injection.abandoned && !injection.proseEmitted) {
         this.reportUndelivered(injection.correlation, "the Grok TUI disconnected before the injected turn's answer arrived", "unknown");
       }
       this.endInjection();
@@ -1895,7 +1919,7 @@ class GrokAdapter extends EventEmitter2 {
     }
     injection.verdictSeen = true;
     injection.reason = "the leader answered our injected prompt";
-    if (injection.emitted) {
+    if (injection.proseEmitted && !injection.abandoned) {
       this.endInjection();
       return;
     }
@@ -1903,21 +1927,13 @@ class GrokAdapter extends EventEmitter2 {
   }
   matchInjectionEcho(text) {
     const injection = this.activeInjection;
-    if (!injection || injection.pendingEcho === null || text === null)
+    if (!injection || injection.started || text === null)
       return;
-    const expected = injection.pendingEcho;
-    const continued = injection.echoSeen + text;
-    if (expected.startsWith(continued)) {
-      injection.echoSeen = continued;
-    } else if (expected.startsWith(text)) {
-      injection.echoSeen = text;
-    } else {
-      injection.echoSeen = "";
+    const seen = (injection.echoSeen + text).slice(-ECHO_SCAN_WINDOW);
+    injection.echoSeen = seen;
+    if (!seen.includes(injection.marker))
       return;
-    }
-    if (injection.echoSeen.length < expected.length)
-      return;
-    injection.pendingEcho = null;
+    injection.started = true;
     injection.echoSeen = "";
     this.log("Our injected prompt came back on the proxy leg; its turn has started");
   }
@@ -1935,14 +1951,17 @@ class GrokAdapter extends EventEmitter2 {
     if (!injection || injection.verdictSeen)
       return;
     this.log(`Failing the in-flight injection: ${reason}`);
-    this.reportUndelivered(injection.correlation, reason, "unknown");
+    if (!injection.abandoned) {
+      this.reportUndelivered(injection.correlation, reason, "unknown");
+    }
+    this.endInjection();
   }
   bindSession(sessionId) {
     if (this.sessionIdValue === sessionId)
       return;
     if (this.sessionIdValue !== null) {
       const injection = this.activeInjection;
-      if (injection && !injection.emitted) {
+      if (injection && !injection.abandoned && !injection.proseEmitted) {
         this.reportUndelivered(injection.correlation, "the Grok session changed before the injected turn's answer arrived", "unknown");
       }
       this.endInjection();
@@ -1963,8 +1982,8 @@ class GrokAdapter extends EventEmitter2 {
       return;
     const injection = this.activeInjection;
     let respondingTo = null;
-    if (injection && injection.pendingEcho === null && !injection.emitted) {
-      injection.emitted = true;
+    if (injection && injection.started && !injection.abandoned && !injection.proseEmitted) {
+      injection.proseEmitted = true;
       respondingTo = injection.correlation;
     }
     const content = this.chunks.join("");

@@ -62,6 +62,38 @@ const INJECTED_TURN_SETTLE_MS = 250;
 const INJECTED_TURN_DEADLINE_MS = 60_000;
 
 /**
+ * How much of the echo stream to keep while looking for a marker.
+ *
+ * The marker is short and the scan only needs to span a split across
+ * chunk boundaries, so anything past this is a turn that did not carry
+ * one.
+ */
+const ECHO_SCAN_WINDOW = 512;
+
+/**
+ * A per-injection identity, written into the prompt and looked for in
+ * its echo.
+ *
+ * Matching the prompt's own text was not identity: a human who types the
+ * same string — `continue`, or the message they are answering — produces
+ * an echo indistinguishable from ours, and their turn walks off with the
+ * correlation. This is unique per prompt.
+ *
+ * Built from zero-width characters so it is invisible in the human's
+ * TUI, and encoded rather than numeric so the digits cannot show up
+ * either. If a leader ever normalises these away the marker simply never
+ * matches, and the injected turn ends at its deadline as `unknown` — a
+ * reported non-delivery, which is the failure worth having here.
+ * Silently attributing an answer to the wrong message is not.
+ */
+function echoMarker(id: number): string {
+  const bits = id.toString(2);
+  let encoded = "";
+  for (const bit of bits) encoded += bit === "1" ? "\u200d" : "\u200c";
+  return `\u200b${encoded}\u200b`;
+}
+
+/**
  * What became of an injected prompt that did not visibly run.
  *
  * - `rejected` — the leader answered with a JSON-RPC error. The prompt
@@ -189,11 +221,10 @@ export class GrokAdapter extends EventEmitter {
    * Owning it is not the same as being allowed to spend it. Grok's
    * leader queues an injected prompt behind whatever the human is
    * already doing, so between the write and the turn there can be one or
-   * more turns that are none of our business. `pendingEcho` is how the
-   * turn recognises itself: the leader echoes an injected prompt back
-   * down the proxy leg as a user message before answering it, so the
-   * correlation is claimable only once the text this adapter wrote has
-   * come back verbatim.
+   * more turns that are none of our business. `started` is how the turn
+   * recognises itself: the leader echoes an injected prompt back down
+   * the proxy leg as a user message before answering it, and that echo
+   * carries this injection's marker.
    */
   private activeInjection: {
     correlation: GrokInjectionCorrelation | null;
@@ -204,18 +235,30 @@ export class GrokAdapter extends EventEmitter {
     /** Why this turn ended, once something has ended it. */
     reason: string;
     /** The prose for this turn has gone to the bus. */
-    emitted: boolean;
+    proseEmitted: boolean;
+    /** This injection's marker, as written into the prompt. */
+    marker: string;
     /**
-     * The part of our prompt's echo not yet seen, or `null` once the
-     * whole of it has come back and this turn has therefore started.
+     * Our prompt's echo has come back, so this turn is running and the
+     * prose on the proxy leg is now ours to claim.
+     *
+     * Deliberately a fact of its own rather than something derived from
+     * "is there prose buffered". Prose alone was what let the human's
+     * turn — the one the leader was already running when we wrote —
+     * settle against our correlation.
      */
-    pendingEcho: string | null;
-    /** Text of the echo matched so far in the current candidate turn. */
+    started: boolean;
+    /** Recent echo text, scanned for the marker across chunk splits. */
     echoSeen: string;
     /**
-     * The deadline passed with nothing to show, the sender has been told
-     * `unknown`, and the slot is held until something authoritative says
-     * the prompt cannot still run.
+     * The deadline passed, the sender has been told `unknown`, and the
+     * slot is held until something authoritative says the prompt cannot
+     * still run.
+     *
+     * Distinct from `proseEmitted`, which the release path reads as "this
+     * turn is fully accounted for, free the slot". Conflating them let a
+     * verdict for an abandoned prompt free the slot while its answer was
+     * still in flight on the other socket.
      */
     abandoned: boolean;
     /** Absolute give-up point, from write time. */
@@ -342,7 +385,7 @@ export class GrokAdapter extends EventEmitter {
    *
    * What that costs is one turn's worth of ambiguity: between this write
    * and our answer there can be human turns whose prose is not ours to
-   * claim. `pendingEcho` is what separates them.
+   * claim. The echo marker is what separates them.
    */
   injectMessage(text: string, correlation?: GrokInjectionCorrelation): boolean {
     const sessionId = this.sessionIdValue;
@@ -358,6 +401,7 @@ export class GrokAdapter extends EventEmitter {
     if (injector === null) return false;
 
     const id = this.nextRequestId++;
+    const marker = echoMarker(id);
     this.log(`Injecting message into Grok (${text.length} chars)`);
     // Installed before the write, not after: nothing here guarantees the
     // response cannot arrive synchronously, and state installed
@@ -367,8 +411,9 @@ export class GrokAdapter extends EventEmitter {
       id,
       verdictSeen: false,
       reason: "",
-      emitted: false,
-      pendingEcho: text,
+      proseEmitted: false,
+      marker,
+      started: false,
       echoSeen: "",
       abandoned: false,
       deadline: Date.now() + this.deadlineMs,
@@ -380,7 +425,10 @@ export class GrokAdapter extends EventEmitter {
         jsonrpc: "2.0",
         id,
         method: "session/prompt",
-        params: { sessionId, prompt: [{ type: "text", text }] },
+        // The marker rides in the prompt because the echo is the only
+        // place it can be read back from. Zero-width, so the human's
+        // session shows exactly what was sent.
+        params: { sessionId, prompt: [{ type: "text", text: text + marker }] },
       }));
     } catch (err) {
       this.endInjection();
@@ -407,28 +455,63 @@ export class GrokAdapter extends EventEmitter {
     const injection = this.activeInjection;
     if (!injection) return;
     if (injection.timer) clearTimeout(injection.timer);
-    const remaining = Math.max(0, injection.deadline - Date.now());
-    const settling = injection.verdictSeen && (this.turnActive || this.chunks.length > 0);
-    const wait = settling ? Math.min(this.settleMs, remaining) : remaining;
+    let wait: number;
+    if (injection.abandoned) {
+      // Nothing is timed for an abandoned injection until its verdict
+      // arrives: the slot is released by evidence, not by waiting
+      // longer. Once the verdict is in, one settle interval covers an
+      // answer still crossing the other socket, so it reaches the bus
+      // before the next prompt goes out.
+      if (!injection.verdictSeen) return;
+      wait = this.settleMs;
+    } else if (this.canSettle(injection)) {
+      wait = Math.min(this.settleMs, Math.max(0, injection.deadline - Date.now()));
+    } else {
+      wait = Math.max(0, injection.deadline - Date.now());
+    }
     injection.timer = setTimeout(() => this.onInjectionTimer(), wait);
     injection.timer.unref?.();
+  }
+
+  /**
+   * Whether buffered prose is this injection's answer, finished.
+   *
+   * All three have to hold. `started` says the prose belongs to us
+   * rather than to the turn the leader was already running; `verdictSeen`
+   * says the leader considers it finished; the buffer says there is
+   * something to end. Dropping `started` from this is what let the
+   * human's turn settle against our correlation when a verdict beat the
+   * echo across the sockets.
+   */
+  private canSettle(injection: NonNullable<GrokAdapter["activeInjection"]>): boolean {
+    return injection.started && injection.verdictSeen && (this.turnActive || this.chunks.length > 0);
   }
 
   /** The outstanding injected turn either settled or ran out of time. */
   private onInjectionTimer(): void {
     const injection = this.activeInjection;
     if (!injection) return;
-    const expired = Date.now() >= injection.deadline;
-    const hasProse = this.turnActive || this.chunks.length > 0;
 
-    if (hasProse && (injection.verdictSeen || expired)) {
-      // Settled, or out of time with something to show for it. Either
-      // way this is the boundary.
+    if (injection.abandoned) {
+      // Only the post-verdict settle arms a timer here, and the verdict
+      // is the evidence that releases the slot. Whatever arrived in the
+      // meantime goes to the bus unowned — its correlation was reported
+      // `unknown` when the deadline passed.
+      if (injection.verdictSeen) {
+        this.flush("the abandoned injected turn's answer arrived late");
+        this.endInjection();
+      }
+      return;
+    }
+    if (this.canSettle(injection)) {
       this.flush(injection.reason || "the injected turn settled");
       this.endInjection();
       return;
     }
-    if (expired) {
+    if (Date.now() >= injection.deadline) {
+      // Always abandon, never end — buffered prose does not make a
+      // deadline into proof that the prompt cannot still run, and the
+      // prose may not even be ours if the turn never started.
       this.abandonInjection(
         `no answer streamed within ${this.deadlineMs}ms of the prompt being written`,
       );
@@ -458,8 +541,6 @@ export class GrokAdapter extends EventEmitter {
     if (injection.timer) clearTimeout(injection.timer);
     injection.timer = null;
     injection.abandoned = true;
-    // Nothing further may claim this correlation: it has been reported.
-    injection.emitted = true;
     this.log(`Giving up on the injected turn: ${reason}`);
     this.reportUndelivered(injection.correlation, reason, "unknown");
   }
@@ -544,7 +625,7 @@ export class GrokAdapter extends EventEmitter {
       // `unknown` rather than rejected: the prompt was written, and the
       // leader may have run it where this bridge can no longer watch.
       const injection = this.activeInjection;
-      if (injection && !injection.emitted) {
+      if (injection && !injection.abandoned && !injection.proseEmitted) {
         this.reportUndelivered(
           injection.correlation,
           "the Grok TUI disconnected before the injected turn's answer arrived",
@@ -744,10 +825,14 @@ export class GrokAdapter extends EventEmitter {
     // The prose may already have gone to the bus — the human's next
     // prompt can end this turn before its verdict crosses the other
     // socket. Nothing is left to wait for in that case.
-    if (injection.emitted) {
+    if (injection.proseEmitted && !injection.abandoned) {
       this.endInjection();
       return;
     }
+    // Otherwise the answer may still be crossing the other socket —
+    // including for an abandoned injection, whose slot this verdict is
+    // the evidence to release. `armInjectionTimer` decides how long that
+    // is worth waiting for.
     this.armInjectionTimer();
   }
 
@@ -756,32 +841,23 @@ export class GrokAdapter extends EventEmitter {
    *
    * The leader queues an injected prompt behind whatever the human is
    * already doing, so the turns between the write and the answer are not
-   * ours. The echo is the only marker that distinguishes them: the text
-   * this adapter wrote, returned verbatim as a user message, immediately
-   * before the answer to it. Until the whole of it has come back the
-   * correlation is owned but unclaimable, which is what stops a human
-   * turn ending in between from walking off with it.
+   * ours. The echo is the only marker that distinguishes them: this
+   * injection's own marker, returned as a user message immediately
+   * before the answer to it. Until it comes back the correlation is
+   * owned but unclaimable, which is what stops a human turn ending in
+   * between from walking off with it.
    *
-   * Matched as a prefix across chunks, because the leader is free to
-   * split it. A chunk that does not continue the match resets it — that
-   * is a different prompt — but is still tried as a fresh start, since
-   * the human's prompt and ours arrive through the same event.
+   * Scanned across a rolling window rather than matched chunk by chunk,
+   * because the leader is free to split a user message anywhere,
+   * including through the middle of the marker.
    */
   private matchInjectionEcho(text: string | null): void {
     const injection = this.activeInjection;
-    if (!injection || injection.pendingEcho === null || text === null) return;
-    const expected = injection.pendingEcho;
-    const continued = injection.echoSeen + text;
-    if (expected.startsWith(continued)) {
-      injection.echoSeen = continued;
-    } else if (expected.startsWith(text)) {
-      injection.echoSeen = text;
-    } else {
-      injection.echoSeen = "";
-      return;
-    }
-    if (injection.echoSeen.length < expected.length) return;
-    injection.pendingEcho = null;
+    if (!injection || injection.started || text === null) return;
+    const seen = (injection.echoSeen + text).slice(-ECHO_SCAN_WINDOW);
+    injection.echoSeen = seen;
+    if (!seen.includes(injection.marker)) return;
+    injection.started = true;
     injection.echoSeen = "";
     this.log("Our injected prompt came back on the proxy leg; its turn has started");
   }
@@ -815,20 +891,31 @@ export class GrokAdapter extends EventEmitter {
    * saying "Grok never saw it" would be a claim this side cannot make,
    * and acting on it — a resend — can run the same turn twice, with
    * whatever file writes and tool calls that turn made.
+   *
+   * Terminal for the slot, unlike a deadline. A deadline is this side
+   * giving up on evidence that may still arrive; a closed injector is
+   * the evidence itself becoming impossible, because the verdict has no
+   * socket left to arrive on. Holding the slot for it would wedge every
+   * later injection until the session ended. The correlation is spent
+   * here, so an answer the leader streams anyway reaches the bus at the
+   * next turn boundary owned by nobody — which is what the sender was
+   * just told.
    */
   private failInflightInjections(reason: string): void {
     const injection = this.activeInjection;
+    // A verdict already in hand means this turn is accounted for and the
+    // settle timer owns what happens next; the socket closing after that
+    // says nothing new.
     if (!injection || injection.verdictSeen) return;
     this.log(`Failing the in-flight injection: ${reason}`);
-    this.reportUndelivered(injection.correlation, reason, "unknown");
-    // Reported, but not ended. "Unknown" cuts both ways: the leader may
-    // well be running this prompt right now, and its answer will stream
-    // down the proxy leg like any other. The verdict that would have
-    // closed the turn is never coming, so the deadline is now the only
-    // thing that will — which is exactly what the deadline is for. Ending
-    // here would free the slot for a second injection racing a turn that
-    // is still running, and leave that answer with no correlation.
+    // An abandoned injection has already been reported `unknown`; saying
+    // it twice would have the sender act on one message two ways.
+    if (!injection.abandoned) {
+      this.reportUndelivered(injection.correlation, reason, "unknown");
+    }
+    this.endInjection();
   }
+
 
   // ── Turn bookkeeping ───────────────────────────────────────
 
@@ -839,7 +926,7 @@ export class GrokAdapter extends EventEmitter {
     // injection was holding its slot waiting for.
     if (this.sessionIdValue !== null) {
       const injection = this.activeInjection;
-      if (injection && !injection.emitted) {
+      if (injection && !injection.abandoned && !injection.proseEmitted) {
         this.reportUndelivered(
           injection.correlation,
           "the Grok session changed before the injected turn's answer arrived",
@@ -875,11 +962,12 @@ export class GrokAdapter extends EventEmitter {
     // Claimed once: a second turn's prose is not this injection's answer.
     const injection = this.activeInjection;
     let respondingTo: GrokInjectionCorrelation | null = null;
-    // `pendingEcho === null` is the whole gate: our prompt has come back,
-    // so what is buffered is the answer to it and not a human turn the
-    // leader ran first.
-    if (injection && injection.pendingEcho === null && !injection.emitted) {
-      injection.emitted = true;
+    // `started` is the whole gate: our prompt has come back, so what is
+    // buffered is the answer to it and not a human turn the leader ran
+    // first. An abandoned injection is excluded because its correlation
+    // has already been reported `unknown` to the sender.
+    if (injection && injection.started && !injection.abandoned && !injection.proseEmitted) {
+      injection.proseEmitted = true;
       respondingTo = injection.correlation;
     }
 
