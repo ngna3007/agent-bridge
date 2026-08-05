@@ -6517,6 +6517,53 @@ var require_dist = __commonJS((exports, module) => {
   exports.default = formatsPlugin;
 });
 
+// src/windows-guard.ts
+import { platform } from "os";
+var ALLOW_NATIVE_WINDOWS_ENV = "AGENTBRIDGE_ALLOW_NATIVE_WINDOWS";
+var REFUSAL = `AgentBridge does not support native Windows.
+
+Run it under WSL2 instead \u2014 AgentBridge works there unmodified, and
+WSL2 is also what OpenAI recommends for Codex CLI, so it is the better
+environment for both halves of the bridge.
+
+Setup, from PowerShell:
+
+  1. wsl --install -d Ubuntu        # then reboot if prompted
+  2. wsl                            # drop into the Ubuntu shell
+  3. curl -fsSL https://bun.sh/install | bash
+  4. npm install -g @anthropic-ai/claude-code @openai/codex
+  5. cd /mnt/c/path/to/your/project
+  6. npm install -g @rowanng/agentbridge
+  7. abg init
+
+Keep the project on the Linux filesystem (~/code/...) rather than under
+/mnt/c if you can \u2014 cross-filesystem file watching is slow enough to be
+noticeable.
+
+Details: https://github.com/ngna3007/agent-bridge/blob/master/docs/windows.md`;
+var OVERRIDE_WARNING = `[abg] ${ALLOW_NATIVE_WINDOWS_ENV}=1 \u2014 running on native Windows anyway.
+[abg] Unsupported. Daemon identity checks and graceful shutdown do not
+[abg] work here; expect refused kills, orphaned processes, and a 30s
+[abg] readiness timeout on launch. See docs/windows.md.`;
+var PLATFORM_EXEMPT_COMMANDS = new Set(["--help", "-h", "--version", "-v"]);
+function checkPlatformSupport(osPlatform = platform(), env = process.env) {
+  if (osPlatform !== "win32")
+    return { action: "proceed" };
+  if (env[ALLOW_NATIVE_WINDOWS_ENV] === "1") {
+    return { action: "warn", message: OVERRIDE_WARNING };
+  }
+  return { action: "refuse", message: REFUSAL };
+}
+function assertSupportedPlatform(write = (s) => process.stderr.write(s), exit = process.exit) {
+  const verdict = checkPlatformSupport();
+  if (verdict.action === "proceed")
+    return;
+  write(`${verdict.message}
+`);
+  if (verdict.action === "refuse")
+    exit(1);
+}
+
 // node_modules/zod/v4/core/core.js
 var NEVER = Object.freeze({
   status: "aborted"
@@ -13663,7 +13710,7 @@ import { randomUUID } from "crypto";
 // src/state-dir.ts
 import { mkdirSync, existsSync } from "fs";
 import { join } from "path";
-import { homedir, platform } from "os";
+import { homedir, platform as platform2 } from "os";
 
 class StateDirResolver {
   stateDir;
@@ -13671,7 +13718,7 @@ class StateDirResolver {
     const override = envOverride ?? process.env.AGENTBRIDGE_STATE_DIR;
     if (override) {
       this.stateDir = override;
-    } else if (platform() === "darwin") {
+    } else if (platform2() === "darwin") {
       this.stateDir = join(homedir(), "Library", "Application Support", "AgentBridge");
     } else {
       const xdgState = process.env.XDG_STATE_HOME ?? join(homedir(), ".local", "state");
@@ -15011,6 +15058,7 @@ function dispositionFor(id, hint) {
 if (process.env.AGENTBRIDGE_ACTIVE !== "1") {
   process.exit(0);
 }
+assertSupportedPlatform();
 var stateDir = new StateDirResolver;
 stateDir.ensure();
 var configService = new ConfigService;

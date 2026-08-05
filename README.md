@@ -72,6 +72,8 @@ Each message carries a `source` field (`"claude"` or `"codex"`). The bridge neve
 
 > **Note:** Bun is required as the runtime for the AgentBridge daemon and plugin server. Node.js alone is not sufficient.
 
+**Platforms:** macOS and Linux. On Windows, run AgentBridge inside WSL2 — it works there unmodified, and WSL2 is also what OpenAI recommends for Codex CLI. Native Windows is not supported and `abg` refuses to start there; see [docs/windows.md](docs/windows.md) for setup and for why.
+
 ## Quick Start
 
 ### Install via Plugin Marketplace (recommended)
