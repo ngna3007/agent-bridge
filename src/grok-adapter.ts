@@ -203,6 +203,13 @@ export class GrokAdapter extends EventEmitter {
   private nextRequestId = 1;
 
   /**
+   * Non-zero while the session or the TUI is being changed, so a slot
+   * freed mid-change is announced against the state that results.
+   */
+  private transitionDepth = 0;
+  private capacityDeferred = false;
+
+  /**
    * The one injected turn the adapter is tracking, from the moment its
    * prompt is written until it is fully accounted for.
    *
@@ -610,7 +617,44 @@ export class GrokAdapter extends EventEmitter {
     if (!injection) return;
     if (injection.timer) clearTimeout(injection.timer);
     this.activeInjection = null;
-    if (!this.stopped) this.emit("injectionCapacity");
+    this.announceCapacity();
+  }
+
+  /**
+   * Say the slot is free, once the destination for it is real.
+   *
+   * The daemon injects synchronously on this event, so "the slot is
+   * free" has to mean "and there is a stable session to put the next
+   * prompt in". Freeing a slot in the middle of a session change or a
+   * TUI teardown announced it against the state being torn down: the
+   * next prompt was written to the session being left, or written and
+   * then immediately reported undelivered by the teardown that was still
+   * running. Held until the transition commits.
+   */
+  private announceCapacity(): void {
+    if (this.stopped) return;
+    if (this.transitionDepth > 0) {
+      this.capacityDeferred = true;
+      return;
+    }
+    this.emit("injectionCapacity");
+  }
+
+  /**
+   * Run a change of destination — the session, or the TUI itself — with
+   * capacity announcements held until it has committed.
+   */
+  private transition(mutate: () => void): void {
+    this.transitionDepth += 1;
+    try {
+      mutate();
+    } finally {
+      this.transitionDepth -= 1;
+    }
+    if (this.transitionDepth === 0 && this.capacityDeferred) {
+      this.capacityDeferred = false;
+      this.announceCapacity();
+    }
   }
 
   // ── The proxy leg ──────────────────────────────────────────
@@ -663,35 +707,52 @@ export class GrokAdapter extends EventEmitter {
 
     const teardown = () => {
       if (this.tui !== client) return;
-      this.tui = null;
-      client.close();
-      upstream.close();
-      // A turn that was mid-flight will never get its response now. Its
-      // prose is real and already streamed, so it goes to the bus rather
-      // than being held for a boundary that is not coming.
-      this.flush("the Grok TUI disconnected");
-      // The observer leg is the only way an injected turn's answer is
-      // ever seen. With it gone, an injection that has not already
-      // emitted cannot be observed to finish no matter how long the
-      // deadline runs — and holding the slot open would refuse
-      // injections for a session that no longer exists. Reported
-      // `unknown` rather than rejected: the prompt was written, and the
-      // leader may have run it where this bridge can no longer watch.
-      const injection = this.activeInjection;
-      if (injection && !injection.abandoned && !injection.proseEmitted) {
-        this.reportUndelivered(
-          injection.correlation,
-          "the Grok TUI disconnected before the injected turn's answer arrived",
-          "unknown",
-        );
-      }
-      this.endInjection();
-      this.sessionIdValue = null;
-      this.log("Grok TUI disconnected");
-      this.emit("tuiDisconnected");
+      this.transition(() => this.tearDownTui(client, upstream));
     };
     client.onClose(teardown);
     upstream.onClose(teardown);
+  }
+
+  /**
+   * The TUI is gone: end what it was carrying, then say so.
+   *
+   * Runs inside a transition because the flush can complete an injected
+   * turn, and completing one frees a slot — which the daemon fills
+   * synchronously. Announced from in here, the next prompt would be
+   * written to a session this method is about to drop and then reported
+   * undelivered by the rest of this same teardown.
+   */
+  private tearDownTui(client: LeaderConnection, upstream: LeaderConnection): void {
+    this.tui = null;
+    client.close();
+    upstream.close();
+    // The session is dropped first: the flush below can complete an
+    // injected turn, and a completed turn frees a slot. Even held to the
+    // end of the transition, the destination that capacity is announced
+    // against must be the one that survives this method.
+    this.sessionIdValue = null;
+    // A turn that was mid-flight will never get its response now. Its
+    // prose is real and already streamed, so it goes to the bus rather
+    // than being held for a boundary that is not coming.
+    this.flush("the Grok TUI disconnected");
+    // The observer leg is the only way an injected turn's answer is
+    // ever seen. With it gone, an injection that has not already
+    // emitted cannot be observed to finish no matter how long the
+    // deadline runs — and holding the slot open would refuse
+    // injections for a session that no longer exists. Reported
+    // `unknown` rather than rejected: the prompt was written, and the
+    // leader may have run it where this bridge can no longer watch.
+    const injection = this.activeInjection;
+    if (injection && !injection.abandoned && !injection.proseEmitted) {
+      this.reportUndelivered(
+        injection.correlation,
+        "the Grok TUI disconnected before the injected turn's answer arrived",
+        "unknown",
+      );
+    }
+    this.endInjection();
+    this.log("Grok TUI disconnected");
+    this.emit("tuiDisconnected");
   }
 
   /**
@@ -973,6 +1034,11 @@ export class GrokAdapter extends EventEmitter {
 
   private bindSession(sessionId: string): void {
     if (this.sessionIdValue === sessionId) return;
+    this.transition(() => this.rebindSession(sessionId));
+  }
+
+  /** The session change itself, run with capacity held. See `transition`. */
+  private rebindSession(sessionId: string): void {
     // Whatever was outstanding was addressed to the session being left.
     // It cannot run here now, which is the evidence an abandoned
     // injection was holding its slot waiting for.

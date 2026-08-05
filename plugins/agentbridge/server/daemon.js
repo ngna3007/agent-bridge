@@ -1581,6 +1581,8 @@ class GrokAdapter extends EventEmitter2 {
   chunks = [];
   turnSeq = 0;
   nextRequestId = 1;
+  transitionDepth = 0;
+  capacityDeferred = false;
   activeInjection = null;
   stopped = false;
   listening = false;
@@ -1759,8 +1761,28 @@ class GrokAdapter extends EventEmitter2 {
     if (injection.timer)
       clearTimeout(injection.timer);
     this.activeInjection = null;
-    if (!this.stopped)
-      this.emit("injectionCapacity");
+    this.announceCapacity();
+  }
+  announceCapacity() {
+    if (this.stopped)
+      return;
+    if (this.transitionDepth > 0) {
+      this.capacityDeferred = true;
+      return;
+    }
+    this.emit("injectionCapacity");
+  }
+  transition(mutate) {
+    this.transitionDepth += 1;
+    try {
+      mutate();
+    } finally {
+      this.transitionDepth -= 1;
+    }
+    if (this.transitionDepth === 0 && this.capacityDeferred) {
+      this.capacityDeferred = false;
+      this.announceCapacity();
+    }
   }
   attachTui(client) {
     if (this.stopped) {
@@ -1796,21 +1818,24 @@ class GrokAdapter extends EventEmitter2 {
     const teardown = () => {
       if (this.tui !== client)
         return;
-      this.tui = null;
-      client.close();
-      upstream.close();
-      this.flush("the Grok TUI disconnected");
-      const injection = this.activeInjection;
-      if (injection && !injection.abandoned && !injection.proseEmitted) {
-        this.reportUndelivered(injection.correlation, "the Grok TUI disconnected before the injected turn's answer arrived", "unknown");
-      }
-      this.endInjection();
-      this.sessionIdValue = null;
-      this.log("Grok TUI disconnected");
-      this.emit("tuiDisconnected");
+      this.transition(() => this.tearDownTui(client, upstream));
     };
     client.onClose(teardown);
     upstream.onClose(teardown);
+  }
+  tearDownTui(client, upstream) {
+    this.tui = null;
+    client.close();
+    upstream.close();
+    this.sessionIdValue = null;
+    this.flush("the Grok TUI disconnected");
+    const injection = this.activeInjection;
+    if (injection && !injection.abandoned && !injection.proseEmitted) {
+      this.reportUndelivered(injection.correlation, "the Grok TUI disconnected before the injected turn's answer arrived", "unknown");
+    }
+    this.endInjection();
+    this.log("Grok TUI disconnected");
+    this.emit("tuiDisconnected");
   }
   observe(framer, chunk, handle) {
     let frames;
@@ -1970,6 +1995,9 @@ class GrokAdapter extends EventEmitter2 {
   bindSession(sessionId) {
     if (this.sessionIdValue === sessionId)
       return;
+    this.transition(() => this.rebindSession(sessionId));
+  }
+  rebindSession(sessionId) {
     if (this.sessionIdValue !== null) {
       const injection = this.activeInjection;
       if (injection && !injection.abandoned && !injection.proseEmitted) {

@@ -593,6 +593,66 @@ describe("GrokAdapter injection", () => {
     ).toBe(true);
   });
 
+  test("a slot freed by a TUI teardown is not offered until the session is gone", () => {
+    // The daemon injects synchronously on `injectionCapacity`, so the
+    // event has to mean "there is somewhere to put the next prompt".
+    // Announced from inside a teardown, it handed the next message a
+    // session the same teardown was about to drop — and then reported
+    // that message undelivered on its way out.
+    const { adapter, tui, upstreams, leader } = harness();
+    tuiPrompts(tui, 1);
+    leader.deliverAcp({ jsonrpc: "2.0", id: 1, result: {} });
+
+    const seen: GrokProseIngress[] = [];
+    const failures: any[] = [];
+    adapter.on("agentMessage", (m: GrokProseIngress) => seen.push(m));
+    adapter.on("injectionRejected", (r: any) => failures.push(r));
+    adapter.injectMessage("what is 2+2", { messageId: "m1", requester: "claude", text: "q" });
+
+    const injector = upstreams[1]!;
+    echoInjected(leader, injector);
+    chunk(leader, "four");
+
+    const accepted: boolean[] = [];
+    adapter.on("injectionCapacity", () => {
+      accepted.push(
+        adapter.injectMessage("what is 3+3", { messageId: "m2", requester: "claude", text: "q2" }),
+      );
+    });
+    tui.hangUp();
+
+    // Refused, because by the time capacity is announced there is no
+    // session left to prompt into. The daemon holds m2 in the mailbox.
+    expect(accepted).toEqual([false]);
+    // m1's answer made it out on the teardown flush, so nothing is owed
+    // on it — and m2 never reached the wire, so nothing is owed there
+    // either. A capacity event announced mid-teardown produced both.
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.respondingTo?.messageId).toBe("m1");
+    expect(failures).toEqual([]);
+  });
+
+  test("a slot freed by a session change is offered against the new session", () => {
+    // The mirror case: capacity announced before `sessionIdValue` moved
+    // wrote the next prompt into the session being left.
+    const { adapter, tui, upstreams, leader } = harness();
+    tuiPrompts(tui, 1);
+    leader.deliverAcp({ jsonrpc: "2.0", id: 1, result: {} });
+
+    adapter.injectMessage("what is 2+2", { messageId: "m1", requester: "claude", text: "q" });
+    const injector = upstreams[1]!;
+
+    adapter.on("injectionCapacity", () => {
+      adapter.injectMessage("what is 3+3", { messageId: "m2", requester: "claude", text: "q2" });
+    });
+    // The human starts a turn in a different session.
+    tuiPrompts(tui, 2, OTHER_SID);
+
+    const prompts = injector.acpSent().filter((m: any) => m.method === "session/prompt");
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1].params.sessionId).toBe(OTHER_SID);
+  });
+
   test("a verdict that arrives before the prose is flushed still ends the turn", async () => {
     // Both halves of "this turn is accounted for" — the verdict and the
     // prose reaching the bus — cross different sockets in either order.
