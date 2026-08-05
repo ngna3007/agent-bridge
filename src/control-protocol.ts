@@ -30,6 +30,17 @@ export interface DaemonStatus {
   /** Claude→Codex replies deferred because Codex was mid-turn. */
   pendingReplyCount: number;
   /**
+   * Whether the daemon is listening on the Grok proxy socket.
+   *
+   * `abg grok` has to know this before it launches the TUI: a daemon
+   * that predates the proxy, or whose `listen` failed, is healthy
+   * without it, and a TUI pointed at an unowned path hangs on connect
+   * with nothing to say why. Reported rather than probed — connecting to
+   * find out claims the one TUI slot the adapter has, and the launcher
+   * would be racing its own probe's teardown for it.
+   */
+  grokProxyReady: boolean;
+  /**
    * Which project this daemon serves — `null` outside a project.
    *
    * Reported so a health probe can ask *whose* daemon answered. Ids

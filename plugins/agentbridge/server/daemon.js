@@ -1561,6 +1561,7 @@ class LeaderFramer {
 
 // src/grok-adapter.ts
 var INJECTED_TURN_SETTLE_MS = 250;
+var ORPHANED_INJECTION_WINDOW_MS = 60000;
 
 class GrokAdapter extends EventEmitter2 {
   server = null;
@@ -1576,9 +1577,11 @@ class GrokAdapter extends EventEmitter2 {
   ourPrompts = new Set;
   injectedCompletion = null;
   stopped = false;
+  listening = false;
   socketPath;
   upstreamPath;
   settleMs;
+  orphanWindowMs;
   logFile;
   makeServer;
   makeUpstream;
@@ -1587,6 +1590,7 @@ class GrokAdapter extends EventEmitter2 {
     this.socketPath = options.socketPath;
     this.upstreamPath = options.upstreamPath ?? defaultLeaderSocket();
     this.settleMs = options.injectedTurnSettleMs ?? INJECTED_TURN_SETTLE_MS;
+    this.orphanWindowMs = options.orphanedInjectionWindowMs ?? ORPHANED_INJECTION_WINDOW_MS;
     this.logFile = options.logFile ?? null;
     this.makeServer = options.createServer ?? (() => listenUnix(this.socketPath, (err) => this.log(`Cannot listen on ${this.socketPath}: ${describe(err)}`)));
     this.makeUpstream = options.createUpstream ?? (() => connectUnix(this.upstreamPath));
@@ -1603,14 +1607,25 @@ class GrokAdapter extends EventEmitter2 {
   get tuiConnected() {
     return this.tui !== null;
   }
+  get proxyListening() {
+    return this.listening;
+  }
   start() {
     const server = this.makeServer();
     this.server = server;
     server.onConnection((client) => this.attachTui(client));
-    this.log(`Listening for the Grok TUI on ${this.socketPath}`);
+    if (server.onListening) {
+      server.onListening(() => {
+        this.listening = true;
+        this.log(`Listening for the Grok TUI on ${this.socketPath}`);
+      });
+    } else {
+      this.listening = true;
+    }
   }
   stop() {
     this.stopped = true;
+    this.listening = false;
     this.takeInjectedCompletion();
     this.tui?.close();
     this.injector?.close();
@@ -1747,6 +1762,7 @@ class GrokAdapter extends EventEmitter2 {
     const kind = update?.sessionUpdate;
     if (kind === "user_message_chunk") {
       this.flush("a user message started a new turn");
+      this.rearmInjectedCompletion();
       return;
     }
     if (kind !== "agent_message_chunk")
@@ -1817,13 +1833,13 @@ class GrokAdapter extends EventEmitter2 {
       });
     }
   }
-  armInjectedCompletion(reason, correlation) {
+  armInjectedCompletion(reason, correlation, windowMs = this.settleMs) {
     if (this.injectedCompletion)
       this.settleInjectedCompletion();
     this.injectedCompletion = {
       correlation,
       reason,
-      timer: setTimeout(() => this.settleInjectedCompletion(), this.settleMs)
+      timer: setTimeout(() => this.settleInjectedCompletion(), windowMs)
     };
     this.injectedCompletion.timer.unref?.();
   }
@@ -1864,6 +1880,7 @@ class GrokAdapter extends EventEmitter2 {
           reason,
           delivery: "unknown"
         });
+        this.armInjectedCompletion(reason, correlation, this.orphanWindowMs);
       }
     }
   }
@@ -1882,10 +1899,10 @@ class GrokAdapter extends EventEmitter2 {
     this.emit("turnStarted");
   }
   flush(reason, respondingTo = null) {
-    const held = this.takeInjectedCompletion();
-    respondingTo ??= held?.correlation ?? null;
     if (!this.turnActive && this.chunks.length === 0)
       return;
+    const held = this.takeInjectedCompletion();
+    respondingTo ??= held?.correlation ?? null;
     const content = this.chunks.join("");
     const senderRef = `${this.sessionIdValue ?? "grok"}#${this.turnSeq}`;
     this.chunks = [];
@@ -1945,6 +1962,12 @@ function listenUnix(path, onError) {
   return {
     onConnection(cb) {
       server.on("connection", (socket) => cb(wrapSocket(socket)));
+    },
+    onListening(cb) {
+      if (server.listening)
+        cb();
+      else
+        server.on("listening", cb);
     },
     close() {
       server.close();
@@ -2459,6 +2482,21 @@ class DaemonLifecycle {
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
     throw new Error(`Timed out waiting for AgentBridge daemon health on ${this.healthUrl}`);
+  }
+  async isGrokProxyReady() {
+    const probe = await this.probe(this.healthUrl);
+    if (probe === null || !probe.ok || !this.acceptsDaemon(probe.body))
+      return false;
+    const body = probe.body;
+    return typeof body === "object" && body !== null && body.grokProxyReady === true;
+  }
+  async waitForGrokProxy(maxRetries = 20, delayMs = 250) {
+    for (let attempt = 0;attempt < maxRetries; attempt++) {
+      if (await this.isGrokProxyReady())
+        return true;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+    return false;
   }
   async isReady() {
     const probe = await this.probe(this.readyUrl);
@@ -3250,6 +3288,61 @@ class PendingRequests {
   }
 }
 
+// src/reply-obligations.ts
+class ReplyObligations {
+  ids = new Map;
+  require(id, now) {
+    this.ids.set(id, now);
+  }
+  has(id) {
+    return this.ids.has(id);
+  }
+  discharge(id) {
+    return this.ids.delete(id);
+  }
+  release(id) {
+    this.ids.delete(id);
+  }
+  sweep(now, ttlMs) {
+    const stale = [];
+    for (const [id, at] of this.ids) {
+      if (now - at > ttlMs)
+        stale.push(id);
+    }
+    for (const id of stale)
+      this.ids.delete(id);
+    return stale;
+  }
+  get size() {
+    return this.ids.size;
+  }
+}
+
+// src/grok-wake.ts
+function grokWakeTransport(deps) {
+  return {
+    payloadMode: "content",
+    acknowledgementMode: "none",
+    wake: (message) => {
+      const requireReply = deps.obligations.has(message.id);
+      const requester = isAgentId(message.from) ? message.from : "system";
+      const content = requireReply ? message.content + REPLY_REQUIRED_INSTRUCTION : message.content;
+      const accepted = deps.inject(content, {
+        messageId: message.id,
+        requester,
+        text: message.content
+      });
+      if (!accepted)
+        throw new Error("Grok has no live session to inject into");
+      deps.obligations.discharge(message.id);
+      if (requireReply && isAgentId(message.from)) {
+        deps.expectReply(message.from, message.id);
+        deps.log(`Reply required from Grok for ${message.id} (requester: ${message.from})`);
+      }
+    }
+  };
+}
+
 // src/wakeup-transport.ts
 class TransportRegistry {
   transports = new Map;
@@ -3549,7 +3642,7 @@ var idSeq = 0;
 function nextMessageId() {
   return `msg_${Date.now()}_${++idSeq}`;
 }
-var requireReplyIds = new Set;
+var obligations = new ReplyObligations;
 var codexDeferralNotes = new Map;
 var outboxRequester = new Map;
 function registerTransport2(agent, transport) {
@@ -3559,7 +3652,7 @@ registerTransport2("codex", {
   payloadMode: "content",
   acknowledgementMode: "none",
   wake: (message) => {
-    const requireReply = requireReplyIds.delete(message.id);
+    const requireReply = obligations.discharge(message.id);
     const requester = isAgentId(message.from) ? message.from : null;
     if (deliverToCodex(message.content, requireReply, requester, message.id)) {
       clearAttentionWindow();
@@ -3581,32 +3674,12 @@ registerTransport2("codex", {
     codexDeferralNotes.set(message.id, note);
   }
 });
-registerTransport2("grok", {
-  payloadMode: "content",
-  acknowledgementMode: "none",
-  wake: (message) => {
-    const requireReply = requireReplyIds.has(message.id);
-    const requester = isAgentId(message.from) ? message.from : "system";
-    const content = requireReply ? message.content + REPLY_REQUIRED_INSTRUCTION : message.content;
-    const accepted = grok.injectMessage(content, {
-      messageId: message.id,
-      requester,
-      text: message.content
-    });
-    if (!accepted)
-      throw new Error("Grok has no live session to inject into");
-    requireReplyIds.delete(message.id);
-    if (requireReply && isAgentId(message.from)) {
-      pendingRequests.add({
-        requester: message.from,
-        responder: "grok",
-        messageId: message.id,
-        at: Date.now()
-      });
-      log(`Reply required from Grok for ${message.id} (requester: ${message.from})`);
-    }
-  }
-});
+registerTransport2("grok", grokWakeTransport({
+  obligations,
+  inject: (content, correlation) => grok.injectMessage(content, correlation),
+  expectReply: (requester, messageId) => pendingRequests.add({ requester, responder: "grok", messageId, at: Date.now() }),
+  log
+}));
 function drainGrokBacklog(why) {
   const batch = mailboxFor("grok").drain(Date.now());
   if (batch.messages.length === 0)
@@ -4048,15 +4121,6 @@ function handleControlMessage(ws, raw) {
         });
         return;
       }
-      if (!tuiConnectionState.canReply()) {
-        sendProtocolMessage(ws, {
-          type: "claude_to_codex_result",
-          requestId: message.requestId,
-          success: false,
-          error: "Codex is not ready. Wait for TUI to connect and create a thread."
-        });
-        return;
-      }
       sendFromFrontend(ws, message.requestId, message.message, !!message.requireReply);
       return;
     }
@@ -4076,10 +4140,10 @@ async function sendFromFrontend(ws, requestId, frame, requireReply) {
     return;
   }
   if (requireReply)
-    requireReplyIds.add(envelope.id);
+    obligations.require(envelope.id, Date.now());
   const outcome = await routeThroughBus2(envelope);
-  requireReplyIds.delete(envelope.id);
   if (outcome.status === "failed") {
+    obligations.release(envelope.id);
     sendProtocolMessage(ws, {
       type: "claude_to_codex_result",
       requestId,
@@ -4394,6 +4458,7 @@ function currentStatus() {
     claudeAttached: frontends.isAttached(DEFAULT_FRONTEND_AGENT),
     attachedAgents: frontends.attachedAgents(),
     pendingReplyCount: replyOutbox.size,
+    grokProxyReady: grok.proxyListening,
     projectId: DAEMON_PROJECT_ID
   };
 }

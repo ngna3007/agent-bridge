@@ -1004,6 +1004,11 @@ const grokProxy = Bun.listen({
 
 function currentStatus() {
   return {
+    // The launcher asks the daemon whether the proxy socket is bound
+    // rather than connecting to find out — a connect-probe would claim
+    // the one TUI slot. The stand-in binds it above; the file check is
+    // how a test takes it away again.
+    grokProxyReady: existsSync(grokSocket),
     bridgeReady: false,
     tuiConnected: false,
     threadId: null,

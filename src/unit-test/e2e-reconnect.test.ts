@@ -116,7 +116,7 @@ describe("E2E: daemon lifecycle + reconnect", () => {
     await client.disconnect();
   }, 10000);
 
-  test("sendReply fails gracefully when Codex TUI is not connected", async () => {
+  test("sendReply holds the message when the Codex TUI is not connected", async () => {
     const client = new DaemonClient(WS_URL);
     await client.connect();
     client.attachClaude();
@@ -131,9 +131,14 @@ describe("E2E: daemon lifecycle + reconnect", () => {
       timestamp: Date.now(),
     });
 
-    // Should fail because no Codex TUI is connected
-    expect(result.success).toBe(false);
-    expect(result.error).toBeTruthy();
+    // Held, not refused. The daemon used to reject the send outright
+    // when Codex had no thread — a readiness rule sitting in front of
+    // routing, where it also refused messages addressed to agents that
+    // have nothing to do with Codex. Codex's own transport already
+    // knows how to hold one: the outbox keeps it and re-injects at the
+    // next thread, and the sender is told so.
+    expect(result.success).toBe(true);
+    expect(result.note ?? "").toContain("Held for delivery");
 
     await client.disconnect();
   }, 10000);

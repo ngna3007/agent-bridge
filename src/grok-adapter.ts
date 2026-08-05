@@ -50,6 +50,16 @@ export interface GrokProseIngress {
 const INJECTED_TURN_SETTLE_MS = 250;
 
 /**
+ * How long a correlation orphaned by a dead injector connection waits
+ * for the turn it belongs to to start streaming.
+ *
+ * Sized against a model, not against a socket: the prompt may already
+ * have reached the leader, and the first token of its answer is thinking
+ * time away. See `failInflightInjections`.
+ */
+const ORPHANED_INJECTION_WINDOW_MS = 60_000;
+
+/**
  * What became of an injected prompt that did not visibly run.
  *
  * - `rejected` — the leader answered with a JSON-RPC error. The prompt
@@ -89,6 +99,12 @@ export interface LeaderConnection {
 /** The listening half: accepts the Grok TUI's connections. */
 export interface ProxyServer {
   onConnection(cb: (client: LeaderConnection) => void): void;
+  /**
+   * Called once the socket is actually bound. Optional because `listen`
+   * on a unix socket succeeds asynchronously and a test fake is bound
+   * the moment it is made — a fake without this is treated as ready.
+   */
+  onListening?(cb: () => void): void;
   close(): void;
 }
 
@@ -103,6 +119,11 @@ export interface GrokAdapterOptions {
    * injected turn. See `armInjectedCompletion`. Injected by tests.
    */
   injectedTurnSettleMs?: number;
+  /**
+   * How long a correlation orphaned by a dead injector connection waits
+   * for its turn to appear. See `failInflightInjections`. Injected by tests.
+   */
+  orphanedInjectionWindowMs?: number;
   /** Injected by tests. */
   createServer?: () => ProxyServer;
   /** Injected by tests. Called once per TUI connection, plus once for injection. */
@@ -161,10 +182,13 @@ export class GrokAdapter extends EventEmitter {
   } | null = null;
 
   private stopped = false;
+  /** Whether the proxy socket is bound. `listen` reports it asynchronously. */
+  private listening = false;
 
   private readonly socketPath: string;
   private readonly upstreamPath: string;
   private readonly settleMs: number;
+  private readonly orphanWindowMs: number;
   private readonly logFile: string | null;
   private readonly makeServer: () => ProxyServer;
   private readonly makeUpstream: () => LeaderConnection;
@@ -174,6 +198,7 @@ export class GrokAdapter extends EventEmitter {
     this.socketPath = options.socketPath;
     this.upstreamPath = options.upstreamPath ?? defaultLeaderSocket();
     this.settleMs = options.injectedTurnSettleMs ?? INJECTED_TURN_SETTLE_MS;
+    this.orphanWindowMs = options.orphanedInjectionWindowMs ?? ORPHANED_INJECTION_WINDOW_MS;
     this.logFile = options.logFile ?? null;
     this.makeServer =
       options.createServer ??
@@ -205,6 +230,16 @@ export class GrokAdapter extends EventEmitter {
   }
 
   /**
+   * True once the proxy socket is bound and a TUI could connect.
+   *
+   * Reported through `/healthz` so `abg grok` can ask instead of
+   * connecting — see `DaemonLifecycle.isGrokProxyReady`.
+   */
+  get proxyListening(): boolean {
+    return this.listening;
+  }
+
+  /**
    * Start listening. Does not require a leader or a TUI to exist yet —
    * the socket is the thing `abg grok` needs to point the TUI at, and it
    * has to exist before there is anything to point.
@@ -213,11 +248,19 @@ export class GrokAdapter extends EventEmitter {
     const server = this.makeServer();
     this.server = server;
     server.onConnection((client) => this.attachTui(client));
-    this.log(`Listening for the Grok TUI on ${this.socketPath}`);
+    if (server.onListening) {
+      server.onListening(() => {
+        this.listening = true;
+        this.log(`Listening for the Grok TUI on ${this.socketPath}`);
+      });
+    } else {
+      this.listening = true;
+    }
   }
 
   stop(): void {
     this.stopped = true;
+    this.listening = false;
     this.takeInjectedCompletion();
     this.tui?.close();
     this.injector?.close();
@@ -419,6 +462,12 @@ export class GrokAdapter extends EventEmitter {
     // opened it came from us.
     if (kind === "user_message_chunk") {
       this.flush("a user message started a new turn");
+      // Our own injected prompt echoes back here, and it echoes back
+      // *before* the answer to it. A settle window opened by the
+      // leader's verdict is therefore waiting on prose that has not
+      // started yet — the echo is evidence it is about to. Push the
+      // window out rather than letting it fire in the gap.
+      this.rearmInjectedCompletion();
       return;
     }
     if (kind !== "agent_message_chunk") return;
@@ -528,7 +577,11 @@ export class GrokAdapter extends EventEmitter {
    * `settleMs`. The cost is that an injected turn's answer reaches the
    * bus `settleMs` late; the alternative is losing it.
    */
-  private armInjectedCompletion(reason: string, correlation: GrokInjectionCorrelation | null): void {
+  private armInjectedCompletion(
+    reason: string,
+    correlation: GrokInjectionCorrelation | null,
+    windowMs: number = this.settleMs,
+  ): void {
     // A second completion while one is pending means two injected turns
     // ran back to back. The older one's prose is already complete —
     // whatever is in the buffer belongs to it — so close it now rather
@@ -537,7 +590,7 @@ export class GrokAdapter extends EventEmitter {
     this.injectedCompletion = {
       correlation,
       reason,
-      timer: setTimeout(() => this.settleInjectedCompletion(), this.settleMs),
+      timer: setTimeout(() => this.settleInjectedCompletion(), windowMs),
     };
     this.injectedCompletion.timer.unref?.();
   }
@@ -597,6 +650,21 @@ export class GrokAdapter extends EventEmitter {
           reason,
           delivery: "unknown",
         } satisfies GrokInjectionRejection);
+        // "Unknown" cuts both ways. The leader may well be running this
+        // prompt right now, and its answer will stream down the proxy
+        // leg like any other — but the verdict that would have closed
+        // the turn is never coming, because the socket it would have
+        // arrived on is gone. Dropping the correlation here would leave
+        // that answer unattributed: no `respondingTo`, no requester, and
+        // a `require_reply` its own reply could not satisfy.
+        //
+        // So the correlation is handed to a settle window instead, one
+        // wide enough to cover the model's thinking time rather than the
+        // gap between two sockets. If prose starts, the first chunk
+        // re-arms it at the normal `settleMs` and the turn closes the
+        // usual way; if nothing arrives, the window fires against an
+        // empty buffer and the correlation is dropped with it.
+        this.armInjectedCompletion(reason, correlation, this.orphanWindowMs);
       }
     }
   }
@@ -618,13 +686,20 @@ export class GrokAdapter extends EventEmitter {
   }
 
   private flush(reason: string, respondingTo: GrokInjectionCorrelation | null = null): void {
-    // Whatever ends the turn takes ownership of a settle window still
-    // open on it — a TUI disconnect, or the next turn starting. Leaving
-    // the window armed would fire it against the *following* turn's
-    // buffer and attribute that turn to this injection.
+    // Nothing to end — and, crucially, nothing to attribute. A settle
+    // window open at this point belongs to a turn that has not arrived
+    // yet, not to this empty flush: the leader's verdict can beat both
+    // the prose it describes *and* the echo of our own injected prompt
+    // across the two sockets, and that echo lands here. Consuming the
+    // correlation on the way past would leave the answer, when it
+    // finally streams in, with no `respondingTo` and no boundary.
+    if (!this.turnActive && this.chunks.length === 0) return;
+    // Past this point a real turn is ending, so it takes ownership of
+    // any window still open on it — a TUI disconnect, or the next turn
+    // starting. Leaving it armed would fire it against the *following*
+    // turn's buffer and attribute that turn to this injection.
     const held = this.takeInjectedCompletion();
     respondingTo ??= held?.correlation ?? null;
-    if (!this.turnActive && this.chunks.length === 0) return;
     const content = this.chunks.join("");
     const senderRef = `${this.sessionIdValue ?? "grok"}#${this.turnSeq}`;
     this.chunks = [];
@@ -705,6 +780,10 @@ function listenUnix(path: string, onError: (err: unknown) => void): ProxyServer 
   return {
     onConnection(cb) {
       server.on("connection", (socket: Socket) => cb(wrapSocket(socket)));
+    },
+    onListening(cb) {
+      if (server.listening) cb();
+      else server.on("listening", cb);
     },
     close() {
       server.close();

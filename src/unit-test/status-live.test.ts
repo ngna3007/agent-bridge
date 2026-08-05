@@ -34,6 +34,7 @@ const BASE_STATUS: DaemonStatus = {
   claudeAttached: true,
   attachedAgents: ["claude"],
   pendingReplyCount: 0,
+  grokProxyReady: true,
   projectId: null,
 };
 

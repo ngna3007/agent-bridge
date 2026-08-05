@@ -1,38 +1,6 @@
 import { spawn } from "node:child_process";
-import { connect } from "node:net";
 import { DaemonLifecycle } from "../daemon-lifecycle";
 import { StateDirResolver } from "../state-dir";
-
-/**
- * Whether something is listening on `path` right now.
- *
- * Deliberately a connect and not an `existsSync`. A unix socket file
- * outlives the process that bound it — a daemon killed with SIGKILL
- * leaves one behind — and the stale file is exactly the case this check
- * exists to catch: the TUI would launch, connect to nothing, and hang
- * with no explanation. Only a completed connection proves an owner.
- */
-function socketAccepts(path: string): Promise<boolean> {
-  return new Promise((resolve) => {
-    const probe = connect(path);
-    const settle = (answer: boolean) => {
-      probe.destroy();
-      resolve(answer);
-    };
-    probe.once("connect", () => settle(true));
-    probe.once("error", () => settle(false));
-  });
-}
-
-/** Poll until the daemon's proxy socket accepts. False once `timeoutMs` is up. */
-async function waitForSocket(path: string, timeoutMs: number): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    if (await socketAccepts(path)) return true;
-    if (Date.now() >= deadline) return false;
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
-}
 
 /**
  * Start Grok Build attached to this project's bridge.
@@ -86,9 +54,14 @@ export async function runGrok(args: string[]) {
   // A healthy daemon is not the same as a daemon owning this socket: one
   // started before this feature existed, or one whose `listen` failed,
   // is healthy without it. Grok would then connect to nothing and hang.
-  // Wait for a listener, and if none appears, say what to do rather than
-  // handing the failure to the TUI.
-  if (!(await waitForSocket(stateDir.grokLeaderSocket, 5_000))) {
+  // Wait for the daemon to report the socket bound, and if it never
+  // does, say what to do rather than handing the failure to the TUI.
+  //
+  // Deliberately asked over `/healthz` rather than by connecting: the
+  // adapter hands its one TUI slot to the first connection it sees, so a
+  // connect-probe takes the slot the TUI is about to need and the launch
+  // races its own probe's teardown for it.
+  if (!(await lifecycle.waitForGrokProxy())) {
     console.error(`Error: the bridge is not listening on ${stateDir.grokLeaderSocket}.`);
     console.error("Run `abg kill` to restart the daemon, then try again.");
     console.error("If it persists, check `abg doctor` and the daemon log.");

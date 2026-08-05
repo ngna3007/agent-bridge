@@ -14673,6 +14673,21 @@ class DaemonLifecycle {
     }
     throw new Error(`Timed out waiting for AgentBridge daemon health on ${this.healthUrl}`);
   }
+  async isGrokProxyReady() {
+    const probe = await this.probe(this.healthUrl);
+    if (probe === null || !probe.ok || !this.acceptsDaemon(probe.body))
+      return false;
+    const body = probe.body;
+    return typeof body === "object" && body !== null && body.grokProxyReady === true;
+  }
+  async waitForGrokProxy(maxRetries = 20, delayMs = 250) {
+    for (let attempt = 0;attempt < maxRetries; attempt++) {
+      if (await this.isGrokProxyReady())
+        return true;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+    return false;
+  }
   async isReady() {
     const probe = await this.probe(this.readyUrl);
     return probe !== null && probe.ok && this.acceptsDaemon(probe.body);

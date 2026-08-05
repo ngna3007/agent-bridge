@@ -90,7 +90,7 @@ class FakeServer implements ProxyServer {
  * order: the TUI's proxied leg first, then the injection leg when it is
  * first needed.
  */
-function harness() {
+function harness(options: { orphanedInjectionWindowMs?: number } = {}) {
   const server = new FakeServer();
   const upstreams: FakeConnection[] = [];
   const adapter = new GrokAdapter({
@@ -100,6 +100,7 @@ function harness() {
     // would make the settle fire between two synchronous deliveries and
     // hide the very race it exists to close.
     injectedTurnSettleMs: SETTLE_MS,
+    orphanedInjectionWindowMs: options.orphanedInjectionWindowMs,
     createServer: () => server,
     createUpstream: () => {
       const conn = new FakeConnection();
@@ -120,6 +121,18 @@ function tuiPrompts(tui: FakeConnection, id: number | string, sessionId = SID): 
     id,
     method: "session/prompt",
     params: { sessionId, prompt: [{ type: "text", text: "hello" }] },
+  });
+}
+
+/** The echo of a prompt, the way the leader fans it back to every client. */
+function userChunk(leader: FakeConnection, text: string, sessionId = SID): void {
+  leader.deliverAcp({
+    jsonrpc: "2.0",
+    method: "session/update",
+    params: {
+      sessionId,
+      update: { sessionUpdate: "user_message_chunk", content: { type: "text", text } },
+    },
   });
 }
 
@@ -498,6 +511,57 @@ describe("GrokAdapter injection", () => {
     injector.deliverAcp({ jsonrpc: "2.0", id: promptId, result: { stopReason: "end_turn" } });
     chunk(leader, "four");
     expect(seen).toHaveLength(0);
+
+    await settle();
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.content).toBe("four");
+    expect(seen[0]?.respondingTo).toEqual({ messageId: "m1", requester: "claude", text: "q" });
+  });
+
+  test("the echo of our own prompt does not eat the answer's correlation", async () => {
+    // The real order, when the verdict wins its race: response on the
+    // injector leg, then the leader's echo of the prompt we injected on
+    // the proxy leg, then the answer. That echo ends a turn — it is how
+    // the adapter learns a new one started — and it used to consume the
+    // settle window on its way past, against an empty buffer. The
+    // answer then streamed in belonging to nobody.
+    const { adapter, tui, upstreams, leader } = harness();
+    tuiPrompts(tui, 1);
+    leader.deliverAcp({ jsonrpc: "2.0", id: 1, result: {} });
+
+    const seen: GrokProseIngress[] = [];
+    adapter.on("agentMessage", (m: GrokProseIngress) => seen.push(m));
+    adapter.injectMessage("what is 2+2", { messageId: "m1", requester: "claude", text: "q" });
+
+    const injector = upstreams[1]!;
+    const promptId = injector.acpSent().find((m) => m.method === "session/prompt").id;
+    injector.deliverAcp({ jsonrpc: "2.0", id: promptId, result: { stopReason: "end_turn" } });
+    userChunk(leader, "what is 2+2");
+    chunk(leader, "four");
+
+    await settle();
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.content).toBe("four");
+    expect(seen[0]?.respondingTo).toEqual({ messageId: "m1", requester: "claude", text: "q" });
+  });
+
+  test("a turn the leader ran anyway is still attributed after the injector dies", async () => {
+    // "Unknown" delivery cuts both ways. The verdict that would have
+    // closed this turn is never coming — the socket it would arrive on
+    // is gone — but the leader may have read the prompt before the
+    // socket died and be answering right now. Dropping the correlation
+    // with the connection left that answer unattributed, so the
+    // `require_reply` it settles could never be satisfied.
+    const { adapter, tui, upstreams, leader } = harness({ orphanedInjectionWindowMs: SETTLE_MS * 6 });
+    tuiPrompts(tui, 1);
+    leader.deliverAcp({ jsonrpc: "2.0", id: 1, result: {} });
+
+    const seen: GrokProseIngress[] = [];
+    adapter.on("agentMessage", (m: GrokProseIngress) => seen.push(m));
+    adapter.injectMessage("what is 2+2", { messageId: "m1", requester: "claude", text: "q" });
+
+    upstreams[1]!.hangUp();
+    chunk(leader, "four");
 
     await settle();
     expect(seen).toHaveLength(1);

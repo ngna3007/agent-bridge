@@ -55,6 +55,8 @@ import { Mailbox } from "./mailbox";
 import { MessageIndex } from "./message-index";
 import { MessageBus } from "./message-bus";
 import { PendingRequests } from "./pending-requests";
+import { ReplyObligations } from "./reply-obligations";
+import { grokWakeTransport } from "./grok-wake";
 import { TransportRegistry, type WakeupTransport } from "./wakeup-transport";
 import {
   deliveryHintFor,
@@ -317,13 +319,10 @@ function nextMessageId(): string {
 }
 
 /**
- * Ids whose sender asked Codex for a reply.
- *
- * The flag has to survive the gap between acceptance and the wake-up:
- * `bus.route` enqueues first and wakes afterwards, and the wake may be
- * deferred by a whole turn, so it cannot be a parameter of the send.
+ * Who is still owed a reply. See `src/reply-obligations.ts` for why this
+ * is one object and not a flag each path clears for itself.
  */
-const requireReplyIds = new Set<string>();
+const obligations = new ReplyObligations();
 
 /** Sender-facing text produced while waking Codex, read back by the send that caused it. */
 const codexDeferralNotes = new Map<string, string>();
@@ -360,7 +359,7 @@ registerTransport("codex", {
   payloadMode: "content",
   acknowledgementMode: "none",
   wake: (message) => {
-    const requireReply = requireReplyIds.delete(message.id);
+    const requireReply = obligations.discharge(message.id);
     const requester = isAgentId(message.from) ? message.from : null;
 
     if (deliverToCodex(message.content, requireReply, requester, message.id)) {
@@ -396,72 +395,16 @@ registerTransport("codex", {
   },
 });
 
-/**
- * A frontend's wake-up: push the message down its control socket.
- *
- * `payloadMode: "content"` describes the frame, not the outcome — a
- * `codex_to_claude` that leaves this process may still never reach the
- * model, which is why the mailbox keeps its copy until an ack. Throwing
- * is how a transport reports failure: `TransportRegistry.wake` turns it
- * into a logged `"failed"` and the message waits.
- */
-/**
- * Grok's wake-up: prompt the session the human's TUI is working in.
- *
- * Deliberately without the outbox Codex needs. A second `turn/start`
- * mid-turn is an error on Codex's app-server, so the daemon has to hold
- * the message and re-inject at the boundary; Grok's leader queues the
- * prompt and runs it at the next boundary itself. Re-implementing that
- * here would be a worse copy of something the server already does.
- *
- * The only refusal left is "there is no session yet" — no TUI has come
- * through the proxy. That throws, which leaves the message in the
- * mailbox for `drainGrokBacklog` to deliver when one arrives.
- */
-registerTransport("grok", {
-  payloadMode: "content",
-  acknowledgementMode: "none",
-  wake: (message) => {
-    // Read, don't consume. This wake is the one that can fail *and* keep
-    // the message: no session means a throw, and the mailbox holds the
-    // entry for `drainGrokBacklog` to retry. A `delete` here would have
-    // that retry deliver the message with no reply instruction and no
-    // pending request — the sender told a reply was required, and
-    // nothing in the system would be waiting for one. The Codex
-    // transport can consume because its deferral hands the obligation to
-    // the outbox entry; this one has nowhere to hand it but here.
-    const requireReply = requireReplyIds.has(message.id);
-    const requester = isAgentId(message.from) ? message.from : "system";
-    const content = requireReply ? message.content + REPLY_REQUIRED_INSTRUCTION : message.content;
-    // The correlation carries `message.content`, not `content`: the echo
-    // a rejection notice shows the sender should be what they wrote, not
-    // the instruction the daemon stapled to it.
-    const accepted = grok.injectMessage(content, {
-      messageId: message.id,
-      requester,
-      text: message.content,
-    });
-    if (!accepted) throw new Error("Grok has no live session to inject into");
-    // Consumed only now that the prompt is on the wire.
-    requireReplyIds.delete(message.id);
-
-    // Deliberately no `activeRequester.set` here. Grok's leader queues an
-    // injected prompt and runs it at the *next* turn boundary, so the
-    // human's turn may still be running — and its `turnCompleted` would
-    // clear the requester before the injected turn ever started. The
-    // adapter reports ownership per turn instead (`respondingTo`), and
-    // `handleGrokMessage` sets it at the moment the answer arrives.
-    if (requireReply && isAgentId(message.from)) {
-      pendingRequests.add({
-        requester: message.from,
-        responder: "grok",
-        messageId: message.id,
-        at: Date.now(),
-      });
-      log(`Reply required from Grok for ${message.id} (requester: ${message.from})`);
-    }
-  },
-});
+registerTransport(
+  "grok",
+  grokWakeTransport({
+    obligations,
+    inject: (content, correlation) => grok.injectMessage(content, correlation),
+    expectReply: (requester, messageId) =>
+      pendingRequests.add({ requester, responder: "grok", messageId, at: Date.now() }),
+    log,
+  }),
+);
 
 /**
  * Deliver what piled up while no Grok TUI was connected.
@@ -481,6 +424,15 @@ function drainGrokBacklog(why: string): void {
   }
 }
 
+/**
+ * A frontend's wake-up: push the message down its control socket.
+ *
+ * `payloadMode: "content"` describes the frame, not the outcome — a
+ * `codex_to_claude` that leaves this process may still never reach the
+ * model, which is why the mailbox keeps its copy until an ack. Throwing
+ * is how a transport reports failure: `TransportRegistry.wake` turns it
+ * into a logged `"failed"` and the message waits.
+ */
 function frontendTransport(agent: FrontendAgent): WakeupTransport {
   return {
     payloadMode: "content",
@@ -1316,16 +1268,15 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
         return;
       }
 
-      if (!tuiConnectionState.canReply()) {
-        sendProtocolMessage(ws, {
-          type: "claude_to_codex_result",
-          requestId: message.requestId,
-          success: false,
-          error: "Codex is not ready. Wait for TUI to connect and create a thread.",
-        });
-        return;
-      }
-
+      // Deliberately no Codex-readiness gate here. This frame is the
+      // only way *any* agent sends anything, and the destination is not
+      // known until `resolveRecipients` runs inside the bus — so a gate
+      // at this point refused a Claude→Grok message because Codex's TUI
+      // had not connected, in a bridge whose claim is that its agents
+      // are independent. Codex's readiness is Codex's transport's
+      // business: `deliverToCodex` returns false when there is no thread
+      // and the outbox holds the message until there is, which is a
+      // better answer than a refusal anyway.
       void sendFromFrontend(ws, message.requestId, message.message, !!message.requireReply);
       return;
     }
@@ -1366,13 +1317,21 @@ async function sendFromFrontend(
   }
 
   // The wake-up happens inside `bus.route` and cannot take arguments, so
-  // the flag is parked under the daemon-assigned id for it to collect.
-  if (requireReply) requireReplyIds.add(envelope.id);
+  // the obligation is parked under the daemon-assigned id for whichever
+  // transport ends up handing the message over to collect.
+  if (requireReply) obligations.require(envelope.id, Date.now());
 
   const outcome = await routeThroughBus(envelope);
-  requireReplyIds.delete(envelope.id);
 
   if (outcome.status === "failed") {
+    // Nothing was enqueued, so no transport will ever discharge this.
+    // Note what is deliberately *not* here: a discharge on the success
+    // path. A wake-up is best-effort — it can fail while the message
+    // stays in the mailbox for a later retry — so "the route returned"
+    // is not "an agent was handed the message", and clearing here left
+    // that retry with no reply instruction and nothing awaiting an
+    // answer.
+    obligations.release(envelope.id);
     sendProtocolMessage(ws, {
       type: "claude_to_codex_result",
       requestId,
@@ -1937,6 +1896,7 @@ function currentStatus(): DaemonStatus {
     claudeAttached: frontends.isAttached(DEFAULT_FRONTEND_AGENT),
     attachedAgents: frontends.attachedAgents(),
     pendingReplyCount: replyOutbox.size,
+    grokProxyReady: grok.proxyListening,
     projectId: DAEMON_PROJECT_ID,
   };
 }
