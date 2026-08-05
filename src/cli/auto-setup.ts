@@ -9,8 +9,8 @@
  * mode exists. Two projects launched that way silently fight over one
  * daemon slot.
  *
- * So we ask. On the first `abg claude` / `abg codex` in an unmarked
- * directory, offer to set the project up. Yes runs the same code path
+ * So we ask. On the first `abg claude` / `abg codex` / `abg grok` in an
+ * unmarked directory, offer to set the project up. Yes runs the same code path
  * as `abg init`; no is remembered per directory so the question is
  * asked exactly once.
  *
@@ -35,7 +35,7 @@ import { arrowPicker } from "./prompt";
 // from tests).
 
 /** Commands whose behavior depends on the project namespace. */
-const SETUP_AWARE_COMMANDS = new Set(["claude", "codex"]);
+const SETUP_AWARE_COMMANDS = new Set(["claude", "codex", "grok"]);
 
 export type SetupOfferDecision =
   | { offer: false; reason: SetupSkipReason }
