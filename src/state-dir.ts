@@ -88,6 +88,22 @@ export class StateDirResolver {
     return join(this.stateDir, "codex-wrapper.log");
   }
 
+  /**
+   * The leader socket this project's daemon listens on for the Grok TUI.
+   *
+   * `abg grok` passes this to `grok --leader-socket`, so the TUI talks to
+   * the daemon and the daemon forwards to the real machine-wide leader —
+   * the same man-in-the-middle shape the Codex proxy has, which is what
+   * makes a turn boundary observable rather than inferred.
+   *
+   * Kept short on purpose: a unix socket path is capped at ~104 bytes by
+   * the kernel, far below `PATH_MAX`, and the cap counts the whole state
+   * directory prefix.
+   */
+  get grokLeaderSocket(): string {
+    return join(this.stateDir, "grok.sock");
+  }
+
   get killedFile(): string {
     return join(this.stateDir, "killed");
   }

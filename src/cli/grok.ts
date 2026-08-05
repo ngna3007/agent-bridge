@@ -5,29 +5,28 @@ import { StateDirResolver } from "../state-dir";
 /**
  * Start Grok Build attached to this project's bridge.
  *
- * There is no Grok-specific adapter and no MCP registration to do.
- * Grok reads Claude Code's plugin registry, so it already loads
- * AgentBridge's MCP server and its `reply` / `get_messages` tools —
- * `grok inspect` lists us among the plugins it loads. What it was
- * missing is two environment variables:
+ * Grok talks to a *leader* — a shared backend process that owns the
+ * model connection and fans session updates out to every connected
+ * client. `--leader-socket` decides which one. Pointing it at the
+ * daemon puts AgentBridge in the middle of that connection: the daemon
+ * forwards every frame to the real machine-wide leader untouched, and
+ * reads the traffic on the way past.
  *
- *   AGENTBRIDGE_ACTIVE=1   the gate `bridge.ts` gets before it will
- *                          claim a frontend slot. Without it a plain
- *                          `grok` self-exits, which is what we want:
- *                          only sessions launched through `abg` join
- *                          the bus. It is set here rather than baked
- *                          into an MCP entry for exactly that reason.
+ * That is the same shape the Codex side has, and it is what buys Grok
+ * the same behaviour: the daemon sees the prompt the human sent and the
+ * response that closes it, so a turn boundary is observed rather than
+ * guessed, and it can inject a message into the live session over a
+ * second connection of its own.
  *
- *   AGENTBRIDGE_AGENT=grok the identity the daemon keys its frontend
- *                          slot by. Without it Grok attaches as Claude
- *                          and the two evict each other, since Claude
- *                          is what every frontend was before 0.8.
+ * Notably absent, compared to what this file used to do: no
+ * `AGENTBRIDGE_ACTIVE` / `AGENTBRIDGE_AGENT`. Grok no longer joins the
+ * bus as an MCP frontend claiming a slot — it is a proxied agent, like
+ * Codex, and the daemon speaks for it.
  *
- * Grok spawns the MCP server as a child process, so both are inherited.
- *
- * Note this wires the *outbound* half only: Grok can send into the bus
- * and read from it. Waking a live Grok TUI with an inbound message is
- * the leader socket, which is separate work (docs/scaling-plan.md 4.1a).
+ * Deliberately no role sync. Grok reads CLAUDE.md and AGENTS.md and has
+ * no instruction file of its own (GROK.md is not read as of grok
+ * 0.2.118), so there is nowhere to render a Grok role that Claude or
+ * Codex would not also read.
  */
 export async function runGrok(args: string[]) {
   const stateDir = new StateDirResolver();
@@ -42,16 +41,32 @@ export async function runGrok(args: string[]) {
   // Same as `abg claude`: an explicit launch clears a previous `abg
   // kill`, or the daemon would refuse to come back up.
   lifecycle.clearKilled();
+  // The daemon owns the socket we are about to hand Grok, so it has to
+  // be up *before* the TUI tries to connect — not merely eventually.
+  await lifecycle.ensureRunning();
 
-  // Deliberately no role sync. Grok reads CLAUDE.md and AGENTS.md and
-  // has no instruction file of its own (GROK.md is not read as of grok
-  // 0.2.114), so there is nowhere to render a Grok role that Claude or
-  // Codex would not also read. Until that is designed, Grok sees the
-  // other two agents' roles and no role of its own.
+  // A caller-supplied --leader-socket wins. Overriding it would be the
+  // wrong call in both directions: it is the one flag that decides
+  // which backend this TUI talks to, and silently rewriting it makes
+  // `abg grok --leader-socket /some/path` a lie.
+  const hasOwnSocket = args.some(
+    (a) => a === "--leader-socket" || a.startsWith("--leader-socket="),
+  );
+  const leaderArgs = hasOwnSocket ? [] : ["--leader-socket", stateDir.grokLeaderSocket];
 
-  const child = spawn("grok", args, {
+  // Grok loads Claude Code's plugin registry, so it spawns our MCP
+  // server whether or not we want it to. `AGENTBRIDGE_ACTIVE` is the
+  // gate that server checks before claiming a frontend slot — and an
+  // inherited one (this command was very likely typed in a terminal
+  // under `abg claude`) would have Grok's MCP child attach as Claude
+  // and evict the real one. Clear both, explicitly.
+  const env = { ...process.env };
+  delete env.AGENTBRIDGE_ACTIVE;
+  delete env.AGENTBRIDGE_AGENT;
+
+  const child = spawn("grok", [...leaderArgs, ...args], {
     stdio: "inherit",
-    env: { ...process.env, AGENTBRIDGE_ACTIVE: "1", AGENTBRIDGE_AGENT: "grok" },
+    env,
   });
 
   child.on("exit", (code) => {

@@ -57,6 +57,9 @@ class StateDirResolver {
   get codexWrapperLogFile() {
     return join(this.stateDir, "codex-wrapper.log");
   }
+  get grokLeaderSocket() {
+    return join(this.stateDir, "grok.sock");
+  }
   get killedFile() {
     return join(this.stateDir, "killed");
   }
@@ -1457,14 +1460,444 @@ class CodexAdapter extends EventEmitter {
   }
 }
 
+// src/grok-adapter.ts
+import { EventEmitter as EventEmitter2 } from "events";
+import { existsSync as existsSync2, unlinkSync as unlinkSync2 } from "fs";
+import { connect, createServer } from "net";
+import { homedir as homedir2 } from "os";
+import { join as join2 } from "path";
+
+// src/grok-acp.ts
+var GROK_ACP_PROTOCOL_VERSION = 1;
+function asObject(frame) {
+  if (typeof frame !== "object" || frame === null || Array.isArray(frame))
+    return null;
+  return frame;
+}
+function isId(v) {
+  return typeof v === "number" || typeof v === "string";
+}
+function isJsonRpcRequest(frame) {
+  const f = asObject(frame);
+  return f !== null && typeof f.method === "string" && isId(f.id);
+}
+function isJsonRpcResponse(frame) {
+  const f = asObject(frame);
+  return f !== null && f.method === undefined && isId(f.id) && (("result" in f) || ("error" in f));
+}
+function isJsonRpcNotification(frame) {
+  const f = asObject(frame);
+  return f !== null && typeof f.method === "string" && f.id === undefined;
+}
+function updateText(update) {
+  const text = update?.content?.text;
+  return typeof text === "string" && text.length > 0 ? text : null;
+}
+
+// src/grok-leader-protocol.ts
+var MAX_FRAME_BYTES = 64 * 1024 * 1024;
+
+class LeaderProtocolError extends Error {
+}
+function encodeLeaderFrame(frame) {
+  const body = Buffer.from(JSON.stringify(frame), "utf8");
+  const header = Buffer.alloc(4);
+  header.writeUInt32BE(body.length, 0);
+  return Buffer.concat([header, body]);
+}
+function encodeAcpFrame(message) {
+  return encodeLeaderFrame({ type: "acp", payload: JSON.stringify(message) });
+}
+function readAcpFrame(frame) {
+  if (frame.type !== "acp" || typeof frame.payload !== "string")
+    return null;
+  try {
+    return JSON.parse(frame.payload);
+  } catch {
+    return null;
+  }
+}
+function registerFrame(clientType) {
+  return encodeLeaderFrame({
+    type: "register",
+    client_type: clientType,
+    mode: "stdio",
+    capabilities: {
+      yolo_mode: false,
+      auto_mode: false,
+      client_version: "agentbridge",
+      code_nav_enabled: false,
+      terminal: false,
+      fs_read: false,
+      fs_write: false
+    }
+  });
+}
+
+class LeaderFramer {
+  buffer = Buffer.alloc(0);
+  push(chunk) {
+    this.buffer = this.buffer.length === 0 ? chunk : Buffer.concat([this.buffer, chunk]);
+    const frames = [];
+    while (this.buffer.length >= 4) {
+      const length = this.buffer.readUInt32BE(0);
+      if (length > MAX_FRAME_BYTES) {
+        throw new LeaderProtocolError(`Leader frame claims ${length} bytes, above the ${MAX_FRAME_BYTES} limit`);
+      }
+      if (this.buffer.length < 4 + length)
+        break;
+      const body = this.buffer.subarray(4, 4 + length).toString("utf8");
+      this.buffer = this.buffer.subarray(4 + length);
+      try {
+        frames.push(JSON.parse(body));
+      } catch {}
+    }
+    return frames;
+  }
+}
+
+// src/grok-adapter.ts
+class GrokAdapter extends EventEmitter2 {
+  server = null;
+  tui = null;
+  injector = null;
+  sessionIdValue = null;
+  turnActive = false;
+  tuiTurnRequestId = null;
+  chunks = [];
+  turnSeq = 0;
+  nextRequestId = 1;
+  injectionCorrelations = new Map;
+  ourPrompts = new Set;
+  stopped = false;
+  socketPath;
+  upstreamPath;
+  logFile;
+  makeServer;
+  makeUpstream;
+  constructor(options) {
+    super();
+    this.socketPath = options.socketPath;
+    this.upstreamPath = options.upstreamPath ?? defaultLeaderSocket();
+    this.logFile = options.logFile ?? null;
+    this.makeServer = options.createServer ?? (() => listenUnix(this.socketPath));
+    this.makeUpstream = options.createUpstream ?? (() => connectUnix(this.upstreamPath));
+  }
+  get proxySocketPath() {
+    return this.socketPath;
+  }
+  get sessionId() {
+    return this.sessionIdValue;
+  }
+  get turnPending() {
+    return this.turnActive;
+  }
+  get tuiConnected() {
+    return this.tui !== null;
+  }
+  start() {
+    const server = this.makeServer();
+    this.server = server;
+    server.onConnection((client) => this.attachTui(client));
+    this.log(`Listening for the Grok TUI on ${this.socketPath}`);
+  }
+  stop() {
+    this.stopped = true;
+    this.tui?.close();
+    this.injector?.close();
+    this.server?.close();
+    this.tui = null;
+    this.injector = null;
+    this.server = null;
+    this.sessionIdValue = null;
+  }
+  injectMessage(text, correlation) {
+    const sessionId = this.sessionIdValue;
+    if (sessionId === null) {
+      this.log("Cannot inject: no Grok session to inject into");
+      return false;
+    }
+    const injector = this.ensureInjector();
+    if (injector === null)
+      return false;
+    const id = this.nextRequestId++;
+    this.log(`Injecting message into Grok (${text.length} chars)`);
+    if (correlation)
+      this.injectionCorrelations.set(id, correlation);
+    this.ourPrompts.add(id);
+    try {
+      injector.write(encodeAcpFrame({
+        jsonrpc: "2.0",
+        id,
+        method: "session/prompt",
+        params: { sessionId, prompt: [{ type: "text", text }] }
+      }));
+    } catch (err) {
+      this.injectionCorrelations.delete(id);
+      this.ourPrompts.delete(id);
+      this.log(`Injection send failed: ${describe(err)}`);
+      return false;
+    }
+    return true;
+  }
+  attachTui(client) {
+    if (this.stopped) {
+      client.close();
+      return;
+    }
+    if (this.tui !== null) {
+      this.log("Refusing a second Grok TUI on this project's leader socket");
+      client.close();
+      return;
+    }
+    let upstream;
+    try {
+      upstream = this.makeUpstream();
+    } catch (err) {
+      this.log(`Cannot reach the Grok leader at ${this.upstreamPath}: ${describe(err)}`);
+      client.close();
+      return;
+    }
+    this.tui = client;
+    this.log("Grok TUI connected through the proxy");
+    this.emit("tuiConnected");
+    const fromTui = new LeaderFramer;
+    const fromLeader = new LeaderFramer;
+    client.onData((chunk) => {
+      upstream.write(chunk);
+      this.observe(fromTui, chunk, (acp) => this.observeFromTui(acp));
+    });
+    upstream.onData((chunk) => {
+      client.write(chunk);
+      this.observe(fromLeader, chunk, (acp) => this.observeFromLeader(acp));
+    });
+    const teardown = () => {
+      if (this.tui !== client)
+        return;
+      this.tui = null;
+      client.close();
+      upstream.close();
+      this.flush("the Grok TUI disconnected");
+      this.sessionIdValue = null;
+      this.log("Grok TUI disconnected");
+      this.emit("tuiDisconnected");
+    };
+    client.onClose(teardown);
+    upstream.onClose(teardown);
+  }
+  observe(framer, chunk, handle) {
+    let frames;
+    try {
+      frames = framer.push(chunk);
+    } catch (err) {
+      this.log(`Stopped reading a leader stream: ${describe(err)}`);
+      return;
+    }
+    for (const frame of frames) {
+      const acp = readAcpFrame(frame);
+      if (acp === null)
+        continue;
+      try {
+        handle(acp);
+      } catch (err) {
+        this.log(`Failed to interpret a leader frame: ${describe(err)}`);
+      }
+    }
+  }
+  observeFromTui(acp) {
+    if (!isJsonRpcRequest(acp))
+      return;
+    if (acp.method !== "session/prompt")
+      return;
+    const sessionId = readSessionId(acp.params);
+    if (sessionId === null)
+      return;
+    this.bindSession(sessionId);
+    this.tuiTurnRequestId = acp.id;
+    this.beginTurn();
+  }
+  observeFromLeader(acp) {
+    if (isJsonRpcResponse(acp)) {
+      if (this.tuiTurnRequestId !== null && acp.id === this.tuiTurnRequestId) {
+        this.tuiTurnRequestId = null;
+        this.flush("the leader answered the TUI's prompt");
+      }
+      const created = readSessionId(acp.result);
+      if (created !== null && this.sessionIdValue === null)
+        this.bindSession(created);
+      return;
+    }
+    if (!isJsonRpcNotification(acp))
+      return;
+    if (acp.method !== "session/update")
+      return;
+    const params = acp.params;
+    if (this.sessionIdValue === null || params?.sessionId !== this.sessionIdValue)
+      return;
+    const update = params.update;
+    const kind = update?.sessionUpdate;
+    if (kind === "user_message_chunk") {
+      this.flush("a user message started a new turn");
+      return;
+    }
+    if (kind !== "agent_message_chunk")
+      return;
+    const text = updateText(update);
+    if (text === null)
+      return;
+    this.beginTurn();
+    this.chunks.push(text);
+  }
+  ensureInjector() {
+    if (this.injector !== null)
+      return this.injector;
+    let conn;
+    try {
+      conn = this.makeUpstream();
+    } catch (err) {
+      this.log(`Cannot open an injection connection to the leader: ${describe(err)}`);
+      return null;
+    }
+    const framer = new LeaderFramer;
+    conn.onData((chunk) => this.observe(framer, chunk, (acp) => this.observeInjectorReply(acp)));
+    conn.onClose(() => {
+      if (this.injector === conn)
+        this.injector = null;
+      this.log("Injection connection to the leader closed");
+    });
+    try {
+      conn.write(registerFrame("agentbridge (bus injector)"));
+      conn.write(encodeAcpFrame({
+        jsonrpc: "2.0",
+        id: this.nextRequestId++,
+        method: "initialize",
+        params: {
+          protocolVersion: GROK_ACP_PROTOCOL_VERSION,
+          clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } }
+        }
+      }));
+    } catch (err) {
+      this.log(`Injection handshake failed: ${describe(err)}`);
+      conn.close();
+      return null;
+    }
+    this.injector = conn;
+    return conn;
+  }
+  observeInjectorReply(acp) {
+    if (!isJsonRpcResponse(acp))
+      return;
+    if (typeof acp.id !== "number" || !this.ourPrompts.has(acp.id))
+      return;
+    this.ourPrompts.delete(acp.id);
+    const correlation = this.injectionCorrelations.get(acp.id);
+    this.injectionCorrelations.delete(acp.id);
+    if (!acp.error)
+      return;
+    const reason = acp.error.message || "Grok refused the prompt";
+    this.log(`Injection rejected: ${reason}`);
+    if (correlation) {
+      this.emit("injectionRejected", { ...correlation, reason });
+    }
+  }
+  bindSession(sessionId) {
+    if (this.sessionIdValue === sessionId)
+      return;
+    this.sessionIdValue = sessionId;
+    this.log(`Attached to Grok session ${sessionId}`);
+    this.emit("sessionAttached", sessionId);
+  }
+  beginTurn() {
+    if (this.turnActive)
+      return;
+    this.turnActive = true;
+    this.turnSeq += 1;
+    this.emit("turnStarted");
+  }
+  flush(reason) {
+    if (!this.turnActive && this.chunks.length === 0)
+      return;
+    const content = this.chunks.join("");
+    const senderRef = `${this.sessionIdValue ?? "grok"}#${this.turnSeq}`;
+    this.chunks = [];
+    this.turnActive = false;
+    if (content.trim()) {
+      this.log(`Grok message completed (${content.length} chars, ${reason})`);
+      this.emit("agentMessage", { senderRef, content });
+    }
+    this.emit("turnCompleted");
+  }
+  log(msg) {
+    const line = `[${new Date().toISOString()}] [GrokAdapter] ${msg}
+`;
+    process.stderr.write(line);
+    if (this.logFile)
+      getRotatingLogger(this.logFile).write(line);
+  }
+}
+function defaultLeaderSocket() {
+  return join2(homedir2(), ".grok", "leader.sock");
+}
+function readSessionId(params) {
+  if (typeof params !== "object" || params === null)
+    return null;
+  const id = params.sessionId;
+  return typeof id === "string" ? id : null;
+}
+function wrapSocket(socket) {
+  return {
+    write(data) {
+      socket.write(data);
+    },
+    onData(cb) {
+      socket.on("data", (chunk) => cb(chunk));
+    },
+    onClose(cb) {
+      socket.on("close", cb);
+      socket.on("error", () => {});
+    },
+    close() {
+      socket.destroy();
+    }
+  };
+}
+function connectUnix(path) {
+  return wrapSocket(connect(path));
+}
+function listenUnix(path) {
+  if (existsSync2(path)) {
+    try {
+      unlinkSync2(path);
+    } catch {}
+  }
+  const server = createServer();
+  server.listen(path);
+  server.on("error", () => {});
+  return {
+    onConnection(cb) {
+      server.on("connection", (socket) => cb(wrapSocket(socket)));
+    },
+    close() {
+      server.close();
+      try {
+        if (existsSync2(path))
+          unlinkSync2(path);
+      } catch {}
+    }
+  };
+}
+function describe(err) {
+  return err instanceof Error ? err.message : String(err);
+}
+
 // src/status-line-writer.ts
-import { writeFileSync as writeFileSync2, mkdirSync as mkdirSync2, existsSync as existsSync2 } from "fs";
-import { dirname, join as join2 } from "path";
+import { writeFileSync as writeFileSync2, mkdirSync as mkdirSync2, existsSync as existsSync3 } from "fs";
+import { dirname, join as join3 } from "path";
 class StatusLineWriter {
   path;
   constructor(stateDir) {
     const dir = (stateDir ?? new StateDirResolver).dir;
-    this.path = join2(dir, "status.line");
+    this.path = join3(dir, "status.line");
   }
   get filePath() {
     return this.path;
@@ -1485,7 +1918,7 @@ class StatusLineWriter {
   }
   ensureDir() {
     const dir = dirname(this.path);
-    if (!existsSync2(dir)) {
+    if (!existsSync3(dir)) {
       mkdirSync2(dir, { recursive: true });
     }
   }
@@ -1780,16 +2213,16 @@ class TuiConnectionState {
 
 // src/daemon-lifecycle.ts
 import { spawn as spawn2, execFileSync as execFileSync2 } from "child_process";
-import { existsSync as existsSync3, readFileSync as readFileSync2, unlinkSync as unlinkSync2, writeFileSync as writeFileSync3, openSync, closeSync, constants } from "fs";
+import { existsSync as existsSync4, readFileSync as readFileSync2, unlinkSync as unlinkSync3, writeFileSync as writeFileSync3, openSync, closeSync, constants } from "fs";
 import { fileURLToPath } from "url";
 
 // src/port-preflight.ts
-import { connect } from "net";
+import { connect as connect2 } from "net";
 var PROBE_TIMEOUT_MS = 1500;
 var CONNECT_TIMEOUT_MS = 500;
 function isPortListening(port, timeoutMs = CONNECT_TIMEOUT_MS) {
   return new Promise((resolve) => {
-    const socket = connect({ port, host: "127.0.0.1" });
+    const socket = connect2({ port, host: "127.0.0.1" });
     const done = (answer) => {
       socket.removeAllListeners();
       socket.destroy();
@@ -1846,7 +2279,7 @@ function resolveDaemonPath() {
   ];
   for (const rel of candidates) {
     const abs = fileURLToPath(new URL(rel, import.meta.url));
-    if (existsSync3(abs))
+    if (existsSync4(abs))
       return abs;
   }
   return fileURLToPath(new URL("./daemon.ts", import.meta.url));
@@ -1996,12 +2429,12 @@ class DaemonLifecycle {
   }
   removePidFile() {
     try {
-      unlinkSync2(this.stateDir.pidFile);
+      unlinkSync3(this.stateDir.pidFile);
     } catch {}
   }
   removeStatusFile() {
     try {
-      unlinkSync2(this.stateDir.statusFile);
+      unlinkSync3(this.stateDir.statusFile);
     } catch {}
   }
   markKilled() {
@@ -2011,11 +2444,11 @@ class DaemonLifecycle {
   }
   clearKilled() {
     try {
-      unlinkSync2(this.stateDir.killedFile);
+      unlinkSync3(this.stateDir.killedFile);
     } catch {}
   }
   wasKilled() {
-    return existsSync3(this.stateDir.killedFile);
+    return existsSync4(this.stateDir.killedFile);
   }
   launch() {
     this.stateDir.ensure();
@@ -2070,7 +2503,7 @@ class DaemonLifecycle {
   }
   releaseLock() {
     try {
-      unlinkSync2(this.stateDir.lockFile);
+      unlinkSync3(this.stateDir.lockFile);
     } catch {}
   }
   async kill(gracefulTimeoutMs = 3000) {
@@ -2137,8 +2570,8 @@ function isProcessAlive(pid) {
 }
 
 // src/config-service.ts
-import { readFileSync as readFileSync3, writeFileSync as writeFileSync4, mkdirSync as mkdirSync3, existsSync as existsSync4 } from "fs";
-import { join as join3 } from "path";
+import { readFileSync as readFileSync3, writeFileSync as writeFileSync4, mkdirSync as mkdirSync3, existsSync as existsSync5 } from "fs";
+import { join as join4 } from "path";
 var DEFAULT_CONFIG = {
   version: "1.0",
   codex: {
@@ -2190,11 +2623,11 @@ class ConfigService {
   configPath;
   constructor(projectRoot) {
     const root = projectRoot ?? process.cwd();
-    this.configDir = join3(root, CONFIG_DIR);
-    this.configPath = join3(this.configDir, CONFIG_FILE);
+    this.configDir = join4(root, CONFIG_DIR);
+    this.configPath = join4(this.configDir, CONFIG_FILE);
   }
   hasConfig() {
-    return existsSync4(this.configPath);
+    return existsSync5(this.configPath);
   }
   load() {
     try {
@@ -2215,7 +2648,7 @@ class ConfigService {
   initDefaults() {
     this.ensureConfigDir();
     const created = [];
-    if (!existsSync4(this.configPath)) {
+    if (!existsSync5(this.configPath)) {
       this.save(DEFAULT_CONFIG);
       created.push(this.configPath);
     }
@@ -2225,7 +2658,7 @@ class ConfigService {
     return this.configPath;
   }
   ensureConfigDir() {
-    if (!existsSync4(this.configDir)) {
+    if (!existsSync5(this.configDir)) {
       mkdirSync3(this.configDir, { recursive: true });
     }
   }
@@ -2341,7 +2774,7 @@ async function probeLiveness(target, options) {
 }
 
 // src/frontend-registry.ts
-var FRONTEND_AGENTS = ["claude", "grok"];
+var FRONTEND_AGENTS = ["claude"];
 var DEFAULT_FRONTEND_AGENT = "claude";
 function parseFrontendAgent(raw) {
   if (raw === undefined || raw === null)
@@ -2976,6 +3409,11 @@ var ATTENTION_WINDOW_MS = parseInt(process.env.AGENTBRIDGE_ATTENTION_WINDOW_MS ?
 var daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_PORT, log });
 var codex = new CodexAdapter(CODEX_APP_PORT, CODEX_PROXY_PORT, stateDir.logFile);
 var attachCmd = `codex --enable tui_app_server --remote ${codex.proxyUrl}`;
+var grok = new GrokAdapter({
+  socketPath: stateDir.grokLeaderSocket,
+  logFile: stateDir.logFile
+});
+var grokEverAttached = false;
 var controlServer = null;
 var frontends = new FrontendRegistry({
   isOpen: (ws) => ws.readyState === WebSocket.OPEN,
@@ -3025,7 +3463,7 @@ var bus = new MessageBus({
   mailboxFor,
   index: messageIndex,
   state: {
-    knownAgents: () => ["codex", ...frontends.knownAgents()],
+    knownAgents: () => ["codex", ...grokEverAttached ? ["grok"] : [], ...frontends.knownAgents()],
     senderOf: (id, replier, now) => messageIndex.resolveSender(id, replier, now),
     activeRequesterFor: (agent) => activeRequester.get(agent) ?? null
   },
@@ -3068,6 +3506,31 @@ registerTransport2("codex", {
     codexDeferralNotes.set(message.id, note);
   }
 });
+registerTransport2("grok", {
+  payloadMode: "content",
+  acknowledgementMode: "none",
+  wake: (message) => {
+    const requester = isAgentId(message.from) ? message.from : "system";
+    const accepted = grok.injectMessage(message.content, {
+      messageId: message.id,
+      requester,
+      text: message.content
+    });
+    if (!accepted)
+      throw new Error("Grok has no live session to inject into");
+    if (isAgentId(message.from))
+      activeRequester.set("grok", message.from);
+  }
+});
+function drainGrokBacklog(why) {
+  const batch = mailboxFor("grok").drain(Date.now());
+  if (batch.messages.length === 0)
+    return;
+  log(`Delivering ${batch.messages.length} held message(s) to Grok (${why})`);
+  for (const message of batch.messages) {
+    transports.wake("grok", message, log);
+  }
+}
 function frontendTransport(agent) {
   return {
     payloadMode: "content",
@@ -3283,6 +3746,87 @@ codex.on("exit", (code) => {
   discardOutboxForLostCodex("the Codex app-server exited");
   notifyFrontends((to) => systemMessage("system_codex_exit", `\u26A0\uFE0F Codex app-server exited (code ${code ?? "unknown"}). AgentBridge daemon is still running, but the Codex side needs to be restarted.`, to));
   broadcastStatus();
+});
+function tellGrok(text) {
+  if (!grok.injectMessage(`[AgentBridge] ${text}`)) {
+    log(`Could not tell Grok: ${text}`);
+  }
+}
+grok.on("agentMessage", (msg) => {
+  handleGrokMessage(msg).catch((err) => {
+    log(`Grok agentMessage handler failed for ${msg.senderRef}: ${describeError2(err)}`);
+  });
+});
+async function handleGrokMessage(msg) {
+  let result;
+  try {
+    result = classifyMessage(msg.content, FILTER_MODE);
+  } catch (err) {
+    tellGrok(describeError2(err));
+    return;
+  }
+  let envelope;
+  try {
+    envelope = normalizeProse(msg.content, { agent: "grok", protocolVersion: PROTOCOL_VERSION }, { id: nextMessageId(), now: Date.now(), senderRef: msg.senderRef });
+  } catch (err) {
+    tellGrok(describeError2(err));
+    return;
+  }
+  log(`Grok \u2192 bus [${result.marker}/${result.action}] (${msg.content.length} chars)`);
+  if (result.action === "buffer") {
+    statusBuffer.add(envelope);
+    return;
+  }
+  if (result.marker === "reply" && statusBuffer.size > 0) {
+    statusBuffer.flush("reply message arrived");
+  }
+  const outcome = await routeThroughBus2(envelope);
+  const text = senderFacingText(outcome);
+  if (text !== null)
+    tellGrok(text);
+  if (outcome.status === "failed")
+    return;
+  if (result.marker === "reply") {
+    pendingRequests.satisfy(envelope.inReplyTo, outcome.accepted);
+    startAttentionWindow();
+  }
+}
+function endGrokTurn(why) {
+  if (!activeRequester.has("grok"))
+    return;
+  log(`Clearing Grok's turn-scoped requester: ${why}`);
+  activeRequester.delete("grok");
+}
+grok.on("sessionAttached", (sessionId) => {
+  log(`Grok session attached: ${sessionId}`);
+  grokEverAttached = true;
+  drainGrokBacklog("a Grok session became available");
+  broadcastStatus();
+});
+grok.on("turnCompleted", () => {
+  log("Grok turn completed");
+  endGrokTurn("the turn completed");
+});
+grok.on("tuiDisconnected", () => {
+  log("Grok TUI disconnected");
+  endGrokTurn("the Grok TUI disconnected");
+  broadcastStatus();
+});
+grok.on("injectionRejected", ({ messageId, requester, text, reason }) => {
+  log(`Grok refused the prompt for ${messageId}: ${reason}`);
+  endGrokTurn("Grok refused the prompt");
+  if (pendingRequests.cancel(messageId)) {
+    log(`Cancelled the pending reply request for refused message ${messageId}`);
+  }
+  const notice = (to) => noticeMessage("grok_prompt_rejected", `\u26A0\uFE0F Grok refused the prompt carrying your message \u2014 it was not delivered and Grok never saw it. ` + `The leader said: ${reason}
+
+Undelivered message:
+${truncateForNotice(text)}`, to);
+  const sender = isAgentId(requester) ? requester : null;
+  if (sender)
+    routeOrLog(notice(sender));
+  else
+    emitToFrontends(notice);
 });
 function startControlServer() {
   controlServer = Bun.serve({
@@ -3865,6 +4409,7 @@ function shutdown(reason) {
   controlServer?.stop();
   controlServer = null;
   codex.stop();
+  grok.stop();
   removePidFile();
   removeStatusFile();
   process.exit(0);
@@ -3914,4 +4459,9 @@ try {
 }
 pendingRequestsTimer = setInterval(checkExpiredRequests, PENDING_REQUEST_CHECK_INTERVAL_MS);
 startupComplete = true;
+try {
+  grok.start();
+} catch (err) {
+  log(`Failed to open the Grok proxy socket: ${describeError2(err)}`);
+}
 bootCodex();

@@ -14,9 +14,14 @@ import type { DaemonStatus } from "../control-protocol";
  *
  * The unit tests in `frontend-registry.test.ts` prove the bookkeeping.
  * This proves the wire: that the `agent` field survives `claude_connect`,
- * that a Grok frontend and a Claude frontend hold slots at the same time
- * instead of evicting each other, and that same-agent contention still
- * behaves exactly as it did when there was one slot.
+ * that an absent field still means Claude, that same-agent contention
+ * behaves exactly as it did when there was one slot, and that a name the
+ * daemon does not recognize is refused rather than handed Claude's slot.
+ *
+ * Claude is the only frontend agent today — Grok moved behind the leader
+ * proxy and Codex was always behind its own — so the two-agent cases now
+ * live in `frontend-registry.test.ts`, where the registry's agent type is
+ * a test-local union. What survives here is what the wire can still do.
  *
  * Ports are deliberately distinct from `e2e-reconnect.test.ts` so the two
  * files cannot collide if they ever run concurrently.
@@ -168,37 +173,13 @@ describe("E2E: one frontend slot per agent", () => {
     await waitForStatus((x) => x.attachedAgents.length === 0);
   }, TEST_TIMEOUT_MS);
 
-  test("Claude and Grok hold slots at the same time", async () => {
-    // The regression: Grok loads our MCP server through Claude Code's
-    // plugin registry, so before per-agent slots it landed in Claude's
-    // and one of the two was told "another Claude session is connected".
-    const claude = await openFrontend();
-    attach(claude, "claude");
-    await waitForStatus((x) => x.claudeAttached);
-
-    const grok = await openFrontend();
-    attach(grok, "grok");
-
-    const s = await waitForStatus((x) => x.attachedAgents.length === 2);
-    expect(s.attachedAgents.sort()).toEqual(["claude", "grok"]);
-    expect(s.claudeAttached).toBe(true);
-
-    // Neither socket was closed to make room for the other.
-    expect(await closeCodeWithin(claude, 250)).toBeNull();
-    expect(await closeCodeWithin(grok, 250)).toBeNull();
-
-    claude.ws.close();
-    grok.ws.close();
-    await waitForStatus((x) => x.attachedAgents.length === 0);
-  }, TEST_TIMEOUT_MS);
-
   test("a second frontend for the same agent still loses to a live incumbent", async () => {
     const first = await openFrontend();
-    attach(first, "grok");
-    await waitForStatus((x) => x.attachedAgents.includes("grok"));
+    attach(first, "claude");
+    await waitForStatus((x) => x.attachedAgents.includes("claude"));
 
     const second = await openFrontend();
-    attach(second, "grok");
+    attach(second, "claude");
 
     // The incumbent answers the liveness probe (Bun's WebSocket pongs at
     // the protocol level), so the contestant is refused — unchanged from
@@ -206,29 +187,10 @@ describe("E2E: one frontend slot per agent", () => {
     expect(await closeCodeWithin(second, 5000)).toBe(CLOSE_CODE_REPLACED);
 
     const s = await status();
-    expect(s.attachedAgents).toEqual(["grok"]);
+    expect(s.attachedAgents).toEqual(["claude"]);
+    expect(s.claudeAttached).toBe(true);
 
     first.ws.close();
-    await waitForStatus((x) => x.attachedAgents.length === 0);
-  }, TEST_TIMEOUT_MS);
-
-  test("a Grok contest does not disturb Claude's slot", async () => {
-    const claude = await openFrontend();
-    attach(claude, "claude");
-    const grok = await openFrontend();
-    attach(grok, "grok");
-    await waitForStatus((x) => x.attachedAgents.length === 2);
-
-    const contestant = await openFrontend();
-    attach(contestant, "grok");
-    expect(await closeCodeWithin(contestant, 5000)).toBe(CLOSE_CODE_REPLACED);
-
-    // Claude was never probed, never evicted, never notified.
-    expect(await closeCodeWithin(claude, 100)).toBeNull();
-    expect((await status()).claudeAttached).toBe(true);
-
-    claude.ws.close();
-    grok.ws.close();
     await waitForStatus((x) => x.attachedAgents.length === 0);
   }, TEST_TIMEOUT_MS);
 
@@ -237,6 +199,15 @@ describe("E2E: one frontend slot per agent", () => {
     attach(stranger, "codex");
 
     expect(await closeCodeWithin(stranger, 2000)).toBe(CLOSE_CODE_UNKNOWN_AGENT);
+    expect((await status()).attachedAgents).toEqual([]);
+
+    // Grok is the case with history: it *was* a frontend, so a stale
+    // build or a hand-set AGENTBRIDGE_AGENT can still send this. It is
+    // proxied now, and a slot is not what it should get.
+    const grok = await openFrontend();
+    attach(grok, "grok");
+
+    expect(await closeCodeWithin(grok, 2000)).toBe(CLOSE_CODE_UNKNOWN_AGENT);
     expect((await status()).attachedAgents).toEqual([]);
   }, TEST_TIMEOUT_MS);
 

@@ -13757,6 +13757,9 @@ class StateDirResolver {
   get codexWrapperLogFile() {
     return join(this.stateDir, "codex-wrapper.log");
   }
+  get grokLeaderSocket() {
+    return join(this.stateDir, "grok.sock");
+  }
   get killedFile() {
     return join(this.stateDir, "killed");
   }
@@ -14137,7 +14140,7 @@ class ClaudeAdapter extends EventEmitter {
 import { EventEmitter as EventEmitter2 } from "events";
 
 // src/frontend-registry.ts
-var FRONTEND_AGENTS = ["claude", "grok"];
+var FRONTEND_AGENTS = ["claude"];
 var DEFAULT_FRONTEND_AGENT = "claude";
 function parseFrontendAgent(raw) {
   if (raw === undefined || raw === null)

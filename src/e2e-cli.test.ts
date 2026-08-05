@@ -178,7 +178,10 @@ class CliE2EHarness {
     extraEnv: NodeJS.ProcessEnv,
     timeoutMs = 20000,
   ): Promise<RunResult> {
-    if (args[0] === "codex") {
+    // `codex` and `grok` both start the daemon before launching their
+    // TUI, and the daemon cannot bind a port this harness is still
+    // holding open to reserve it.
+    if (args[0] === "codex" || args[0] === "grok") {
       await this.releaseDaemonPortReservations();
     }
 
@@ -193,7 +196,10 @@ class CliE2EHarness {
   }
 
   async spawnCli(args: string[], extraEnv: NodeJS.ProcessEnv = {}): Promise<TrackedProcess> {
-    if (args[0] === "codex") {
+    // `codex` and `grok` both start the daemon before launching their
+    // TUI, and the daemon cannot bind a port this harness is still
+    // holding open to reserve it.
+    if (args[0] === "codex" || args[0] === "grok") {
       await this.releaseDaemonPortReservations();
     }
 
@@ -423,13 +429,12 @@ describe("E2E: CLI surface", () => {
     });
   });
 
-  test("agentbridge grok hands Grok its own identity", async () => {
-    // Grok loads our MCP server through Claude Code's plugin registry
-    // without any help from us, so the launcher's entire contribution is
-    // these two variables and the arguments passing through untouched.
-    // AGENTBRIDGE_AGENT is what keeps Grok out of Claude's slot; without
-    // it the two evict each other, since Claude is what every frontend
-    // was before 0.8.
+  test("agentbridge grok points the TUI at the daemon's leader socket", async () => {
+    // Grok is proxied now, not an MCP frontend: the launcher's whole
+    // contribution is `--leader-socket`, which is what puts the daemon
+    // between the TUI and the machine-wide leader. The bus variables it
+    // used to set are deliberately gone — a Grok that claims a frontend
+    // slot is the bug this replaced.
     await withHarness(async (harness) => {
       const result = await harness.runCli(["grok", "--model", "grok-code"]);
 
@@ -437,8 +442,27 @@ describe("E2E: CLI surface", () => {
 
       const invocations = harness.readShimCalls("grok");
       expect(invocations.length).toBe(1);
-      expect(invocations[0]?.args).toEqual(["--model", "grok-code"]);
-      expect(invocations[0]?.env).toEqual({ active: "1", agent: "grok" });
+      expect(invocations[0]?.args).toEqual([
+        "--leader-socket",
+        join(harness.stateDir, "grok.sock"),
+        "--model",
+        "grok-code",
+      ]);
+      expect(invocations[0]?.env).toEqual({ active: null, agent: null });
+    });
+  });
+
+  test("agentbridge grok leaves a caller-chosen leader socket alone", async () => {
+    // The one flag that decides which backend the TUI talks to. Silently
+    // rewriting it would make the command a lie.
+    await withHarness(async (harness) => {
+      const result = await harness.runCli(["grok", "--leader-socket", "/tmp/mine.sock"]);
+
+      expect(result.code).toBe(0);
+      expect(harness.readShimCalls("grok")[0]?.args).toEqual([
+        "--leader-socket",
+        "/tmp/mine.sock",
+      ]);
     });
   });
 

@@ -3,6 +3,8 @@
 import type { ServerWebSocket } from "bun";
 import { CodexAdapter } from "./codex-adapter";
 import type { CodexProseIngress, InjectionRejection } from "./codex-adapter";
+import { GrokAdapter } from "./grok-adapter";
+import type { GrokInjectionRejection, GrokProseIngress } from "./grok-adapter";
 import { getRotatingLogger } from "./log-rotator";
 import { StatusLineWriter } from "./status-line-writer";
 import { BRIDGE_STOPPED_TAG } from "./lifecycle-tags";
@@ -126,6 +128,30 @@ const daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_POR
 
 const codex = new CodexAdapter(CODEX_APP_PORT, CODEX_PROXY_PORT, stateDir.logFile);
 const attachCmd = `codex --enable tui_app_server --remote ${codex.proxyUrl}`;
+
+/**
+ * Grok's proxy, in the same role the Codex proxy plays.
+ *
+ * Constructed unconditionally and cheaply: `start` only opens a unix
+ * socket, and the socket has to exist before `abg grok` has anything to
+ * point a TUI at. No Grok installed and no TUI launched costs one idle
+ * listener.
+ */
+const grok = new GrokAdapter({
+  socketPath: stateDir.grokLeaderSocket,
+  logFile: stateDir.logFile,
+});
+
+/**
+ * Whether a Grok TUI has ever been through this proxy.
+ *
+ * Gates Grok's membership in `knownAgents` the way attaching gates a
+ * frontend's: broadcasting to a Grok that has never connected fills a
+ * mailbox nobody will drain. "Ever", not "now", for the same reason the
+ * frontend registry keeps known separate from attached — a TUI being
+ * restarted must keep receiving into its mailbox.
+ */
+let grokEverAttached = false;
 
 let controlServer: ReturnType<typeof Bun.serve> | null = null;
 
@@ -271,7 +297,8 @@ const bus = new MessageBus({
     // entire reason the mailbox exists. `FrontendRegistry.knownAgents`
     // seeds Claude, so a message that arrives before Claude's first
     // connect is still retained — long-standing behaviour.
-    knownAgents: () => ["codex", ...frontends.knownAgents()],
+    knownAgents: () =>
+      ["codex", ...(grokEverAttached ? (["grok"] as const) : []), ...frontends.knownAgents()],
     senderOf: (id, replier, now) => messageIndex.resolveSender(id, replier, now),
     activeRequesterFor: (agent) => activeRequester.get(agent) ?? null,
   },
@@ -373,6 +400,52 @@ registerTransport("codex", {
  * is how a transport reports failure: `TransportRegistry.wake` turns it
  * into a logged `"failed"` and the message waits.
  */
+/**
+ * Grok's wake-up: prompt the session the human's TUI is working in.
+ *
+ * Deliberately without the outbox Codex needs. A second `turn/start`
+ * mid-turn is an error on Codex's app-server, so the daemon has to hold
+ * the message and re-inject at the boundary; Grok's leader queues the
+ * prompt and runs it at the next boundary itself. Re-implementing that
+ * here would be a worse copy of something the server already does.
+ *
+ * The only refusal left is "there is no session yet" — no TUI has come
+ * through the proxy. That throws, which leaves the message in the
+ * mailbox for `drainGrokBacklog` to deliver when one arrives.
+ */
+registerTransport("grok", {
+  payloadMode: "content",
+  acknowledgementMode: "none",
+  wake: (message) => {
+    const requester = isAgentId(message.from) ? message.from : "system";
+    const accepted = grok.injectMessage(message.content, {
+      messageId: message.id,
+      requester,
+      text: message.content,
+    });
+    if (!accepted) throw new Error("Grok has no live session to inject into");
+    if (isAgentId(message.from)) activeRequester.set("grok", message.from);
+  },
+});
+
+/**
+ * Deliver what piled up while no Grok TUI was connected.
+ *
+ * Grok has no `get_messages`: it cannot pull its own mailbox the way a
+ * frontend does, so nothing would ever drain this on its own. Messages
+ * addressed to a Grok that was not running are held rather than shed —
+ * the mailbox is the whole point — and this is the only thing that
+ * hands them over.
+ */
+function drainGrokBacklog(why: string): void {
+  const batch = mailboxFor("grok").drain(Date.now());
+  if (batch.messages.length === 0) return;
+  log(`Delivering ${batch.messages.length} held message(s) to Grok (${why})`);
+  for (const message of batch.messages) {
+    void transports.wake("grok", message, log);
+  }
+}
+
 function frontendTransport(agent: FrontendAgent): WakeupTransport {
   return {
     payloadMode: "content",
@@ -817,6 +890,125 @@ codex.on("exit", (code: number | null) => {
     ),
   );
   broadcastStatus();
+});
+
+// ── Grok ────────────────────────────────────────────────────────────
+
+/** Say something to Grok as the bridge. Grok's equivalent of `tellCodex`. */
+function tellGrok(text: string): void {
+  if (!grok.injectMessage(`[AgentBridge] ${text}`)) {
+    log(`Could not tell Grok: ${text}`);
+  }
+}
+
+// Same shape as the Codex listener, for the same reason: an async
+// listener hands the emitter a promise it does not await, so a throw
+// becomes an unhandled rejection on the path every Grok message takes.
+grok.on("agentMessage", (msg: GrokProseIngress) => {
+  void handleGrokMessage(msg).catch((err: unknown) => {
+    log(`Grok agentMessage handler failed for ${msg.senderRef}: ${describeError(err)}`);
+  });
+});
+
+async function handleGrokMessage(msg: GrokProseIngress): Promise<void> {
+  // As on the Codex path: the adapter hands over prose, and
+  // `normalizeProse` is the only thing here that builds an envelope, so
+  // it runs before anything downstream sees the message.
+  let result: FilterResult;
+  try {
+    result = classifyMessage(msg.content, FILTER_MODE);
+  } catch (err: unknown) {
+    tellGrok(describeError(err));
+    return;
+  }
+
+  let envelope: BridgeMessage;
+  try {
+    envelope = normalizeProse(
+      msg.content,
+      { agent: "grok", protocolVersion: PROTOCOL_VERSION },
+      { id: nextMessageId(), now: Date.now(), senderRef: msg.senderRef },
+    );
+  } catch (err: unknown) {
+    tellGrok(describeError(err));
+    return;
+  }
+
+  log(`Grok → bus [${result.marker}/${result.action}] (${msg.content.length} chars)`);
+
+  if (result.action === "buffer") {
+    statusBuffer.add(envelope);
+    return;
+  }
+  if (result.marker === "reply" && statusBuffer.size > 0) {
+    statusBuffer.flush("reply message arrived");
+  }
+
+  const outcome = await routeThroughBus(envelope);
+  // Grok has no other way to learn that the name it addressed does not
+  // resolve, or that its `[REPLY]` reached Codex and not Claude.
+  const text = senderFacingText(outcome);
+  if (text !== null) tellGrok(text);
+  if (outcome.status === "failed") return;
+
+  if (result.marker === "reply") {
+    pendingRequests.satisfy(envelope.inReplyTo, outcome.accepted);
+    startAttentionWindow();
+  }
+}
+
+/** Close the turn-scoped state a Grok turn owns. See `endCodexTurn`. */
+function endGrokTurn(why: string): void {
+  if (!activeRequester.has("grok")) return;
+  log(`Clearing Grok's turn-scoped requester: ${why}`);
+  activeRequester.delete("grok");
+}
+
+grok.on("sessionAttached", (sessionId: string) => {
+  log(`Grok session attached: ${sessionId}`);
+  grokEverAttached = true;
+  drainGrokBacklog("a Grok session became available");
+  broadcastStatus();
+});
+
+grok.on("turnCompleted", () => {
+  log("Grok turn completed");
+  endGrokTurn("the turn completed");
+});
+
+grok.on("tuiDisconnected", () => {
+  log("Grok TUI disconnected");
+  endGrokTurn("the Grok TUI disconnected");
+  broadcastStatus();
+});
+
+/**
+ * The leader refused a prompt the daemon already reported as sent.
+ *
+ * Identical reasoning to the Codex handler: `injectMessage` returning
+ * true only means the frame left this process, and by the time the
+ * refusal lands the `acknowledgementMode: "none"` self-ack has deleted
+ * the mailbox entry. Without this the message is gone, Grok never saw
+ * it, and the only trace is a log line the sender cannot read.
+ */
+grok.on("injectionRejected", ({ messageId, requester, text, reason }: GrokInjectionRejection) => {
+  log(`Grok refused the prompt for ${messageId}: ${reason}`);
+  endGrokTurn("Grok refused the prompt");
+  if (pendingRequests.cancel(messageId)) {
+    log(`Cancelled the pending reply request for refused message ${messageId}`);
+  }
+
+  const notice = (to: AgentId) =>
+    noticeMessage(
+      "grok_prompt_rejected",
+      `⚠️ Grok refused the prompt carrying your message — it was not delivered and Grok never saw it. ` +
+        `The leader said: ${reason}\n\nUndelivered message:\n${truncateForNotice(text)}`,
+      to,
+    );
+
+  const sender = isAgentId(requester) ? requester : null;
+  if (sender) routeOrLog(notice(sender));
+  else emitToFrontends(notice);
 });
 
 function startControlServer() {
@@ -1757,6 +1949,7 @@ function shutdown(reason: string) {
   controlServer?.stop();
   controlServer = null;
   codex.stop();
+  grok.stop();
   removePidFile();
   removeStatusFile();
   process.exit(0);
@@ -1824,4 +2017,12 @@ try {
 }
 pendingRequestsTimer = setInterval(checkExpiredRequests, PENDING_REQUEST_CHECK_INTERVAL_MS);
 startupComplete = true;
+// Independent of Codex on purpose: the Grok socket only has to exist
+// before `abg grok` points a TUI at it, and a Codex app-server that
+// fails to start is no reason for the Grok side to be unreachable.
+try {
+  grok.start();
+} catch (err: unknown) {
+  log(`Failed to open the Grok proxy socket: ${describeError(err)}`);
+}
 void bootCodex();

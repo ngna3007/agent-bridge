@@ -120,7 +120,10 @@ describe("abg status - live daemon view", () => {
   });
 
   test("names a second frontend, and stays quiet when there is only one", async () => {
-    serveStatus({ attachedAgents: ["claude", "grok"] });
+    // Cast because `FrontendAgent` is a one-member union in this build
+    // (Grok is proxied, not attached). The renderer's job is to name
+    // whatever the daemon reports, which is what this asserts.
+    serveStatus({ attachedAgents: ["claude", "grok"] as unknown as DaemonStatus["attachedAgents"] });
     await runStatus();
 
     expect(output()).toContain("also        grok attached");
