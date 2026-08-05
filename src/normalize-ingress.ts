@@ -110,11 +110,16 @@ export function normalizeIngress(
   };
 }
 
+export interface ProseContext extends IngressContext {
+  /** The sending app-server's own item id, when it had one. */
+  senderRef?: string;
+}
+
 /** Codex has no tool. Its ordinary prose is the ingress. */
 export function normalizeProse(
   content: string,
   socket: IngressSocket,
-  ctx: IngressContext,
+  ctx: ProseContext,
 ): BridgeMessage {
   let marker;
   try {
@@ -125,6 +130,7 @@ export function normalizeProse(
   }
   return {
     id: ctx.id,
+    senderRef: ctx.senderRef,
     from: socket.agent,
     to: marker.to,
     kind: marker.marker,

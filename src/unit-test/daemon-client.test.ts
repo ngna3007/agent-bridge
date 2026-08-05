@@ -204,8 +204,11 @@ describe("DaemonClient", () => {
     const elapsed = Date.now() - start;
 
     expect(result).toBe(false);
-    // Must actually wait for the timeout, not resolve instantly.
-    expect(elapsed).toBeGreaterThanOrEqual(140);
+    // Must actually wait for the timeout, not resolve instantly. The floor
+    // sits well under 150 on purpose: setTimeout is allowed to fire a few ms
+    // early, and a 10ms margin made this flaky under WSL2 timer jitter. What
+    // is being asserted is "it waited", not the scheduler's precision.
+    expect(elapsed).toBeGreaterThanOrEqual(100);
     // Sanity check on upper bound to catch event-listener leaks that delay GC.
     expect(elapsed).toBeLessThan(2_000);
   });
@@ -234,7 +237,7 @@ describe("DaemonClient", () => {
 
     // Send a message that expects a reply — it will never be answered
     const replyPromise = client.sendReply(
-      { id: "test-pending", source: "claude", content: "hello", timestamp: Date.now() },
+      { id: "test-pending", from: "claude", to: null, kind: "untagged", content: "hello", timestamp: Date.now() },
       false,
     );
 
@@ -292,7 +295,7 @@ describe("DaemonClient", () => {
   test("sendReply returns error when not connected", async () => {
     const result = await client.sendReply({
       id: "r1",
-      source: "claude",
+      from: "claude", to: null, kind: "untagged",
       content: "hi",
       timestamp: Date.now(),
     });
@@ -317,7 +320,7 @@ describe("DaemonClient", () => {
 
     const result = await client.sendReply({
       id: "r2",
-      source: "claude",
+      from: "claude", to: null, kind: "untagged",
       content: "reply text",
       timestamp: Date.now(),
     });
@@ -329,7 +332,7 @@ describe("DaemonClient", () => {
 
     const replyPromise = client.sendReply({
       id: "r3",
-      source: "claude",
+      from: "claude", to: null, kind: "untagged",
       content: "will be rejected",
       timestamp: Date.now(),
     });

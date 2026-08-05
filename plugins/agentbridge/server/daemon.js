@@ -1101,10 +1101,8 @@ class CodexAdapter extends EventEmitter {
           if (content) {
             this.log(`Agent message completed (${content.length} chars)`);
             this.emit("agentMessage", {
-              id: item.id,
-              source: "codex",
-              content,
-              timestamp: Date.now()
+              senderRef: item.id,
+              content
             });
           }
         }
@@ -2921,6 +2919,7 @@ function normalizeProse(content, socket, ctx) {
   }
   return {
     id: ctx.id,
+    senderRef: ctx.senderRef,
     from: socket.agent,
     to: marker.to,
     kind: marker.marker,
@@ -3164,7 +3163,7 @@ function flushPendingCodexNotices() {
 }
 codex.on("agentMessage", (msg) => {
   handleCodexMessage(msg).catch((err) => {
-    log(`agentMessage handler failed for ${msg.id}: ${describeError2(err)}`);
+    log(`agentMessage handler failed for ${msg.senderRef}: ${describeError2(err)}`);
   });
 });
 async function handleCodexMessage(msg) {
@@ -3175,21 +3174,21 @@ async function handleCodexMessage(msg) {
     tellCodex(describeError2(err));
     return;
   }
+  let envelope;
+  try {
+    envelope = normalizeProse(msg.content, { agent: "codex", protocolVersion: PROTOCOL_VERSION }, { id: nextMessageId(), now: Date.now(), senderRef: msg.senderRef });
+  } catch (err) {
+    tellCodex(describeError2(err));
+    return;
+  }
   if (FILTER_MODE !== "full" && inAttentionWindow && result.marker === "status") {
     log(`Codex \u2192 Claude [${result.marker}/buffer-attention] (${msg.content.length} chars)`);
-    statusBuffer.add(msg);
+    statusBuffer.add(envelope);
     return;
   }
   log(`Codex \u2192 Claude [${result.marker}/${result.action}] (${msg.content.length} chars)`);
   if (result.action === "buffer") {
-    statusBuffer.add(msg);
-    return;
-  }
-  let envelope;
-  try {
-    envelope = normalizeProse(msg.content, { agent: "codex", protocolVersion: PROTOCOL_VERSION }, { id: nextMessageId(), now: Date.now() });
-  } catch (err) {
-    tellCodex(describeError2(err));
+    statusBuffer.add(envelope);
     return;
   }
   if (result.marker === "reply" && statusBuffer.size > 0) {

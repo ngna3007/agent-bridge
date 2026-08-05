@@ -2,7 +2,7 @@
 
 import type { ServerWebSocket } from "bun";
 import { CodexAdapter } from "./codex-adapter";
-import type { InjectionRejection } from "./codex-adapter";
+import type { CodexProseIngress, InjectionRejection } from "./codex-adapter";
 import { getRotatingLogger } from "./log-rotator";
 import { StatusLineWriter } from "./status-line-writer";
 import { BRIDGE_STOPPED_TAG } from "./lifecycle-tags";
@@ -581,21 +581,35 @@ function flushPendingCodexNotices(): void {
 // throw anywhere in the handler becomes an unhandled rejection — in a
 // process designed to run for days, on the path every Codex message
 // takes. The emitter gets a sync function; the rejection is caught here.
-codex.on("agentMessage", (msg: BridgeMessage) => {
+codex.on("agentMessage", (msg: CodexProseIngress) => {
   void handleCodexMessage(msg).catch((err: unknown) => {
-    log(`agentMessage handler failed for ${msg.id}: ${describeError(err)}`);
+    log(`agentMessage handler failed for ${msg.senderRef}: ${describeError(err)}`);
   });
 });
 
-async function handleCodexMessage(msg: BridgeMessage): Promise<void> {
-  // `msg.source` is deliberately not read: attribution on ingress comes
-  // from where the message arrived, and everything on this emitter
-  // arrived from Codex. `normalizeProse` writes `from` accordingly.
+async function handleCodexMessage(msg: CodexProseIngress): Promise<void> {
+  // The adapter hands over prose, not an envelope: attribution on ingress
+  // comes from where the message arrived, and everything on this emitter
+  // arrived from Codex. `normalizeProse` writes `from` accordingly, and is
+  // the only thing that constructs a `BridgeMessage` on this path — so it
+  // runs before anything downstream (including the status buffer) sees it.
   let result: FilterResult;
   try {
     result = classifyMessage(msg.content, FILTER_MODE);
   } catch (err: unknown) {
     // An unknown @name is a parse failure, not a broadcast. Tell Codex.
+    tellCodex(describeError(err));
+    return;
+  }
+
+  let envelope: BridgeMessage;
+  try {
+    envelope = normalizeProse(
+      msg.content,
+      { agent: "codex", protocolVersion: PROTOCOL_VERSION },
+      { id: nextMessageId(), now: Date.now(), senderRef: msg.senderRef },
+    );
+  } catch (err: unknown) {
     tellCodex(describeError(err));
     return;
   }
@@ -606,7 +620,7 @@ async function handleCodexMessage(msg: BridgeMessage): Promise<void> {
   // a [STATUS] message would start getting buffered instead of forwarded.
   if (FILTER_MODE !== "full" && inAttentionWindow && result.marker === "status") {
     log(`Codex → Claude [${result.marker}/buffer-attention] (${msg.content.length} chars)`);
-    statusBuffer.add(msg);
+    statusBuffer.add(envelope);
     return;
   }
 
@@ -615,19 +629,7 @@ async function handleCodexMessage(msg: BridgeMessage): Promise<void> {
   // [STATUS] still folds into the summary rather than entering a mailbox
   // one message at a time; the summary itself is an ordinary send.
   if (result.action === "buffer") {
-    statusBuffer.add(msg);
-    return;
-  }
-
-  let envelope: BridgeMessage;
-  try {
-    envelope = normalizeProse(
-      msg.content,
-      { agent: "codex", protocolVersion: PROTOCOL_VERSION },
-      { id: nextMessageId(), now: Date.now() },
-    );
-  } catch (err: unknown) {
-    tellCodex(describeError(err));
+    statusBuffer.add(envelope);
     return;
   }
 

@@ -15,7 +15,20 @@ import { EventEmitter } from "node:events";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { StateDirResolver } from "./state-dir";
 import { getRotatingLogger } from "./log-rotator";
-import type { BridgeMessage } from "./types";
+/**
+ * What the adapter knows about a message it intercepts from Codex: the
+ * app-server's own item id, and the prose.
+ *
+ * Deliberately not a `BridgeMessage`. Routing (`from` / `to` / `kind`) is not
+ * the adapter's to decide, and the canonical `id` is the daemon's to assign —
+ * `senderRef` is the app-server id under the name the envelope reserves for
+ * "the sender's own id, preserved for correlation". Reusing `id` here would
+ * give one field name two identities.
+ */
+export interface CodexProseIngress {
+  senderRef: string;
+  content: string;
+}
 import type { ServerWebSocket } from "bun";
 import {
   isAppServerNotification,
@@ -1422,8 +1435,9 @@ export class CodexAdapter extends EventEmitter {
           if (content) {
             this.log(`Agent message completed (${content.length} chars)`);
             this.emit("agentMessage", {
-              id: item.id, source: "codex" as const, content, timestamp: Date.now(),
-            } satisfies BridgeMessage);
+              senderRef: item.id,
+              content,
+            } satisfies CodexProseIngress);
           }
         }
         break;

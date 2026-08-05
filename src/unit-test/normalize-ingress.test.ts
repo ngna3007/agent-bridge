@@ -146,4 +146,21 @@ describe("normalizeProse", () => {
     expect(m.kind).toBe("untagged");
     expect(m.content).toBe("just thinking");
   });
+
+  test("carries the sender's own id through as senderRef", () => {
+    const m = normalizeProse(
+      "[REPLY] ok",
+      { agent: "codex", protocolVersion: 1 },
+      { ...ctx, senderRef: "item_abc" },
+    );
+    // The canonical id stays the daemon's; the app-server's id survives
+    // alongside it so a reply can be correlated back to the item.
+    expect(m.id).toBe("canonical1");
+    expect(m.senderRef).toBe("item_abc");
+  });
+
+  test("omits senderRef when the sender had no id", () => {
+    const m = normalizeProse("[REPLY] ok", { agent: "codex", protocolVersion: 1 }, ctx);
+    expect(m.senderRef).toBeUndefined();
+  });
 });
