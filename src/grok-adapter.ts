@@ -498,7 +498,14 @@ export class GrokAdapter extends EventEmitter {
       // meantime goes to the bus unowned — its correlation was reported
       // `unknown` when the deadline passed.
       if (injection.verdictSeen) {
-        this.flush("the abandoned injected turn's answer arrived late");
+        // Only our own turn's prose may be ended here. If the marker
+        // never matched, whatever is buffered belongs to the turn the
+        // leader was already running, and flushing it would cut a human
+        // turn in half on the way to releasing a slot that has nothing
+        // to do with it.
+        if (injection.started) {
+          this.flush("the abandoned injected turn's answer arrived late");
+        }
         this.endInjection();
       }
       return;
@@ -543,6 +550,12 @@ export class GrokAdapter extends EventEmitter {
     injection.abandoned = true;
     this.log(`Giving up on the injected turn: ${reason}`);
     this.reportUndelivered(injection.correlation, reason, "unknown");
+    // Every state change re-asks the scheduler what happens next, and
+    // abandonment is a state change like any other. Skipping it wedged
+    // the slot forever whenever the verdict had already arrived before
+    // the deadline: the only thing that arms the post-verdict settle is
+    // this call, and nothing else was going to make it.
+    this.armInjectionTimer();
   }
 
   /**

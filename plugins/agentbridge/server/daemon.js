@@ -1713,7 +1713,9 @@ class GrokAdapter extends EventEmitter2 {
       return;
     if (injection.abandoned) {
       if (injection.verdictSeen) {
-        this.flush("the abandoned injected turn's answer arrived late");
+        if (injection.started) {
+          this.flush("the abandoned injected turn's answer arrived late");
+        }
         this.endInjection();
       }
       return;
@@ -1739,6 +1741,7 @@ class GrokAdapter extends EventEmitter2 {
     injection.abandoned = true;
     this.log(`Giving up on the injected turn: ${reason}`);
     this.reportUndelivered(injection.correlation, reason, "unknown");
+    this.armInjectionTimer();
   }
   endInjection() {
     const injection = this.activeInjection;
