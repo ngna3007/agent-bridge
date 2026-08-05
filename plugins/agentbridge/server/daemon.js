@@ -1644,15 +1644,11 @@ class GrokAdapter extends EventEmitter2 {
     this.sessionIdValue = null;
   }
   injectMessage(text, correlation) {
+    if (!this.canInjectNow()) {
+      this.log(`Cannot inject: ${this.injectionRefusal()}`);
+      return false;
+    }
     const sessionId = this.sessionIdValue;
-    if (sessionId === null) {
-      this.log("Cannot inject: no Grok session to inject into");
-      return false;
-    }
-    if (this.activeInjection !== null) {
-      this.log("Cannot inject: an injected turn is still outstanding");
-      return false;
-    }
     const injector = this.ensureInjector();
     if (injector === null)
       return false;
@@ -1774,6 +1770,15 @@ class GrokAdapter extends EventEmitter2 {
   }
   canInjectNow() {
     return !this.stopped && this.sessionIdValue !== null && this.activeInjection === null;
+  }
+  injectionRefusal() {
+    if (this.stopped)
+      return "the Grok adapter has stopped";
+    if (this.sessionIdValue === null)
+      return "no Grok session to inject into";
+    if (this.activeInjection !== null)
+      return "an injected turn is still outstanding";
+    return "no reason recorded";
   }
   transition(mutate) {
     this.transitionDepth += 1;

@@ -401,17 +401,16 @@ export class GrokAdapter extends EventEmitter {
    * claim. The echo marker is what separates them.
    */
   injectMessage(text: string, correlation?: GrokInjectionCorrelation): boolean {
-    const sessionId = this.sessionIdValue;
-    if (sessionId === null) {
-      this.log("Cannot inject: no Grok session to inject into");
+    // The same predicate the capacity event is announced on, so an
+    // offer and an attempt can never disagree. The fields are inspected
+    // below only to say which clause refused — never to decide.
+    if (!this.canInjectNow()) {
+      this.log(`Cannot inject: ${this.injectionRefusal()}`);
       return false;
     }
-    if (this.activeInjection !== null) {
-      this.log("Cannot inject: an injected turn is still outstanding");
-      return false;
-    }
-    // Both conditions above are `canInjectNow`; they are spelled out
-    // again here only to say which one refused.
+    // Non-null by `canInjectNow`, read after it rather than before so
+    // there is no second copy of the check to fall out of step with it.
+    const sessionId = this.sessionIdValue!;
     const injector = this.ensureInjector();
     if (injector === null) return false;
 
@@ -654,6 +653,14 @@ export class GrokAdapter extends EventEmitter {
    */
   private canInjectNow(): boolean {
     return !this.stopped && this.sessionIdValue !== null && this.activeInjection === null;
+  }
+
+  /** Which clause of `canInjectNow` is false, for the log line. */
+  private injectionRefusal(): string {
+    if (this.stopped) return "the Grok adapter has stopped";
+    if (this.sessionIdValue === null) return "no Grok session to inject into";
+    if (this.activeInjection !== null) return "an injected turn is still outstanding";
+    return "no reason recorded";
   }
 
   /**

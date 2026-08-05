@@ -593,6 +593,35 @@ describe("GrokAdapter injection", () => {
     ).toBe(true);
   });
 
+  test("a stopped adapter refuses to inject on the clause that applies", () => {
+    // `injectMessage` and `injectionCapacity` answer the same question,
+    // so they ask it in the same place. `stopped` is a clause of that
+    // question the call site used not to have at all — and `stop` also
+    // drops the session, so the refusal alone proves nothing: the old
+    // two-check version refused too, for the wrong reason. The reason is
+    // the assertion.
+    const { adapter, tui, leader } = harness();
+    tuiPrompts(tui, 1);
+    leader.deliverAcp({ jsonrpc: "2.0", id: 1, result: {} });
+    adapter.stop();
+
+    const logged: string[] = [];
+    const write = process.stderr.write;
+    (process.stderr as any).write = (line: string) => {
+      logged.push(String(line));
+      return true;
+    };
+    try {
+      expect(
+        adapter.injectMessage("what is 2+2", { messageId: "m1", requester: "claude", text: "q" }),
+      ).toBe(false);
+    } finally {
+      process.stderr.write = write;
+    }
+
+    expect(logged.join("")).toContain("the Grok adapter has stopped");
+  });
+
   test("a TUI teardown frees a slot without offering it", () => {
     // The daemon injects synchronously on `injectionCapacity`, so the
     // event has to mean "there is somewhere to put the next prompt".
