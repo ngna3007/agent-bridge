@@ -11,6 +11,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0]
+
+Grok gains a proxy transport of the same shape as Codex's, and message
+delivery stops being a per-transport improvisation.
+
+> The proxy has unit coverage. Separate Tier-2 harnesses verify leader
+> attachment and non-Claude bus delivery, but neither drives the proxy
+> itself, so the full proxy path is unverified. In particular, the
+> end-to-end path through a real Grok leader is not yet verified — the
+> account's API balance is exhausted (HTTP 402) — so marker survival on
+> the real leader remains an open item rather than a shipped guarantee.
+
+### Added
+
+- **Grok is a proxied agent, not a half-agent.** It could already send —
+  its MCP tools come free from the plugin registry (PR #10) — but nothing could
+  wake it, and it occupied a frontend slot to do so. The daemon now
+  listens on `<stateDir>/grok.sock`, `abg grok` launches the TUI with
+  `--leader-socket` pointed at it, and every frame is forwarded to the
+  real `~/.grok/leader.sock` untouched. Because both the human's
+  `session/prompt` and the response that closes it cross the proxy, a
+  turn boundary is observed rather than guessed from an idle timer.
+  Injection goes out over a second, dedicated leader connection, so no
+  JSON-RPC id on a live human session is ever rewritten. New modules:
+  `grok-leader-protocol.ts` (the leader's `[u32][JSON]` envelope layer),
+  `grok-acp.ts` (ACP itself, with no knowledge of leaders), and
+  `grok-adapter.ts`. (PRs #12, #18)
+- **An injected turn is correlated by marker, not by arrival order.** The
+  leader queues an injected prompt behind whatever the human is already
+  doing, and its verdict arrives on a different socket from its prose.
+  The adapter appends an invisible per-injection marker to the prompt and
+  claims the turn only once it observes that marker echoed back, so a
+  human turn running in between cannot walk off with the correlation.
+  Whether the marker survives a real Grok leader is untested — see the
+  note above. A prompt that cannot be accounted for is
+  reported to its sender as `unknown` rather than being silently
+  forgotten, and one injected turn is outstanding at a time. (PR #18)
+- **Daemon-owned mailboxes and causal routing.** Delivery was a property
+  of whichever transport happened to handle a message. Each agent now
+  has one mailbox in the daemon, messages are routed by cause rather
+  than broadcast, and a reply that cannot be delivered is held for the
+  next drain instead of being dropped. (PR #16)
+- **Every frontend agent gets its own slot.** One shared "active agent"
+  variable meant two agents evicted each other; `FrontendRegistry` keys
+  the slot by agent. (PR #11)
+- **Native Windows is refused at startup**, with a pointer to WSL2,
+  rather than failing later on socket paths that cannot work. (PR #17)
+
+### Changed
+
+- Each control-socket refusal carries its own close code, so a client
+  can tell "another session is active" from "this project is shutting
+  down" without parsing prose. (PR #14)
+
+### Documentation
+
+- `docs/` gains the agent communication lifecycle spec (PR #15) and the
+  Tier 2e / 2g live harnesses that prove leader attach and inbound
+  delivery to a non-Claude frontend. (PRs #9, #13)
+
 ## [0.7.0]
 
 Everything below landed on `master` after the `0.6.8` version bump. A
