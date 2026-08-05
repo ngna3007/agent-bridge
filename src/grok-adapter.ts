@@ -60,6 +60,17 @@ const INJECTED_TURN_SETTLE_MS = 250;
 const ORPHANED_INJECTION_WINDOW_MS = 60_000;
 
 /**
+ * How many injected prompts may wait behind the one in flight.
+ *
+ * Injection is serialised (see `injectMessage`), so a backlog drain that
+ * hands the adapter twenty messages queues nineteen. The cap is what
+ * keeps that queue from being an unbounded buffer in front of a mailbox
+ * that already is one: past it, injection refuses, the wake throws, and
+ * the message stays where it can be retried.
+ */
+const MAX_QUEUED_INJECTIONS = 32;
+
+/**
  * What became of an injected prompt that did not visibly run.
  *
  * - `rejected` — the leader answered with a JSON-RPC error. The prompt
@@ -179,7 +190,23 @@ export class GrokAdapter extends EventEmitter {
     correlation: GrokInjectionCorrelation | null;
     reason: string;
     timer: ReturnType<typeof setTimeout>;
+    /**
+     * When to stop waiting for a turn that has not started.
+     *
+     * The settle timer answers "has the prose stopped?", which is only a
+     * question once prose has started. Before that the same timer is
+     * asking "is a turn coming at all?", and the two need different
+     * patience: 250ms of socket skew versus a model's thinking time.
+     * Firing against an empty buffer re-arms until this deadline.
+     */
+    deadline: number;
   } | null = null;
+
+  /**
+   * Injected prompts waiting for the one in flight to finish. See
+   * `injectMessage`.
+   */
+  private readonly injectionQueue: { text: string; correlation?: GrokInjectionCorrelation }[] = [];
 
   private stopped = false;
   /** Whether the proxy socket is bound. `listen` reports it asynchronously. */
@@ -261,6 +288,9 @@ export class GrokAdapter extends EventEmitter {
   stop(): void {
     this.stopped = true;
     this.listening = false;
+    for (const q of this.injectionQueue.splice(0)) {
+      this.reportUndelivered(q.correlation, "the bridge stopped before the prompt was sent", "rejected");
+    }
     this.takeInjectedCompletion();
     this.tui?.close();
     this.injector?.close();
@@ -279,12 +309,64 @@ export class GrokAdapter extends EventEmitter {
    * comes back later and asynchronously, correlated through
    * `injectionRejected`.
    *
-   * Note what is *not* here: a turn-in-progress guard. Codex needs one
-   * because a second `turn/start` mid-turn is an error. Grok's leader
-   * queues the prompt and runs it at the next turn boundary, so refusing
-   * here would re-implement, worse, something the server already does.
+   * Note what is *not* here: a turn-in-progress guard against the
+   * *human's* turn. Codex needs one because a second `turn/start`
+   * mid-turn is an error. Grok's leader queues the prompt and runs it at
+   * the next turn boundary, so refusing there would re-implement, worse,
+   * something the server already does.
+   *
+   * What *is* here is a guard against a second *injected* turn. The two
+   * facts about an injected turn arrive on two sockets with no ordering
+   * between them (see `armInjectedCompletion`), and the proxy leg's prose
+   * carries no prompt id — so with two injections outstanding there is
+   * nothing in the stream that says which turn is streaming. The second
+   * verdict would close the first turn against whatever happened to be
+   * buffered and take its correlation with it. Serialising is what makes
+   * the correlation unambiguous rather than merely usually right: one
+   * injected turn at a time, the rest queued here and sent as each turn
+   * closes. The leader would have run them one at a time regardless.
    */
   injectMessage(text: string, correlation?: GrokInjectionCorrelation): boolean {
+    if (this.sessionIdValue === null) {
+      this.log("Cannot inject: no Grok session to inject into");
+      return false;
+    }
+    if (this.injectionBusy) {
+      if (this.injectionQueue.length >= MAX_QUEUED_INJECTIONS) {
+        this.log(`Cannot inject: ${MAX_QUEUED_INJECTIONS} prompts already queued`);
+        return false;
+      }
+      this.injectionQueue.push({ text, correlation });
+      this.log(`Queued injection behind the turn in flight (${this.injectionQueue.length} waiting)`);
+      return true;
+    }
+    return this.writeInjection(text, correlation);
+  }
+
+  /**
+   * True from the moment a prompt is written until its turn is fully
+   * accounted for — the verdict arrived *and* the settle window closed.
+   * Not merely "a prompt is in flight": the window is exactly the period
+   * where a second correlation would be ambiguous.
+   */
+  private get injectionBusy(): boolean {
+    return this.ourPrompts.size > 0 || this.injectedCompletion !== null;
+  }
+
+  /** Send the next queued prompt, if the turn just closed and one waits. */
+  private pumpInjectionQueue(): void {
+    if (this.stopped || this.injectionBusy) return;
+    const next = this.injectionQueue.shift();
+    if (!next) return;
+    if (!this.writeInjection(next.text, next.correlation)) {
+      // Never written, so never run: safe to say so, and safe to resend.
+      this.reportUndelivered(next.correlation, "the prompt could not be written to the Grok leader", "rejected");
+      this.pumpInjectionQueue();
+    }
+  }
+
+  /** Put one prompt on the wire. The serialisation gate is the caller's. */
+  private writeInjection(text: string, correlation?: GrokInjectionCorrelation): boolean {
     const sessionId = this.sessionIdValue;
     if (sessionId === null) {
       this.log("Cannot inject: no Grok session to inject into");
@@ -549,13 +631,23 @@ export class GrokAdapter extends EventEmitter {
     }
     const reason = acp.error.message || "Grok refused the prompt";
     this.log(`Injection rejected: ${reason}`);
-    if (correlation) {
-      this.emit("injectionRejected", {
-        ...correlation,
-        reason,
-        delivery: "rejected",
-      } satisfies GrokInjectionRejection);
-    }
+    this.reportUndelivered(correlation, reason, "rejected");
+    // The turn that will never run is not holding the queue any more.
+    this.pumpInjectionQueue();
+  }
+
+  /** Tell the daemon an injected prompt did not visibly run. */
+  private reportUndelivered(
+    correlation: GrokInjectionCorrelation | null | undefined,
+    reason: string,
+    delivery: GrokInjectionDelivery,
+  ): void {
+    if (!correlation) return;
+    this.emit("injectionRejected", {
+      ...correlation,
+      reason,
+      delivery,
+    } satisfies GrokInjectionRejection);
   }
 
   /**
@@ -582,14 +674,20 @@ export class GrokAdapter extends EventEmitter {
     correlation: GrokInjectionCorrelation | null,
     windowMs: number = this.settleMs,
   ): void {
-    // A second completion while one is pending means two injected turns
-    // ran back to back. The older one's prose is already complete —
-    // whatever is in the buffer belongs to it — so close it now rather
-    // than letting the new turn's settle window claim it.
-    if (this.injectedCompletion) this.settleInjectedCompletion();
+    // Injection is serialised, so there is never a second window to
+    // reconcile with this one. It used to close the older one here, which
+    // — with nothing streamed yet, the ordinary case when two verdicts
+    // beat their prose — flushed an empty buffer and dropped the first
+    // correlation on the floor. Serialising removed the situation rather
+    // than the symptom; this is the assertion that it stays removed.
+    if (this.injectedCompletion) {
+      this.log("BUG: a second injected completion armed while one was pending");
+      this.settleInjectedCompletion();
+    }
     this.injectedCompletion = {
       correlation,
       reason,
+      deadline: Date.now() + windowMs,
       timer: setTimeout(() => this.settleInjectedCompletion(), windowMs),
     };
     this.injectedCompletion.timer.unref?.();
@@ -606,9 +704,40 @@ export class GrokAdapter extends EventEmitter {
 
   /** End the injected turn the settle window was holding open. */
   private settleInjectedCompletion(): void {
-    const pending = this.takeInjectedCompletion();
+    const pending = this.injectedCompletion;
     if (!pending) return;
+
+    // Nothing has streamed yet, so this window is not measuring silence
+    // after a turn — it is still waiting for one to start. Consuming the
+    // correlation here is how a slow first token used to cost an answer
+    // its attribution: the leader's verdict arms the window, the echo of
+    // our own prompt re-arms it at the *short* settle interval, and it
+    // fires in the gap before the model's first chunk. Keep waiting
+    // until the deadline the window was armed with.
+    if (!this.turnActive && this.chunks.length === 0) {
+      const remaining = pending.deadline - Date.now();
+      if (remaining > 0) {
+        clearTimeout(pending.timer);
+        pending.timer = setTimeout(
+          () => this.settleInjectedCompletion(),
+          Math.min(this.settleMs, remaining),
+        );
+        pending.timer.unref?.();
+        return;
+      }
+      // Out of patience. No turn is coming — say so rather than dropping
+      // it through an empty `flush`, which reports nothing at all.
+      this.takeInjectedCompletion();
+      if (pending.correlation) {
+        this.log(`Giving up on the turn for ${pending.correlation.messageId}: ${pending.reason}`);
+      }
+      this.pumpInjectionQueue();
+      return;
+    }
+
+    this.takeInjectedCompletion();
     this.flush(pending.reason, pending.correlation);
+    this.pumpInjectionQueue();
   }
 
   /** Disarm the settle window and hand back what it was holding. */
@@ -637,6 +766,13 @@ export class GrokAdapter extends EventEmitter {
    * whatever file writes and tool calls that turn made.
    */
   private failInflightInjections(reason: string): void {
+    // Queued prompts never reached the wire, so unlike the one in flight
+    // their fate is knowable: Grok did not see them, and a resend cannot
+    // duplicate anything.
+    const queued = this.injectionQueue.splice(0);
+    for (const q of queued) {
+      this.reportUndelivered(q.correlation, "the prompt was never sent to the Grok leader", "rejected");
+    }
     if (this.ourPrompts.size === 0) return;
     this.log(`Failing ${this.ourPrompts.size} in-flight injection(s): ${reason}`);
     const inflight = [...this.ourPrompts];
@@ -709,6 +845,10 @@ export class GrokAdapter extends EventEmitter {
       this.emit("agentMessage", { senderRef, content, respondingTo } satisfies GrokProseIngress);
     }
     this.emit("turnCompleted");
+    // A turn ending here — a TUI disconnect, or the human's next prompt —
+    // consumed the window just as a settle would have, so the queue is
+    // free either way.
+    if (held) this.pumpInjectionQueue();
   }
 
   private log(msg: string): void {

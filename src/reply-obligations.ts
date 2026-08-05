@@ -19,11 +19,19 @@
  * prevent.
  *
  * The rule, in one place: an obligation is discharged by the transport
- * that hands the message over, released by the path that establishes
- * nobody ever will, and swept if neither happens.
+ * that hands the message over, and released by the path that establishes
+ * nobody ever will. There is no timer sweep, and adding one would be a
+ * bug: an obligation still held is one whose message is still sitting in
+ * a mailbox waiting for its agent to connect, and expiring it would
+ * silently downgrade that delivery when it finally happens. What makes
+ * "no third case" true is the contract enforced at ingress —
+ * `require_reply` is accepted only for a `reply` addressed to exactly one
+ * agent, and a `reply` is the one kind a mailbox refuses rather than
+ * sheds. So every obligation ends at a transport or at a refusal.
  */
 export class ReplyObligations {
   private readonly ids = new Map<string, number>();
+
 
   /** The sender asked for a reply to `id`. */
   require(id: string, now: number): void {
@@ -49,22 +57,6 @@ export class ReplyObligations {
    */
   release(id: string): void {
     this.ids.delete(id);
-  }
-
-  /**
-   * Drop obligations older than `ttlMs`, and report them.
-   *
-   * The backstop for the case no other path covers: a message enqueued
-   * for an agent that never connects, whose mailbox entry expires
-   * underneath it. Without this the entry is immortal.
-   */
-  sweep(now: number, ttlMs: number): string[] {
-    const stale: string[] = [];
-    for (const [id, at] of this.ids) {
-      if (now - at > ttlMs) stale.push(id);
-    }
-    for (const id of stale) this.ids.delete(id);
-    return stale;
   }
 
   get size(): number {

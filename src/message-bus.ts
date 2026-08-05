@@ -34,9 +34,26 @@ export interface BusDeps {
 export class MessageBus {
   constructor(private readonly deps: BusDeps) {}
 
-  async route(envelope: BridgeMessage, now: number): Promise<RouteResult> {
+  async route(
+    envelope: BridgeMessage,
+    now: number,
+    opts: { requireReply?: boolean } = {},
+  ): Promise<RouteResult> {
     // 1. the only routing decision in the system
     const recipients = resolveRecipients(envelope, this.deps.state, now);
+
+    // `require_reply` names one agent to wait on, so it can only be
+    // asked of one agent. Enforced here rather than at the frontend
+    // because the recipient count is a routing fact — `to: "*"`, an
+    // omitted `to`, and a turn-scoped requester all fan out, and only
+    // `resolveRecipients` knows which. Refused rather than narrowed: a
+    // sender who asked three agents for an answer and got one obligation
+    // has been told something untrue about two of them.
+    if (opts.requireReply && recipients.length !== 1) {
+      throw new SendRejected(
+        `require_reply needs exactly one recipient; ${envelope.id} resolved to ${recipients.length} (${recipients.join(", ") || "none"}). Address one agent directly.`,
+      );
+    }
 
     // 2. per-recipient acceptance. a full mailbox for A must not block B.
     const accepted: AgentId[] = [];

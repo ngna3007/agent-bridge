@@ -518,6 +518,97 @@ describe("GrokAdapter injection", () => {
     expect(seen[0]?.respondingTo).toEqual({ messageId: "m1", requester: "claude", text: "q" });
   });
 
+  test("a slow first token does not cost an orphaned turn its attribution", async () => {
+    // The unknown-delivery window is sized against a model's thinking
+    // time, but the echo of our own prompt re-arms it at the *settle*
+    // interval — 250ms of socket skew. Firing in that gap used to consume
+    // the correlation against an empty buffer, and the answer, when it
+    // finally streamed, belonged to nobody. An empty window now waits out
+    // its own deadline instead.
+    const { adapter, tui, upstreams, leader } = harness({
+      orphanedInjectionWindowMs: SETTLE_MS * 20,
+    });
+    tuiPrompts(tui, 1);
+    leader.deliverAcp({ jsonrpc: "2.0", id: 1, result: {} });
+
+    const seen: GrokProseIngress[] = [];
+    adapter.on("agentMessage", (m: GrokProseIngress) => seen.push(m));
+    adapter.injectMessage("what is 2+2", { messageId: "m1", requester: "claude", text: "q" });
+
+    upstreams[1]!.hangUp();
+    userChunk(leader, "what is 2+2");
+    // Longer than settleMs, well inside the orphan window: the model is
+    // still thinking.
+    await settle();
+    expect(seen).toEqual([]);
+
+    chunk(leader, "four");
+    await settle();
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.respondingTo).toEqual({ messageId: "m1", requester: "claude", text: "q" });
+  });
+
+  test("a second injection waits for the first turn instead of racing it", async () => {
+    // Two verdicts can both land before any prose does, and the proxy
+    // leg's prose carries no prompt id — so with two turns outstanding
+    // nothing in the stream says which is streaming. The second used to
+    // close the first against an empty buffer and take its correlation.
+    const { adapter, tui, upstreams, leader } = harness();
+    tuiPrompts(tui, 1);
+    leader.deliverAcp({ jsonrpc: "2.0", id: 1, result: {} });
+
+    const seen: GrokProseIngress[] = [];
+    adapter.on("agentMessage", (m: GrokProseIngress) => seen.push(m));
+    expect(adapter.injectMessage("first", { messageId: "m1", requester: "claude", text: "q1" })).toBe(true);
+    expect(adapter.injectMessage("second", { messageId: "m2", requester: "claude", text: "q2" })).toBe(true);
+
+    const injector = upstreams[1]!;
+    const prompts = () => injector.acpSent().filter((m: any) => m.method === "session/prompt");
+    // Only the first is on the wire.
+    expect(prompts()).toHaveLength(1);
+
+    injector.deliverAcp({ jsonrpc: "2.0", id: prompts()[0].id, result: { stopReason: "end_turn" } });
+    userChunk(leader, "first");
+    chunk(leader, "four");
+    await settle();
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.content).toBe("four");
+    expect(seen[0]?.respondingTo?.messageId).toBe("m1");
+
+    // The first turn closed, so the second went out.
+    expect(prompts()).toHaveLength(2);
+    injector.deliverAcp({ jsonrpc: "2.0", id: prompts()[1].id, result: { stopReason: "end_turn" } });
+    userChunk(leader, "second");
+    chunk(leader, "five");
+    await settle();
+
+    expect(seen).toHaveLength(2);
+    expect(seen[1]?.content).toBe("five");
+    expect(seen[1]?.respondingTo?.messageId).toBe("m2");
+  });
+
+  test("an injector death reports the queued prompt as never sent", async () => {
+    // The one in flight is `unknown` — the bytes were written. The one
+    // still queued never reached the wire, so its fate is knowable and a
+    // resend cannot duplicate anything.
+    const { adapter, tui, upstreams, leader } = harness();
+    tuiPrompts(tui, 1);
+    leader.deliverAcp({ jsonrpc: "2.0", id: 1, result: {} });
+
+    const failures: any[] = [];
+    adapter.on("injectionRejected", (r: any) => failures.push(r));
+    adapter.injectMessage("first", { messageId: "m1", requester: "claude", text: "q1" });
+    adapter.injectMessage("second", { messageId: "m2", requester: "claude", text: "q2" });
+
+    upstreams[1]!.hangUp();
+
+    expect(failures.map((f) => [f.messageId, f.delivery])).toEqual([
+      ["m2", "rejected"],
+      ["m1", "unknown"],
+    ]);
+  });
+
   test("the echo of our own prompt does not eat the answer's correlation", async () => {
     // The real order, when the verdict wins its race: response on the
     // injector leg, then the leader's echo of the prompt we injected on

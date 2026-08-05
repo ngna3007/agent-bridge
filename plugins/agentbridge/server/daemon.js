@@ -1562,6 +1562,7 @@ class LeaderFramer {
 // src/grok-adapter.ts
 var INJECTED_TURN_SETTLE_MS = 250;
 var ORPHANED_INJECTION_WINDOW_MS = 60000;
+var MAX_QUEUED_INJECTIONS = 32;
 
 class GrokAdapter extends EventEmitter2 {
   server = null;
@@ -1576,6 +1577,7 @@ class GrokAdapter extends EventEmitter2 {
   injectionCorrelations = new Map;
   ourPrompts = new Set;
   injectedCompletion = null;
+  injectionQueue = [];
   stopped = false;
   listening = false;
   socketPath;
@@ -1626,6 +1628,9 @@ class GrokAdapter extends EventEmitter2 {
   stop() {
     this.stopped = true;
     this.listening = false;
+    for (const q of this.injectionQueue.splice(0)) {
+      this.reportUndelivered(q.correlation, "the bridge stopped before the prompt was sent", "rejected");
+    }
     this.takeInjectedCompletion();
     this.tui?.close();
     this.injector?.close();
@@ -1636,6 +1641,36 @@ class GrokAdapter extends EventEmitter2 {
     this.sessionIdValue = null;
   }
   injectMessage(text, correlation) {
+    if (this.sessionIdValue === null) {
+      this.log("Cannot inject: no Grok session to inject into");
+      return false;
+    }
+    if (this.injectionBusy) {
+      if (this.injectionQueue.length >= MAX_QUEUED_INJECTIONS) {
+        this.log(`Cannot inject: ${MAX_QUEUED_INJECTIONS} prompts already queued`);
+        return false;
+      }
+      this.injectionQueue.push({ text, correlation });
+      this.log(`Queued injection behind the turn in flight (${this.injectionQueue.length} waiting)`);
+      return true;
+    }
+    return this.writeInjection(text, correlation);
+  }
+  get injectionBusy() {
+    return this.ourPrompts.size > 0 || this.injectedCompletion !== null;
+  }
+  pumpInjectionQueue() {
+    if (this.stopped || this.injectionBusy)
+      return;
+    const next = this.injectionQueue.shift();
+    if (!next)
+      return;
+    if (!this.writeInjection(next.text, next.correlation)) {
+      this.reportUndelivered(next.correlation, "the prompt could not be written to the Grok leader", "rejected");
+      this.pumpInjectionQueue();
+    }
+  }
+  writeInjection(text, correlation) {
     const sessionId = this.sessionIdValue;
     if (sessionId === null) {
       this.log("Cannot inject: no Grok session to inject into");
@@ -1825,20 +1860,27 @@ class GrokAdapter extends EventEmitter2 {
     }
     const reason = acp.error.message || "Grok refused the prompt";
     this.log(`Injection rejected: ${reason}`);
-    if (correlation) {
-      this.emit("injectionRejected", {
-        ...correlation,
-        reason,
-        delivery: "rejected"
-      });
-    }
+    this.reportUndelivered(correlation, reason, "rejected");
+    this.pumpInjectionQueue();
+  }
+  reportUndelivered(correlation, reason, delivery) {
+    if (!correlation)
+      return;
+    this.emit("injectionRejected", {
+      ...correlation,
+      reason,
+      delivery
+    });
   }
   armInjectedCompletion(reason, correlation, windowMs = this.settleMs) {
-    if (this.injectedCompletion)
+    if (this.injectedCompletion) {
+      this.log("BUG: a second injected completion armed while one was pending");
       this.settleInjectedCompletion();
+    }
     this.injectedCompletion = {
       correlation,
       reason,
+      deadline: Date.now() + windowMs,
       timer: setTimeout(() => this.settleInjectedCompletion(), windowMs)
     };
     this.injectedCompletion.timer.unref?.();
@@ -1852,10 +1894,27 @@ class GrokAdapter extends EventEmitter2 {
     pending.timer.unref?.();
   }
   settleInjectedCompletion() {
-    const pending = this.takeInjectedCompletion();
+    const pending = this.injectedCompletion;
     if (!pending)
       return;
+    if (!this.turnActive && this.chunks.length === 0) {
+      const remaining = pending.deadline - Date.now();
+      if (remaining > 0) {
+        clearTimeout(pending.timer);
+        pending.timer = setTimeout(() => this.settleInjectedCompletion(), Math.min(this.settleMs, remaining));
+        pending.timer.unref?.();
+        return;
+      }
+      this.takeInjectedCompletion();
+      if (pending.correlation) {
+        this.log(`Giving up on the turn for ${pending.correlation.messageId}: ${pending.reason}`);
+      }
+      this.pumpInjectionQueue();
+      return;
+    }
+    this.takeInjectedCompletion();
     this.flush(pending.reason, pending.correlation);
+    this.pumpInjectionQueue();
   }
   takeInjectedCompletion() {
     const pending = this.injectedCompletion;
@@ -1866,6 +1925,10 @@ class GrokAdapter extends EventEmitter2 {
     return pending;
   }
   failInflightInjections(reason) {
+    const queued = this.injectionQueue.splice(0);
+    for (const q of queued) {
+      this.reportUndelivered(q.correlation, "the prompt was never sent to the Grok leader", "rejected");
+    }
     if (this.ourPrompts.size === 0)
       return;
     this.log(`Failing ${this.ourPrompts.size} in-flight injection(s): ${reason}`);
@@ -1912,6 +1975,8 @@ class GrokAdapter extends EventEmitter2 {
       this.emit("agentMessage", { senderRef, content, respondingTo });
     }
     this.emit("turnCompleted");
+    if (held)
+      this.pumpInjectionQueue();
   }
   log(msg) {
     const line = `[${new Date().toISOString()}] [GrokAdapter] ${msg}
@@ -3217,8 +3282,11 @@ class MessageBus {
   constructor(deps) {
     this.deps = deps;
   }
-  async route(envelope, now) {
+  async route(envelope, now, opts = {}) {
     const recipients = resolveRecipients(envelope, this.deps.state, now);
+    if (opts.requireReply && recipients.length !== 1) {
+      throw new SendRejected(`require_reply needs exactly one recipient; ${envelope.id} resolved to ${recipients.length} (${recipients.join(", ") || "none"}). Address one agent directly.`);
+    }
     const accepted = [];
     const rejected = [];
     for (const agent of recipients) {
@@ -3302,16 +3370,6 @@ class ReplyObligations {
   }
   release(id) {
     this.ids.delete(id);
-  }
-  sweep(now, ttlMs) {
-    const stale = [];
-    for (const [id, at] of this.ids) {
-      if (now - at > ttlMs)
-        stale.push(id);
-    }
-    for (const id of stale)
-      this.ids.delete(id);
-    return stale;
   }
   get size() {
     return this.ids.size;
@@ -3404,10 +3462,10 @@ function senderFacingText(outcome) {
       return outcome.error;
   }
 }
-async function routeThroughBus(deps, envelope) {
+async function routeThroughBus(deps, envelope, opts = {}) {
   const { bus, log } = deps;
   try {
-    const outcome = await bus.route(envelope, (deps.now ?? Date.now)());
+    const outcome = await bus.route(envelope, (deps.now ?? Date.now)(), opts);
     if (outcome.rejected.length === 0)
       return { status: "delivered", accepted: outcome.accepted };
     log(`Message ${envelope.id} rejected by ${outcome.rejected.map((r) => r.agent).join(", ")}`);
@@ -3706,8 +3764,8 @@ function frontendTransport(agent) {
 }
 for (const agent of FRONTEND_AGENTS)
   registerTransport2(agent, frontendTransport(agent));
-async function routeThroughBus2(envelope) {
-  return routeThroughBus({ bus, log }, envelope);
+async function routeThroughBus2(envelope, opts = {}) {
+  return routeThroughBus({ bus, log }, envelope, opts);
 }
 function routeOrLog(envelope) {
   routeThroughBus2(envelope).then((outcome) => {
@@ -4139,9 +4197,18 @@ async function sendFromFrontend(ws, requestId, frame, requireReply) {
     });
     return;
   }
+  if (requireReply && envelope.kind !== "reply") {
+    sendProtocolMessage(ws, {
+      type: "claude_to_codex_result",
+      requestId,
+      success: false,
+      error: `require_reply is only available on reply-kind messages; ${envelope.id} is ${envelope.kind}. A ${envelope.kind} may be shed when a mailbox fills, which would leave the reply owed by nobody.`
+    });
+    return;
+  }
   if (requireReply)
     obligations.require(envelope.id, Date.now());
-  const outcome = await routeThroughBus2(envelope);
+  const outcome = await routeThroughBus2(envelope, { requireReply });
   if (outcome.status === "failed") {
     obligations.release(envelope.id);
     sendProtocolMessage(ws, {

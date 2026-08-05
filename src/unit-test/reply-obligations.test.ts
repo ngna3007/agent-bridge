@@ -25,6 +25,10 @@ describe("ReplyObligations", () => {
     expect(new ReplyObligations().discharge("nope")).toBe(false);
   });
 
+  // Deliberately no sweep test: there is no sweep. See the class docblock —
+  // an obligation still held means a message still queued, and expiring
+  // one on a timer downgrades the delivery that eventually happens.
+
   test("release() drops an obligation nothing will ever discharge", () => {
     const o = new ReplyObligations();
     o.require("m1", 0);
@@ -32,13 +36,4 @@ describe("ReplyObligations", () => {
     expect(o.has("m1")).toBe(false);
   });
 
-  test("sweep() drops only entries past the ttl, and names them", () => {
-    const o = new ReplyObligations();
-    o.require("old", 0);
-    o.require("fresh", 900);
-    const stale = o.sweep(1_000, 500);
-    expect(stale).toEqual(["old"]);
-    expect(o.has("old")).toBe(false);
-    expect(o.has("fresh")).toBe(true);
-  });
 });

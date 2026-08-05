@@ -456,8 +456,11 @@ function frontendTransport(agent: FrontendAgent): WakeupTransport {
 for (const agent of FRONTEND_AGENTS) registerTransport(agent, frontendTransport(agent));
 
 /** The one call into the bus. See `routeThroughBus` in `src/daemon-bus.ts`. */
-async function routeThroughBus(envelope: BridgeMessage): Promise<RouteOutcome> {
-  return routeThroughBusIn({ bus, log }, envelope);
+async function routeThroughBus(
+  envelope: BridgeMessage,
+  opts: { requireReply?: boolean } = {},
+): Promise<RouteOutcome> {
+  return routeThroughBusIn({ bus, log }, envelope, opts);
 }
 
 /**
@@ -1316,12 +1319,26 @@ async function sendFromFrontend(
     return;
   }
 
+  // The other half of the `require_reply` contract; the bus enforces the
+  // recipient count. Only `reply` refuses a full mailbox — every other
+  // kind sheds under pressure and still reports `accepted`, which would
+  // leave an obligation recorded for a message that no longer exists.
+  if (requireReply && envelope.kind !== "reply") {
+    sendProtocolMessage(ws, {
+      type: "claude_to_codex_result",
+      requestId,
+      success: false,
+      error: `require_reply is only available on reply-kind messages; ${envelope.id} is ${envelope.kind}. A ${envelope.kind} may be shed when a mailbox fills, which would leave the reply owed by nobody.`,
+    });
+    return;
+  }
+
   // The wake-up happens inside `bus.route` and cannot take arguments, so
   // the obligation is parked under the daemon-assigned id for whichever
   // transport ends up handing the message over to collect.
   if (requireReply) obligations.require(envelope.id, Date.now());
 
-  const outcome = await routeThroughBus(envelope);
+  const outcome = await routeThroughBus(envelope, { requireReply });
 
   if (outcome.status === "failed") {
     // Nothing was enqueued, so no transport will ever discharge this.

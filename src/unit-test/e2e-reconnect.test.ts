@@ -143,6 +143,29 @@ describe("E2E: daemon lifecycle + reconnect", () => {
     await client.disconnect();
   }, 10000);
 
+  test("require_reply is refused on a kind a mailbox may shed", async () => {
+    // Only `reply` refuses a full mailbox; every other kind sheds under
+    // pressure and still reports `accepted`. Accepting `require_reply` on
+    // one of those would record an obligation against a message that can
+    // stop existing, owed by nobody.
+    const client = new DaemonClient(WS_URL);
+    await client.connect();
+    client.attachClaude();
+    await new Promise((r) => setTimeout(r, 200));
+
+    const result = await client.sendReply({
+      id: "test_require_status",
+      from: "claude", to: "codex", kind: "status",
+      content: "working on it",
+      timestamp: Date.now(),
+    }, true);
+
+    expect(result.success).toBe(false);
+    expect(result.error ?? "").toContain("require_reply is only available on reply-kind");
+
+    await client.disconnect();
+  }, 10000);
+
   test("client detects daemon shutdown via disconnect event", async () => {
     const client = new DaemonClient(WS_URL);
     await client.connect();
