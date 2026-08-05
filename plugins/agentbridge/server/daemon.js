@@ -1764,13 +1764,16 @@ class GrokAdapter extends EventEmitter2 {
     this.announceCapacity();
   }
   announceCapacity() {
-    if (this.stopped)
-      return;
     if (this.transitionDepth > 0) {
       this.capacityDeferred = true;
       return;
     }
+    if (!this.canInjectNow())
+      return;
     this.emit("injectionCapacity");
+  }
+  canInjectNow() {
+    return !this.stopped && this.sessionIdValue !== null && this.activeInjection === null;
   }
   transition(mutate) {
     this.transitionDepth += 1;

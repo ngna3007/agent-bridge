@@ -593,12 +593,14 @@ describe("GrokAdapter injection", () => {
     ).toBe(true);
   });
 
-  test("a slot freed by a TUI teardown is not offered until the session is gone", () => {
+  test("a TUI teardown frees a slot without offering it", () => {
     // The daemon injects synchronously on `injectionCapacity`, so the
     // event has to mean "there is somewhere to put the next prompt".
     // Announced from inside a teardown, it handed the next message a
     // session the same teardown was about to drop — and then reported
-    // that message undelivered on its way out.
+    // that message undelivered on its way out. The slot is genuinely
+    // free afterwards, but there is nothing to inject into until a TUI
+    // comes back, and that is `sessionAttached`'s event to send.
     const { adapter, tui, upstreams, leader } = harness();
     tuiPrompts(tui, 1);
     leader.deliverAcp({ jsonrpc: "2.0", id: 1, result: {} });
@@ -621,9 +623,9 @@ describe("GrokAdapter injection", () => {
     });
     tui.hangUp();
 
-    // Refused, because by the time capacity is announced there is no
-    // session left to prompt into. The daemon holds m2 in the mailbox.
-    expect(accepted).toEqual([false]);
+    // Not even offered: `canInjectNow` is false with no session, so the
+    // daemon is spared a drain that could only be refused.
+    expect(accepted).toEqual([]);
     // m1's answer made it out on the teardown flush, so nothing is owed
     // on it — and m2 never reached the wire, so nothing is owed there
     // either. A capacity event announced mid-teardown produced both.
@@ -1058,7 +1060,9 @@ describe("GrokAdapter injection", () => {
     // The prompt was written; the leader may have run it where this
     // bridge can no longer watch.
     expect(failures[0].delivery).toBe("unknown");
-    expect(capacity).toHaveLength(1);
+    // No capacity: the slot is empty, but there is no session to put
+    // anything in. The next `sessionAttached` is what offers it.
+    expect(capacity).toEqual([]);
   });
 
   test("the echo of our own prompt does not eat the answer's correlation", async () => {

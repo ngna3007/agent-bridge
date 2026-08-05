@@ -410,6 +410,8 @@ export class GrokAdapter extends EventEmitter {
       this.log("Cannot inject: an injected turn is still outstanding");
       return false;
     }
+    // Both conditions above are `canInjectNow`; they are spelled out
+    // again here only to say which one refused.
     const injector = this.ensureInjector();
     if (injector === null) return false;
 
@@ -632,12 +634,26 @@ export class GrokAdapter extends EventEmitter {
    * running. Held until the transition commits.
    */
   private announceCapacity(): void {
-    if (this.stopped) return;
     if (this.transitionDepth > 0) {
       this.capacityDeferred = true;
       return;
     }
+    if (!this.canInjectNow()) return;
     this.emit("injectionCapacity");
+  }
+
+  /**
+   * Whether an injected prompt would be written if one were offered now.
+   *
+   * The same predicate `injectMessage` refuses on, so the event and the
+   * call agree. Without it the event was a hint that a slot *had been*
+   * freed, which is not the same claim: a teardown announced capacity
+   * with no session left, and a session change announced it after
+   * `sessionAttached` had already drained the mailbox into the slot. Both
+   * cost the daemon a drain that could only be refused.
+   */
+  private canInjectNow(): boolean {
+    return !this.stopped && this.sessionIdValue !== null && this.activeInjection === null;
   }
 
   /**
