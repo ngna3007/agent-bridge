@@ -72,9 +72,26 @@ export type ControlClientMessage =
    * through the same MCP surface. The message keeps its `claude_`
    * name for wire compatibility with frontends that predate the field.
    */
-  | { type: "claude_connect"; projectId?: string | null; agent?: FrontendAgent }
+  | {
+      type: "claude_connect";
+      projectId?: string | null;
+      agent?: FrontendAgent;
+      /**
+       * The frontend declaring which envelope shape it speaks. Absent
+       * means a pre-0.8 frontend, whose payload `source` field was
+       * never authenticated and is therefore ignored rather than
+       * treated as a mismatch. Inferring the version from which fields
+       * happen to be present is how a partially-upgraded frontend gets
+       * silently mis-handled, so it is declared, not sniffed.
+       */
+      protocolVersion?: number;
+    }
   | { type: "claude_disconnect" }
   | { type: "claude_to_codex"; requestId: string; message: BridgeMessage; requireReply?: boolean }
+  /** Ask the daemon to lease this agent's pending messages. */
+  | { type: "drain"; requestId: string }
+  /** Confirm what was actually consumed. Only this deletes. */
+  | { type: "ack"; batchId: string; ids: string[] }
   | { type: "status" };
 
 /**
@@ -86,14 +103,25 @@ export type ControlClientMessage =
  *   [REPLY] events and any system_* lifecycle notice the daemon
  *   wants Claude to act on immediately.
  *
- * - "queue": held in the ClaudeAdapter's pull queue. Claude only sees
- *   it when it explicitly calls the get_messages tool. Used for
- *   untagged Codex output so that not every Codex reply automatically
- *   spends Claude's context tokens.
+ * - "queue": not pushed. The message stays in the daemon's mailbox for
+ *   that agent — there is no second queue in the frontend any more —
+ *   and Claude sees it when it calls get_messages, which is what drains
+ *   and acks the mailbox. Used for untagged Codex output so that not
+ *   every Codex line automatically spends Claude's context tokens.
+ *
+ * The hint is advisory in exactly one direction: a frontend too old to
+ * know the field pushes everything, which is what it did before the
+ * field existed. It is not advisory in the other — a frontend that
+ * receives "queue" and pushes anyway makes this type a lie, and makes
+ * liars of `BRIDGE_CONTRACT_REMINDER` and every doc that describes the
+ * pull queue to the agents using it.
  */
 export type ClaudeDeliveryHint = "push" | "queue";
 
 export type ControlServerMessage =
+  /** First frame the daemon sends. Its absence tells a new frontend the daemon is old. */
+  | { type: "hello"; protocolVersion: number }
+  | { type: "drain_result"; requestId: string; batchId: string; messages: BridgeMessage[] }
   | { type: "codex_to_claude"; message: BridgeMessage; deliveryHint?: ClaudeDeliveryHint }
   | {
       type: "claude_to_codex_result";

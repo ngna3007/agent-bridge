@@ -117,7 +117,7 @@ export async function runStatus() {
     console.log(`  codex tui   ${live.tuiConnected ? "connected" : "not connected"}`);
     console.log(`  thread      ${live.threadId ?? "none yet (Codex has not started a thread)"}`);
     console.log(`  bridge      ${live.bridgeReady ? "ready" : "not ready"}`);
-    console.log(`  queued      ${live.queuedMessageCount} Codex message(s) waiting for get_messages`);
+    console.log(`  queued      ${live.queuedMessageCount} message(s) held in agent mailboxes`);
     console.log(`  held        ${live.pendingReplyCount} Claude repl(ies) waiting for Codex's turn to end`);
     console.log("");
 
@@ -229,7 +229,9 @@ function liveHints(live: DaemonStatus): string[] {
     );
   }
   if (live.queuedMessageCount > 0) {
-    hints.push(`${live.queuedMessageCount} Codex message(s) are queued for Claude's next get_messages call.`);
+    // Counts every direction — Codex→Claude, Claude→Codex, and anything
+    // held for a frontend that is not currently attached.
+    hints.push(`${live.queuedMessageCount} message(s) are waiting in agent mailboxes to be picked up.`);
   }
   return hints;
 }

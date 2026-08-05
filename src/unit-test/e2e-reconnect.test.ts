@@ -126,7 +126,7 @@ describe("E2E: daemon lifecycle + reconnect", () => {
 
     const result = await client.sendReply({
       id: "test_reply_1",
-      source: "claude",
+      from: "claude", to: null, kind: "untagged",
       content: "hello codex",
       timestamp: Date.now(),
     });

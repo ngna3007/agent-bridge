@@ -1,10 +1,9 @@
-import { describe, expect, test, beforeEach, afterEach } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { ClaudeAdapter } from "../claude-adapter";
 
 // Access internals for testing
 function createAdapter(envMode?: string): any {
   const origMode = process.env.AGENTBRIDGE_MODE;
-  const origMax = process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES;
 
   if (envMode !== undefined) {
     process.env.AGENTBRIDGE_MODE = envMode;
@@ -20,11 +19,6 @@ function createAdapter(envMode?: string): any {
   } else {
     delete process.env.AGENTBRIDGE_MODE;
   }
-  if (origMax !== undefined) {
-    process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES = origMax;
-  } else {
-    delete process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES;
-  }
 
   return adapter;
 }
@@ -32,9 +26,21 @@ function createAdapter(envMode?: string): any {
 function makeBridgeMessage(content: string, ts?: number) {
   return {
     id: `test_${Date.now()}`,
-    source: "codex" as const,
+    from: "codex" as const,
+    to: "claude" as const,
+    kind: "reply" as const,
     content,
     timestamp: ts ?? Date.now(),
+  };
+}
+
+/** A mailbox stand-in whose drain() the test controls directly. */
+function fakeMailbox(messages: ReturnType<typeof makeBridgeMessage>[], batchId = "b1") {
+  const acks: { batchId: string; ids: string[] }[] = [];
+  return {
+    acks,
+    drain: async () => ({ batchId, messages }),
+    ack: (batchId: string, ids: string[]) => acks.push({ batchId, ids }),
   };
 }
 
@@ -81,66 +87,26 @@ describe("Dual-mode transport: mode resolution", () => {
   });
 });
 
-describe("Dual-mode transport: pull mode message queue", () => {
-  test("queueForPull adds message to pendingMessages", () => {
+describe("Dual-mode transport: the daemon mailbox is the only store", () => {
+  test("a message queued by the daemon is drainable via get_messages, not a local buffer", async () => {
+    // What used to be "queueForPull adds message to pendingMessages" now
+    // asserts the replacement invariant: the adapter has no buffer of its
+    // own, so a waiting message is only visible by draining the mailbox.
     const adapter = createAdapter("pull");
     adapter.resolveMode();
 
-    const msg = makeBridgeMessage("hello from codex");
-    adapter.queueForPull(msg);
+    const mailbox = fakeMailbox([makeBridgeMessage("hello from codex")]);
+    adapter.setMailbox(mailbox);
 
-    expect(adapter.pendingMessages).toHaveLength(1);
-    expect(adapter.pendingMessages[0].content).toBe("hello from codex");
-    expect(adapter.getPendingMessageCount()).toBe(1);
+    const result = await adapter.handleGetMessages();
+    expect(result).toContain("hello from codex");
+    expect(mailbox.acks).toEqual([{ batchId: "b1", ids: [expect.any(String)] }]);
   });
 
-  test("queueForPull drops oldest when queue is full", () => {
-    const orig = process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES;
-    process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES = "3";
-    const adapter = createAdapter("pull");
-    process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES = orig;
-
-    adapter.resolveMode();
-
-    adapter.queueForPull(makeBridgeMessage("msg1"));
-    adapter.queueForPull(makeBridgeMessage("msg2"));
-    adapter.queueForPull(makeBridgeMessage("msg3"));
-    adapter.queueForPull(makeBridgeMessage("msg4"));
-
-    expect(adapter.pendingMessages).toHaveLength(3);
-    expect(adapter.pendingMessages[0].content).toBe("msg2");
-    expect(adapter.pendingMessages[2].content).toBe("msg4");
-    expect(adapter.droppedMessageCount).toBe(1);
-  });
-
-  test("pushNotification queues in pull mode", async () => {
-    const adapter = createAdapter("pull");
-    adapter.resolveMode();
-    await adapter.pushNotification(makeBridgeMessage("pull msg"));
-    expect(adapter.pendingMessages).toHaveLength(1);
-    expect(adapter.pendingMessages[0].content).toBe("pull msg");
-  });
-
-  test("enqueueForPull holds a message without notifying (queue-only delivery)", async () => {
-    // Backs the new "untagged Codex output stays in Claude's pull
-    // queue" path. We must NOT send an MCP notification for these,
-    // even though we are in push mode.
-    const adapter = createAdapter("push");
-    adapter.resolveMode();
-
-    const notifications: any[] = [];
-    adapter.server = {
-      notification: async (payload: any) => {
-        notifications.push(payload);
-      },
-    };
-
-    adapter.enqueueForPull(makeBridgeMessage("queue-only msg"));
-
-    expect(notifications).toHaveLength(0);
-    expect(adapter.pendingMessages).toHaveLength(1);
-    expect(adapter.pendingMessages[0].content).toBe("queue-only msg");
-  });
+  // The old suite also asserted that a pushed message was NOT queued —
+  // that assertion encoded the defect this task removes (two ledgers, a
+  // WebSocket send deciding which one a message landed in). There is now
+  // one mailbox, owned by the daemon, so that case no longer applies.
 
   test("push mode message ids include a session-unique prefix", async () => {
     const adapter = createAdapter("push");
@@ -167,7 +133,26 @@ describe("Dual-mode transport: pull mode message queue", () => {
     expect(firstId).not.toBe("codex_msg_1");
   });
 
-  test("pushNotification falls back to the pull queue when push delivery throws", async () => {
+  test("the push notification carries the message's canonical id for dedup", async () => {
+    const adapter = createAdapter("push");
+    adapter.resolveMode();
+
+    const notifications: any[] = [];
+    adapter.server = {
+      notification: async (payload: any) => {
+        notifications.push(payload);
+      },
+    };
+
+    const msg = makeBridgeMessage("wake up");
+    await adapter.pushNotification(msg);
+
+    expect(notifications[0].params.meta.canonical_id).toBe(msg.id);
+  });
+
+  test("a failed push does not throw and leaves no local trace of the message", async () => {
+    // A push is a wake-up, not the delivery: the message never left the
+    // daemon's mailbox, so a failed send has nothing to fall back into.
     const adapter = createAdapter("push");
     adapter.resolveMode();
 
@@ -177,92 +162,83 @@ describe("Dual-mode transport: pull mode message queue", () => {
       },
     };
 
-    await adapter.pushNotification(makeBridgeMessage("fallback msg"));
-
-    expect(adapter.pendingMessages).toHaveLength(1);
-    expect(adapter.pendingMessages[0].content).toBe("fallback msg");
+    await expect(adapter.pushNotification(makeBridgeMessage("fallback msg"))).resolves.toBeUndefined();
+    expect((adapter as unknown as Record<string, unknown>).pendingMessages).toBeUndefined();
   });
-});
 
-describe("Dual-mode transport: drainMessages (get_messages)", () => {
-  test("returns 'no new messages' when queue is empty", () => {
+  test("pushNotification in pull mode does not touch the MCP channel", async () => {
+    // In pull mode Claude never receives a push; the message already lives
+    // in the daemon's mailbox and is reached via get_messages.
     const adapter = createAdapter("pull");
     adapter.resolveMode();
 
-    const result = adapter.drainMessages();
-    expect(result.content[0].text).toBe("No new messages from Codex.");
+    const notifications: any[] = [];
+    adapter.server = {
+      notification: async (payload: any) => {
+        notifications.push(payload);
+      },
+    };
+
+    await adapter.pushNotification(makeBridgeMessage("pull msg"));
+    expect(notifications).toHaveLength(0);
+  });
+});
+
+describe("Dual-mode transport: get_messages (handleGetMessages)", () => {
+  test("returns 'No new messages.' when the mailbox drain is empty", async () => {
+    const adapter = createAdapter("pull");
+    adapter.resolveMode();
+    adapter.setMailbox(fakeMailbox([]));
+
+    const result = await adapter.handleGetMessages();
+    expect(result).toBe("No new messages.");
   });
 
-  test("returns formatted messages and clears queue", () => {
+  test("returns formatted messages from the drain", async () => {
     const adapter = createAdapter("pull");
     adapter.resolveMode();
 
     const ts = 1705312200000; // fixed timestamp for deterministic output
-    adapter.queueForPull(makeBridgeMessage("first message", ts));
-    adapter.queueForPull(makeBridgeMessage("second message", ts + 5000));
+    const mailbox = fakeMailbox([
+      makeBridgeMessage("first message", ts),
+      makeBridgeMessage("second message", ts + 5000),
+    ]);
+    adapter.setMailbox(mailbox);
 
-    const result = adapter.drainMessages();
-    const text = result.content[0].text;
+    const result = await adapter.handleGetMessages();
 
-    expect(text).toContain("[2 new messages from Codex]");
-    expect(text).toContain("chat_id:");
-    expect(text).toContain("[1]");
-    expect(text).toContain("first message");
-    expect(text).toContain("[2]");
-    expect(text).toContain("second message");
-
-    // Queue should be cleared
-    expect(adapter.pendingMessages).toHaveLength(0);
-    expect(adapter.getPendingMessageCount()).toBe(0);
+    expect(result).toContain("first message");
+    expect(result).toContain("second message");
   });
 
-  test("includes dropped count when messages were lost", () => {
-    const orig = process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES;
-    process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES = "2";
-    const adapter = createAdapter("pull");
-    process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES = orig;
-    adapter.resolveMode();
-
-    adapter.queueForPull(makeBridgeMessage("a"));
-    adapter.queueForPull(makeBridgeMessage("b"));
-    adapter.queueForPull(makeBridgeMessage("c")); // drops "a"
-
-    const result = adapter.drainMessages();
-    const text = result.content[0].text;
-    expect(text).toContain("1 older message");
-    expect(text).toContain("dropped due to queue overflow");
-    expect(adapter.droppedMessageCount).toBe(0); // reset after drain
-  });
-
-  test("singular message uses correct grammar", () => {
+  test("acks exactly the ids it was handed, once", async () => {
     const adapter = createAdapter("pull");
     adapter.resolveMode();
 
-    adapter.queueForPull(makeBridgeMessage("only one"));
+    const msg1 = makeBridgeMessage("a");
+    const msg2 = makeBridgeMessage("b");
+    const mailbox = fakeMailbox([msg1, msg2], "batch-7");
+    adapter.setMailbox(mailbox);
 
-    const result = adapter.drainMessages();
-    expect(result.content[0].text).toContain("[1 new message from Codex]");
+    await adapter.handleGetMessages();
+
+    expect(mailbox.acks).toEqual([{ batchId: "batch-7", ids: [msg1.id, msg2.id] }]);
+  });
+
+  test("no mailbox registered reports a clear state rather than throwing", async () => {
+    const adapter = createAdapter("pull");
+    adapter.resolveMode();
+
+    const result = await adapter.handleGetMessages();
+    expect(result).toBe("AgentBridge is not connected to a daemon.");
   });
 });
 
-describe("Dual-mode transport: reply pending hint", () => {
-  test("handleReply includes pending message hint when queue is non-empty", async () => {
-    const adapter = createAdapter("pull");
-    adapter.resolveMode();
-
-    adapter.replySender = async () => ({ success: true });
-    adapter.queueForPull(makeBridgeMessage("waiting msg 1"));
-    adapter.queueForPull(makeBridgeMessage("waiting msg 2"));
-
-    const result = await adapter.handleReply({ chat_id: "test", text: "hello codex" });
-    const text = result.content[0].text;
-
-    expect(text).toContain("Reply sent to Codex.");
-    expect(text).toContain("2 unread Codex message");
-    expect(text).toContain("get_messages");
-  });
-
-  test("handleReply has no hint when queue is empty", async () => {
+describe("Dual-mode transport: reply", () => {
+  test("handleReply reports success without any pending-queue hint", async () => {
+    // The old "N unread messages waiting" hint read the adapter's own
+    // pull queue, which no longer exists. handleReply must not regress
+    // to peeking the mailbox to fake that hint back in.
     const adapter = createAdapter("pull");
     adapter.resolveMode();
 
@@ -288,5 +264,17 @@ describe("Dual-mode transport: reply pending hint", () => {
     const result = await adapter.handleReply({ text: "hello" });
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("bridge not initialized");
+  });
+
+  test("handleReply surfaces a queued reply as a success with a note, not an error", async () => {
+    const adapter = createAdapter("pull");
+    adapter.resolveMode();
+
+    adapter.replySender = async () => ({ success: true, queued: true, note: "Codex is mid-turn." });
+
+    const result = await adapter.handleReply({ text: "hello codex" });
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("Reply queued for Codex");
+    expect(result.content[0].text).toContain("Codex is mid-turn.");
   });
 });

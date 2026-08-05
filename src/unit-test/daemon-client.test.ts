@@ -204,8 +204,11 @@ describe("DaemonClient", () => {
     const elapsed = Date.now() - start;
 
     expect(result).toBe(false);
-    // Must actually wait for the timeout, not resolve instantly.
-    expect(elapsed).toBeGreaterThanOrEqual(140);
+    // Must actually wait for the timeout, not resolve instantly. The floor
+    // sits well under 150 on purpose: setTimeout is allowed to fire a few ms
+    // early, and a 10ms margin made this flaky under WSL2 timer jitter. What
+    // is being asserted is "it waited", not the scheduler's precision.
+    expect(elapsed).toBeGreaterThanOrEqual(100);
     // Sanity check on upper bound to catch event-listener leaks that delay GC.
     expect(elapsed).toBeLessThan(2_000);
   });
@@ -234,7 +237,7 @@ describe("DaemonClient", () => {
 
     // Send a message that expects a reply — it will never be answered
     const replyPromise = client.sendReply(
-      { id: "test-pending", source: "claude", content: "hello", timestamp: Date.now() },
+      { id: "test-pending", from: "claude", to: null, kind: "untagged", content: "hello", timestamp: Date.now() },
       false,
     );
 
@@ -292,7 +295,7 @@ describe("DaemonClient", () => {
   test("sendReply returns error when not connected", async () => {
     const result = await client.sendReply({
       id: "r1",
-      source: "claude",
+      from: "claude", to: null, kind: "untagged",
       content: "hi",
       timestamp: Date.now(),
     });
@@ -317,7 +320,7 @@ describe("DaemonClient", () => {
 
     const result = await client.sendReply({
       id: "r2",
-      source: "claude",
+      from: "claude", to: null, kind: "untagged",
       content: "reply text",
       timestamp: Date.now(),
     });
@@ -329,7 +332,7 @@ describe("DaemonClient", () => {
 
     const replyPromise = client.sendReply({
       id: "r3",
-      source: "claude",
+      from: "claude", to: null, kind: "untagged",
       content: "will be rejected",
       timestamp: Date.now(),
     });
@@ -385,5 +388,200 @@ describe("DaemonClient", () => {
 
     const msg = await received;
     expect(msg.type).toBe("claude_connect");
+  });
+
+  describe("drain()", () => {
+    test("resolves with the batch when a matching drain_result arrives", async () => {
+      onServerMessage = (ws: any, raw: any) => {
+        const msg = JSON.parse(typeof raw === "string" ? raw : raw.toString());
+        if (msg.type === "drain") {
+          ws.send(JSON.stringify({
+            type: "drain_result",
+            requestId: msg.requestId,
+            batchId: "b1",
+            messages: [
+              { id: "m1", from: "codex", to: "claude", kind: "chat", content: "hi", timestamp: 1 },
+            ],
+          }));
+        }
+      };
+
+      await client.connect();
+      const result = await client.drain();
+
+      expect(result.batchId).toBe("b1");
+      expect(result.messages).toHaveLength(1);
+      expect(result.messages[0]?.id).toBe("m1");
+      expect(client.pendingDrainCount).toBe(0);
+    });
+
+    test("rejects on a synchronous send failure", async () => {
+      // Never connected — send() throws synchronously inside the
+      // executor, which must surface as a distinguishable rejection
+      // rather than folding into the same empty-batch resolve the
+      // timeout path uses.
+      await expect(client.drain()).rejects.toThrow(/not open/);
+      expect(client.pendingDrainCount).toBe(0);
+    });
+
+    test("timeout path resolves with an empty batch when the daemon never answers", async () => {
+      onServerMessage = () => {}; // accepts the frame but never replies
+
+      await client.connect();
+      const result = await client.drain();
+
+      expect(result).toEqual({ batchId: "", messages: [] });
+      expect(client.pendingDrainCount).toBe(0);
+    }, 7_000);
+
+    test("a drain_result for an unknown requestId is ignored and does not disturb a pending drain", async () => {
+      let realRequestId = "";
+      onServerMessage = (ws: any, raw: any) => {
+        const msg = JSON.parse(typeof raw === "string" ? raw : raw.toString());
+        if (msg.type === "drain") {
+          realRequestId = msg.requestId;
+          // Answer with an unrelated requestId first.
+          ws.send(JSON.stringify({
+            type: "drain_result",
+            requestId: "not-the-real-one",
+            batchId: "wrong",
+            messages: [],
+          }));
+        }
+      };
+
+      await client.connect();
+      const drainPromise = client.drain();
+
+      // Give the bogus result a tick to (not) settle the promise.
+      await new Promise((r) => setTimeout(r, 50));
+      expect(client.pendingDrainCount).toBe(1);
+
+      for (const ws of serverSockets) {
+        ws.send(JSON.stringify({
+          type: "drain_result",
+          requestId: realRequestId,
+          batchId: "real",
+          messages: [],
+        }));
+      }
+
+      const result = await drainPromise;
+      expect(result.batchId).toBe("real");
+      expect(client.pendingDrainCount).toBe(0);
+    });
+
+    test("a second drain_result for the same requestId does not double-settle or leak", async () => {
+      let realRequestId = "";
+      onServerMessage = (_ws: any, raw: any) => {
+        const msg = JSON.parse(typeof raw === "string" ? raw : raw.toString());
+        if (msg.type === "drain") realRequestId = msg.requestId;
+      };
+
+      await client.connect();
+      const drainPromise = client.drain();
+      await new Promise((r) => setTimeout(r, 50));
+
+      const sendResult = (batchId: string) => {
+        for (const ws of serverSockets) {
+          ws.send(JSON.stringify({ type: "drain_result", requestId: realRequestId, batchId, messages: [] }));
+        }
+      };
+
+      sendResult("first");
+      sendResult("second");
+
+      const result = await drainPromise;
+      expect(result.batchId).toBe("first");
+      expect(client.pendingDrainCount).toBe(0);
+
+      // The stray second result must not have thrown or left anything behind.
+      await new Promise((r) => setTimeout(r, 20));
+      expect(client.pendingDrainCount).toBe(0);
+    });
+
+    test("a socket close with a drain in flight settles that promise rather than hanging it", async () => {
+      onServerMessage = () => {}; // never answer
+
+      await client.connect();
+      const drainPromise = client.drain();
+      await new Promise((r) => setTimeout(r, 20));
+      expect(client.pendingDrainCount).toBe(1);
+
+      for (const ws of serverSockets) {
+        ws.close();
+      }
+
+      const result = await drainPromise;
+      expect(result).toEqual({ batchId: "", messages: [] });
+      expect(client.pendingDrainCount).toBe(0);
+    });
+  });
+
+  describe("ack()", () => {
+    test("reaches the socket with the batchId and ids it was given", async () => {
+      const received = new Promise<any>((resolve) => {
+        onServerMessage = (_ws: any, raw: any) => {
+          resolve(JSON.parse(typeof raw === "string" ? raw : raw.toString()));
+        };
+      });
+
+      await client.connect();
+      client.ack("batch-1", ["m1", "m2"]);
+
+      const msg = await received;
+      expect(msg).toEqual({ type: "ack", batchId: "batch-1", ids: ["m1", "m2"] });
+    });
+
+    test("no-ops on an empty ids array without touching the socket", async () => {
+      let sawMessage = false;
+      onServerMessage = () => { sawMessage = true; };
+
+      await client.connect();
+      client.ack("batch-1", []);
+
+      await new Promise((r) => setTimeout(r, 50));
+      expect(sawMessage).toBe(false);
+    });
+
+    test("throws when the socket is not open, rather than silently dropping the ack", () => {
+      // Never connected.
+      expect(() => client.ack("batch-1", ["m1"])).toThrow(/not open/);
+    });
+  });
+
+  describe("incompatibleDaemon", () => {
+    test("is emitted when the first server frame is not hello", async () => {
+      onServerMessage = () => {};
+
+      const incompatible = new Promise<void>((resolve) => {
+        client.on("incompatibleDaemon", () => resolve());
+      });
+
+      await client.connect();
+      sendToClient({ type: "status", status: { bridgeReady: true, tuiConnected: false, threadId: null, queuedMessageCount: 0, proxyUrl: "", appServerUrl: "", pid: 1 } });
+
+      await incompatible;
+      expect(client.isHandshakeConfirmed).toBe(false);
+    });
+
+    test("is NOT emitted when the first server frame is hello", async () => {
+      let emitted = false;
+      client.on("incompatibleDaemon", () => { emitted = true; });
+
+      await client.connect();
+      sendToClient({ type: "hello", protocolVersion: 1 });
+
+      // Follow up with a second, unrelated frame — only the first frame
+      // determines compatibility, so this must not retroactively flip it.
+      const statusPromise = new Promise<void>((resolve) => {
+        client.on("status", () => resolve());
+      });
+      sendToClient({ type: "status", status: { bridgeReady: true, tuiConnected: false, threadId: null, queuedMessageCount: 0, proxyUrl: "", appServerUrl: "", pid: 1 } });
+      await statusPromise;
+
+      expect(emitted).toBe(false);
+      expect(client.isHandshakeConfirmed).toBe(true);
+    });
   });
 });

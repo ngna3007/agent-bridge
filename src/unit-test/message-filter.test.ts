@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   BRIDGE_CONTRACT_REMINDER,
+  MarkerError,
   StatusBuffer,
   classifyMessage,
   parseMarker,
@@ -11,7 +12,7 @@ import type { BridgeMessage } from "../types";
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 function makeMsg(content: string, ts?: number): BridgeMessage {
-  return { id: `test_${Date.now()}`, source: "codex", content, timestamp: ts ?? Date.now() };
+  return { id: `test_${Date.now()}`, from: "codex", to: null, kind: "status", content, timestamp: ts ?? Date.now() };
 }
 
 describe("parseMarker", () => {
@@ -96,9 +97,10 @@ describe("classifyMessage — full mode preserves marker identity (regression)",
   // discarding what parseMarker had found. Full mode is a *routing* switch
   // ("forward everything"), but the marker is also read for *semantics*:
   // daemon.ts gates require_reply satisfaction on `result.marker === "reply"`.
-  // Erasing the marker meant a correctly-tagged [REPLY] never set
-  // replyReceivedDuringTurn, so every require_reply turn in full mode ended
-  // with a spurious system_reply_missing warning to Claude.
+  // Erasing the marker meant a correctly-tagged [REPLY] never satisfied
+  // the pending request (see src/pending-requests.ts), so every
+  // require_reply turn in full mode ended with a spurious `reply_missing`
+  // warning to Claude once the request's TTL expired.
 
   test("reports the parsed marker, not untagged", () => {
     expect(classifyMessage("[REPLY] x", "full")).toEqual({ action: "forward", marker: "reply" });
@@ -127,7 +129,7 @@ describe("daemon reply-tracking decision rules (mirrors src/daemon.ts)", () => {
   // handler; they exist to pin the daemon-visible consequence of the
   // classifyMessage contract above. Same precedent as pin-contract.test.ts.
 
-  /** src/daemon.ts: `if (replyRequired && result.marker === "reply")` */
+  /** src/daemon.ts: `if (result.marker === "reply") pendingRequests.satisfy(...)` */
   function replySatisfiedBy(contents: string[], mode: FilterMode): boolean {
     return contents.some((c) => classifyMessage(c, mode).marker === "reply");
   }
@@ -143,7 +145,8 @@ describe("daemon reply-tracking decision rules (mirrors src/daemon.ts)", () => {
 
   test("a [REPLY] satisfies require_reply in full mode", () => {
     // This is the bug: it returned false before the fix, so the daemon
-    // emitted system_reply_missing even though Codex did reply.
+    // would have emitted reply_missing once the request's TTL expired,
+    // even though Codex did reply.
     expect(replySatisfiedBy(["[REPLY] done, LGTM"], "full")).toBe(true);
   });
 
@@ -292,5 +295,43 @@ describe("BRIDGE_CONTRACT_REMINDER", () => {
     expect(BRIDGE_CONTRACT_REMINDER).toContain("[REPLY]");
     expect(BRIDGE_CONTRACT_REMINDER).toContain("[STATUS]");
     expect(BRIDGE_CONTRACT_REMINDER).toContain("[FYI]");
+  });
+});
+
+describe("addressed markers", () => {
+  test("extracts the @agent from inside the marker", () => {
+    expect(parseMarker("[REPLY @grok] ship it")).toEqual({
+      marker: "reply",
+      to: "grok",
+      body: "ship it",
+    });
+  });
+
+  test("an unaddressed marker leaves `to` null", () => {
+    expect(parseMarker("[REPLY] looks good")).toEqual({
+      marker: "reply",
+      to: null,
+      body: "looks good",
+    });
+  });
+
+  test("a bare @agent in prose does not address", () => {
+    const parsed = parseMarker("see @grok in the diff");
+    expect(parsed.marker).toBe("untagged");
+    expect(parsed.to).toBeNull();
+    expect(parsed.body).toBe("see @grok in the diff");
+  });
+
+  test("an unknown @name is a parse failure, not a broadcast", () => {
+    expect(() => parseMarker("[REPLY @grrok] oops")).toThrow(MarkerError);
+    expect(() => parseMarker("[REPLY @grrok] oops")).toThrow(/grrok/);
+  });
+
+  test("[IMPORTANT] still maps to reply and can carry an address", () => {
+    expect(parseMarker("[IMPORTANT @claude] hi")).toEqual({
+      marker: "reply",
+      to: "claude",
+      body: "hi",
+    });
   });
 });

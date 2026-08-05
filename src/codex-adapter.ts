@@ -15,7 +15,20 @@ import { EventEmitter } from "node:events";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { StateDirResolver } from "./state-dir";
 import { getRotatingLogger } from "./log-rotator";
-import type { BridgeMessage } from "./types";
+/**
+ * What the adapter knows about a message it intercepts from Codex: the
+ * app-server's own item id, and the prose.
+ *
+ * Deliberately not a `BridgeMessage`. Routing (`from` / `to` / `kind`) is not
+ * the adapter's to decide, and the canonical `id` is the daemon's to assign —
+ * `senderRef` is the app-server id under the name the envelope reserves for
+ * "the sender's own id, preserved for correlation". Reusing `id` here would
+ * give one field name two identities.
+ */
+export interface CodexProseIngress {
+  senderRef: string;
+  content: string;
+}
 import type { ServerWebSocket } from "bun";
 import {
   isAppServerNotification,
@@ -63,6 +76,30 @@ interface PendingRequest {
   threadId?: string;
 }
 
+/**
+ * What an injection was carrying, handed back if the app-server refuses it.
+ *
+ * Every field is opaque to the adapter — it stores them and echoes them
+ * back untouched. The adapter has no idea what an agent id is and should
+ * not learn; the daemon is the one that has to tell a sender its message
+ * did not land.
+ */
+export interface InjectionCorrelation {
+  /** The daemon's message id, so the caller recognises its own payload. */
+  id: string;
+  /** Who to tell, or null when the daemon itself was the sender. */
+  requester: string | null;
+  /** The text handed to `injectMessage`, echoed back so it can be reported. */
+  text: string;
+}
+
+/** An injection the app-server answered with an error. Emitted as `injectionRejected`. */
+export interface InjectionRejection {
+  correlation: InjectionCorrelation;
+  /** The app-server's own error message, as close to verbatim as it gave it. */
+  error: string;
+}
+
 export class CodexAdapter extends EventEmitter {
   private static readonly RESPONSE_TRACKING_TTL_MS = 30000;
 
@@ -93,6 +130,77 @@ export class CodexAdapter extends EventEmitter {
   private pendingRequests = new Map<string, PendingRequest>();
   private activeTurnIds = new Set<string>();
   turnInProgress = false;
+
+  /**
+   * `turn/start` requests this bridge has sent but the app-server has not
+   * yet confirmed with a `turn/started`.
+   *
+   * `turnInProgress` is set from the `turn/started` notification, which is
+   * an async round trip away. Two callers in the same synchronous tick —
+   * the daemon fires three of them back to back when a turn completes —
+   * would both read `false` and both send a `turn/start` on a thread that
+   * runs one turn at a time. The loser is logged upstream and dropped,
+   * while the daemon has already reported it delivered. A reservation
+   * taken the instant the frame goes out closes that window: the second
+   * caller is refused and keeps its payload for the next turn.
+   *
+   * Every entry carries a timer, so a reservation whose turn never starts
+   * expires instead of stalling injection forever. See `reserveTurnStart`.
+   */
+  private pendingTurnStarts = new Map<number, ReturnType<typeof setTimeout>>();
+
+  /**
+   * What each in-flight `turn/start` was carrying, for the caller that
+   * handed it over.
+   *
+   * `injectMessage` returning true means "the frame is on the wire", not
+   * "Codex took it". The app-server can still answer with an error, and
+   * that answer lands here, long after the caller was told true. Without
+   * this map the refusal is a log line and nothing else: the daemon has
+   * already self-acked the mailbox entry away, so the message is gone
+   * and its sender is told nothing — the one shape the never-silently-
+   * lost guarantee forbids outright. Holding the payload alongside the
+   * request id is what lets the rejection be reported back with the text
+   * it lost.
+   *
+   * Keyed and released by *bridge request id*, never by the injection
+   * slot. Those are two different lifetimes and conflating them lost the
+   * refusal that matters most: the app-server refuses a turn/start
+   * because another turn is already running, so the winning
+   * `turn/started` — which frees the slot — arrives before the refusal
+   * does. The entry survives until the response lands, until the id
+   * stops being correlatable at all (`RESPONSE_TRACKING_TTL_MS`), or
+   * until the connection those ids belong to is gone.
+   *
+   * Naturally near-empty: injection is serialised by `turnPending`, so at
+   * most one entry is live at a time, and it is bounded above by the same
+   * TTL as `bridgeRequestIds`.
+   */
+  private injectionCorrelations = new Map<number, InjectionCorrelation>();
+
+  /**
+   * How long an unconfirmed `turn/start` blocks the next injection.
+   *
+   * The failure this bounds is a `turn/start` that is neither answered nor
+   * followed by a `turn/started` — a dropped frame, an app-server that
+   * accepted and forgot. Long enough that a healthy round trip is never
+   * cut short, short enough that a lost one costs one deferral rather
+   * than the rest of the session.
+   */
+  private static readonly TURN_START_CONFIRM_TIMEOUT_MS = 15000;
+
+  /**
+   * Whether an injection right now would be refused because Codex is
+   * already occupied — a turn running, or one starting.
+   *
+   * Callers that hold a payload must ask this, not `turnInProgress`, to
+   * tell "retry when the turn ends" apart from "there is nowhere to send
+   * this". Reading `turnInProgress` alone during the in-flight window
+   * misreads a deferral as a dead thread.
+   */
+  get turnPending(): boolean {
+    return this.turnInProgress || this.pendingTurnStarts.size > 0;
+  }
 
   // Proxy-layer id rewriting: upstream uses globally unique ids
   private nextProxyId = 100000;
@@ -234,8 +342,16 @@ export class CodexAdapter extends EventEmitter {
     }
   }
 
-  /** Inject a message into the active Codex thread via turn/start. Returns true if sent. */
-  injectMessage(text: string): boolean {
+  /**
+   * Inject a message into the active Codex thread via turn/start.
+   *
+   * Returns true when the frame reached the wire — which is *not* the
+   * same as "Codex accepted it". The app-server may still answer with an
+   * error, and that answer arrives asynchronously; pass `correlation` to
+   * hear about it on the `injectionRejected` event. Without it a refusal
+   * is only logged, and the caller goes on believing it delivered.
+   */
+  injectMessage(text: string, correlation?: InjectionCorrelation): boolean {
     if (!this.threadId) {
       this.log("Cannot inject: no active thread");
       return false;
@@ -244,8 +360,20 @@ export class CodexAdapter extends EventEmitter {
       this.log("Cannot inject: app-server WebSocket not connected");
       return false;
     }
-    if (this.turnInProgress) {
-      this.log(`Rejected injection: Codex turn is in progress (thread ${this.threadId})`);
+    // One question, asked once. `turnPending` is the definition of
+    // "Codex is occupied" — restating its terms here is how a future
+    // third term gets honoured by the daemon's deferral check and not by
+    // the guard that actually sends, which would inject into a dead
+    // thread and report success. The log string is the only thing that
+    // needs to tell the two cases apart: a turn/start already in flight
+    // is a turn from the caller's point of view, it is simply not
+    // confirmed yet.
+    if (this.turnPending) {
+      this.log(
+        this.turnInProgress
+          ? `Rejected injection: Codex turn is in progress (thread ${this.threadId})`
+          : `Rejected injection: a turn/start is already in flight (thread ${this.threadId})`,
+      );
       return false;
     }
     this.log(`Injecting message into Codex (${text.length} chars)`);
@@ -257,6 +385,10 @@ export class CodexAdapter extends EventEmitter {
         id: requestId,
         params: { threadId: this.threadId, input: [{ type: "text", text }] },
       } satisfies AppServerRequest<"turn/start", TurnStartParams>));
+      // Only after the frame is actually on the wire: a send that threw
+      // started nothing and must not block the next caller.
+      this.reserveTurnStart(requestId);
+      if (correlation) this.injectionCorrelations.set(requestId, correlation);
       return true;
     } catch (err: any) {
       this.untrackBridgeRequestId(requestId);
@@ -363,8 +495,7 @@ export class CodexAdapter extends EventEmitter {
     // pendingServerRequests — those must survive the intentional reconnect
     // so they can be replayed after the TUI completes thread/resume.
     this.clearResponseTrackingStateForAppServerReconnect();
-    this.activeTurnIds.clear();
-    this.turnInProgress = false;
+    this.abandonTurns("the app-server was reconnected for a new TUI session");
 
     try {
       await this.connectToAppServer(false);
@@ -443,8 +574,7 @@ export class CodexAdapter extends EventEmitter {
     // Approval request/response ids are scoped to the current app-server session.
     // If the socket reconnects, replaying old approval state would forward stale ids.
     this.clearResponseTrackingState();
-    this.activeTurnIds.clear();
-    this.turnInProgress = false;
+    this.abandonTurns("the app-server connection closed");
     if (!intentional) {
       this.scheduleReconnect();
     }
@@ -1213,8 +1343,22 @@ export class CodexAdapter extends EventEmitter {
     }
 
     if (!isNaN(numericId) && this.consumeBridgeRequestId(numericId)) {
+      // Answered, so it is no longer in flight — on error especially: a
+      // turn/start that was refused will never produce a turn/started,
+      // and holding its reservation would block injection until the
+      // timeout for no reason.
+      this.clearTrackedId(this.pendingTurnStarts, numericId);
+      const correlation = this.injectionCorrelations.get(numericId);
+      this.injectionCorrelations.delete(numericId);
       if (parsed.error) {
-        this.log(`Bridge-originated request failed (id ${responseId}): ${parsed.error.message ?? "unknown error"}`);
+        const error = parsed.error.message ?? "unknown error";
+        this.log(`Bridge-originated request failed (id ${responseId}): ${error}`);
+        // The caller was told `true` when the frame went out and has
+        // long since moved on — for an injection, that means the mailbox
+        // entry was self-acked away. This event is the only remaining
+        // way anyone learns the message did not land, so it carries the
+        // text back with it.
+        if (correlation) this.emit("injectionRejected", { correlation, error } satisfies InjectionRejection);
       } else {
         this.log(`Bridge-originated request completed (id ${responseId})`);
       }
@@ -1291,8 +1435,9 @@ export class CodexAdapter extends EventEmitter {
           if (content) {
             this.log(`Agent message completed (${content.length} chars)`);
             this.emit("agentMessage", {
-              id: item.id, source: "codex" as const, content, timestamp: Date.now(),
-            } satisfies BridgeMessage);
+              senderRef: item.id,
+              content,
+            } satisfies CodexProseIngress);
           }
         }
         break;
@@ -1419,7 +1564,50 @@ export class CodexAdapter extends EventEmitter {
     this.emit("ready", threadId);
   }
 
+  /**
+   * Claim the single turn slot from the moment `turn/start` is sent.
+   *
+   * The timer is the anti-stall: the reservation is released by
+   * `turn/started`, by the response to this very request, and by every
+   * path that resets turn state — but if all of those are missed, the
+   * timer releases it anyway. A flag that can only be set by an event
+   * that may never arrive is how a race becomes a permanent stall.
+   */
+  private reserveTurnStart(requestId: number) {
+    this.clearTrackedId(this.pendingTurnStarts, requestId);
+    const timer = setTimeout(() => {
+      this.pendingTurnStarts.delete(requestId);
+      // Only the reservation. The correlation outlives it deliberately:
+      // this timer is about the *injection slot*, and it fires at 15s
+      // while a response stays correlatable for 30s. Dropping the
+      // correlation here would lose a refusal that arrives in between —
+      // and "no turn/started yet" is if anything a hint that a refusal
+      // is what is coming.
+      this.log(`turn/start ${requestId} was never confirmed; releasing the injection slot`);
+    }, CodexAdapter.TURN_START_CONFIRM_TIMEOUT_MS);
+    timer.unref?.();
+    this.pendingTurnStarts.set(requestId, timer);
+  }
+
+  /** Release every reservation: the app-server's turn state has been resolved for us. */
+  private clearPendingTurnStarts() {
+    for (const timer of this.pendingTurnStarts.values()) clearTimeout(timer);
+    this.pendingTurnStarts.clear();
+    // Reservations only. `markTurnStarted` calls this for *whoever's*
+    // turn started, and the most likely reason the app-server refuses
+    // the bridge's turn/start is that another turn is already running —
+    // so the winning turn/started arrives first and the refusal second.
+    // Clearing correlations here dropped exactly that refusal, after the
+    // transport's self-ack had already deleted the mailbox entry: real
+    // loss with nobody told. Correlations are keyed by bridge request id
+    // and are released with it, not with the injection slot.
+  }
+
   private markTurnStarted(turnId?: string) {
+    // A turn is running, whoever started it. `turnInProgress` now guards
+    // injection on its own, so the optimistic reservation has done its
+    // job and holding it longer would only delay the next injection.
+    this.clearPendingTurnStarts();
     const wasInProgress = this.turnInProgress;
     if (typeof turnId === "string" && turnId.length > 0) {
       this.activeTurnIds.add(turnId);
@@ -1431,6 +1619,24 @@ export class CodexAdapter extends EventEmitter {
     if (!wasInProgress && this.turnInProgress) {
       this.emit("turnStarted");
     }
+  }
+
+  /**
+   * Drop every running turn because the connection carrying it is gone.
+   *
+   * Distinct from `markTurnCompleted`: nothing completed. No
+   * `turn/completed` will ever arrive for these, so `turnCompleted` does
+   * not fire — and anything the daemon scopes to a turn (the requester
+   * that opened it, above all) would otherwise outlive the thread and
+   * keep steering Codex's next output at one agent while every other
+   * attached frontend silently received nothing. `turnAborted` is the
+   * event that says "this turn ended badly", which is still an ending.
+   */
+  private abandonTurns(why: string) {
+    this.activeTurnIds.clear();
+    this.turnInProgress = false;
+    this.log(`Abandoning any running Codex turn: ${why}`);
+    this.emit("turnAborted", why);
   }
 
   private markTurnCompleted(turnId?: string) {
@@ -1502,6 +1708,12 @@ export class CodexAdapter extends EventEmitter {
 
     const timer = setTimeout(() => {
       this.bridgeRequestIds.delete(requestId);
+      // The invariant that bounds a correlation: it lives exactly as
+      // long as the id a response could be matched against. Once this
+      // id is forgotten, `consumeBridgeRequestId` can never claim a
+      // response for it, so no refusal can ever arrive and the payload
+      // is dead weight.
+      this.injectionCorrelations.delete(requestId);
     }, CodexAdapter.RESPONSE_TRACKING_TTL_MS);
     timer.unref?.();
     this.bridgeRequestIds.set(requestId, timer);
@@ -1513,6 +1725,12 @@ export class CodexAdapter extends EventEmitter {
 
   private untrackBridgeRequestId(requestId: number) {
     this.clearTrackedId(this.bridgeRequestIds, requestId);
+    // Keeps "a correlation never outlives its bridge request id" true
+    // literally rather than by argument. Nothing is stored yet on the
+    // one path that calls this — the send threw before the correlation
+    // was recorded — and that is precisely why it must not be the thing
+    // the invariant rests on.
+    this.injectionCorrelations.delete(requestId);
   }
 
   private clearTrackedId(store: Map<number, ReturnType<typeof setTimeout>>, id: number) {
@@ -1536,6 +1754,19 @@ export class CodexAdapter extends EventEmitter {
       clearTimeout(timer);
     }
     this.bridgeRequestIds.clear();
+    // Same lifetime, and this is the one place the ids are genuinely
+    // meaningless: they belong to a connection that is gone, so no
+    // response for them is ever coming. Not a refusal — nobody said no —
+    // so nothing is reported; the daemon's exit and turn-abort paths own
+    // that case.
+    this.injectionCorrelations.clear();
+
+    // A turn/start reservation is keyed by a bridge request id, so once
+    // those are dropped no response can ever release it. Released here so
+    // every connection-scoped reset — app-server close and new-session
+    // reconnect both land in this method — frees the injection slot
+    // without each having to remember to.
+    this.clearPendingTurnStarts();
   }
 
   private clearResponseTrackingState() {

@@ -2,6 +2,7 @@
 
 import type { ServerWebSocket } from "bun";
 import { CodexAdapter } from "./codex-adapter";
+import type { CodexProseIngress, InjectionRejection } from "./codex-adapter";
 import { getRotatingLogger } from "./log-rotator";
 import { StatusLineWriter } from "./status-line-writer";
 import { BRIDGE_STOPPED_TAG } from "./lifecycle-tags";
@@ -11,6 +12,7 @@ import {
   StatusBuffer,
   classifyMessage,
   type FilterMode,
+  type FilterResult,
 } from "./message-filter";
 import { TuiConnectionState } from "./tui-connection-state";
 import { DaemonLifecycle } from "./daemon-lifecycle";
@@ -24,9 +26,14 @@ import {
 } from "./control-protocol";
 import { probeControlPort, describeControlPortConflict } from "./port-preflight";
 import { parsePositiveIntEnv } from "./env-utils";
-import { ReplyOutbox, type QueuedReply } from "./reply-outbox";
-import type { ControlClientMessage, ControlServerMessage, DaemonStatus } from "./control-protocol";
-import type { BridgeMessage } from "./types";
+import { ReplyOutbox } from "./reply-outbox";
+import type {
+  ControlClientMessage,
+  ControlServerMessage,
+  DaemonStatus,
+} from "./control-protocol";
+import type { AgentId, BridgeMessage } from "./types";
+import { forEgress } from "./daemon-egress";
 import { probeLiveness as probeLivenessImpl } from "./liveness-probe";
 import {
   DEFAULT_FRONTEND_AGENT,
@@ -35,6 +42,26 @@ import {
   parseFrontendAgent,
 } from "./frontend-registry";
 import type { FrontendAgent } from "./frontend-registry";
+import { isAgentId } from "./agent-id";
+import { Mailbox } from "./mailbox";
+import { MessageIndex } from "./message-index";
+import { MessageBus } from "./message-bus";
+import { PendingRequests } from "./pending-requests";
+import { TransportRegistry, type WakeupTransport } from "./wakeup-transport";
+import {
+  deliveryHintFor,
+  registerTransport as registerTransportIn,
+  routeThroughBus as routeThroughBusIn,
+  senderFacingText,
+  type RouteOutcome,
+} from "./daemon-bus";
+import { PROTOCOL_VERSION, normalizeIngress, normalizeProse } from "./normalize-ingress";
+import {
+  INDEX_CAPACITY,
+  INDEX_TTL_MS,
+  LEASE_TIMEOUT_MS,
+  MAILBOX_CAPACITY,
+} from "./daemon-constants";
 
 const FRONTEND_AGENT_LIST = FRONTEND_AGENTS.join(", ");
 
@@ -48,6 +75,14 @@ interface ControlSocketData {
    * *something*, and Claude is what every frontend was until 0.8.
    */
   agent: FrontendAgent;
+  /**
+   * The envelope shape this frontend declared in `claude_connect`.
+   *
+   * `null` means it declared none — a pre-0.8 frontend, whose payload
+   * `source` field was never authenticated and is therefore ignored
+   * rather than treated as a mismatch. Absent is tolerated, not refused.
+   */
+  protocolVersion: number | null;
   attached: boolean;
   /** When the last pong landed. Diagnostics only — the probe reads `pongCount`. */
   lastPongAt: number;
@@ -81,7 +116,6 @@ const CODEX_PROXY_PORT = parseInt(process.env.CODEX_PROXY_PORT ?? String(config.
 const CONTROL_PORT = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10);
 const TUI_DISCONNECT_GRACE_MS = parseInt(process.env.TUI_DISCONNECT_GRACE_MS ?? "2500", 10);
 const CLAUDE_DISCONNECT_GRACE_MS = 5_000;
-const MAX_BUFFERED_MESSAGES = parseInt(process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES ?? "100", 10);
 const FILTER_MODE: FilterMode =
   (process.env.AGENTBRIDGE_FILTER_MODE as FilterMode) === "full" ? "full" : "filtered";
 const IDLE_SHUTDOWN_MS = parseInt(process.env.AGENTBRIDGE_IDLE_SHUTDOWN_MS ?? String(config.idleShutdownSeconds * 1000), 10);
@@ -102,8 +136,7 @@ let controlServer: ReturnType<typeof Bun.serve> | null = null;
  * land in Claude's slot — see `src/frontend-registry.ts` and
  * `docs/scaling-plan.md` §4.1b.
  */
-const frontends = new FrontendRegistry<ServerWebSocket<ControlSocketData>, BridgeMessage>({
-  maxBufferedMessages: MAX_BUFFERED_MESSAGES,
+const frontends = new FrontendRegistry<ServerWebSocket<ControlSocketData>>({
   isOpen: (ws) => ws.readyState === WebSocket.OPEN,
   isClosed: (ws) => ws.readyState === WebSocket.CLOSED,
 });
@@ -125,10 +158,9 @@ let nextSystemMessageId = 0;
 let codexBootstrapped = false;
 let attentionWindowTimer: ReturnType<typeof setTimeout> | null = null;
 let inAttentionWindow = false;
-let replyRequired = false;
-let replyReceivedDuringTurn = false;
 let shuttingDown = false;
 let idleShutdownTimer: ReturnType<typeof setTimeout> | null = null;
+let pendingRequestsTimer: ReturnType<typeof setInterval> | null = null;
 let claudeDisconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let claudeOnlineNoticeSent = false;
 let claudeOfflineNoticeShown = false;
@@ -170,22 +202,281 @@ const replyOutbox = new ReplyOutbox({
   ttlMs: parsePositiveIntEnv("AGENTBRIDGE_REPLY_QUEUE_TTL_MS", 10 * 60_000, log),
 });
 
+/**
+ * Requests waiting on a reply, correlated per-request rather than by one
+ * module-level flag. See `src/pending-requests.ts` for why: with
+ * addressing, a `[REPLY @grok]` must not clear a request Claude is still
+ * waiting on.
+ */
+const pendingRequests = new PendingRequests();
+
+/**
+ * How long a require-reply request may sit unanswered before it is
+ * reported as missing. Same order of magnitude as the reply outbox TTL
+ * above — both bound how long a sender's request may go unaddressed
+ * before AgentBridge says so instead of staying quiet.
+ */
+const PENDING_REQUEST_TTL_MS = parsePositiveIntEnv("AGENTBRIDGE_REPLY_REQUIRED_TTL_MS", 10 * 60_000, log);
+/** How often `checkExpiredRequests` sweeps for requests past their TTL. */
+const PENDING_REQUEST_CHECK_INTERVAL_MS = 30_000;
+
+// ===========================================================================
+// The message bus.
+//
+// Every recipient owns a mailbox held by the daemon, and the mailbox —
+// not a wake-up — is the system of record. A wake-up that returns
+// success is not evidence the payload reached the model
+// (`docs/channels-silent-block.md`), so nothing is deleted from a
+// mailbox until the consumer acks it. This replaces the per-frontend
+// buffers that used to live in `FrontendRegistry`, where a message held
+// for an agent could only ever be replayed by the daemon guessing when
+// to replay it.
+// ===========================================================================
+
+const mailboxes = new Map<AgentId, Mailbox>();
+
+/** Every agent has a mailbox, attached or not. That is the point of having one. */
+function mailboxFor(agent: AgentId): Mailbox {
+  let box = mailboxes.get(agent);
+  if (!box) {
+    box = new Mailbox(agent, { capacity: MAILBOX_CAPACITY, leaseTimeoutMs: LEASE_TIMEOUT_MS });
+    mailboxes.set(agent, box);
+  }
+  return box;
+}
+
+const messageIndex = new MessageIndex({ capacity: INDEX_CAPACITY, ttlMs: INDEX_TTL_MS });
+const transports = new TransportRegistry();
+
+/** The agent whose request opened each agent's current turn. Turn-scoped. */
+const activeRequester = new Map<AgentId, AgentId>();
+
+const bus = new MessageBus({
+  mailboxFor,
+  index: messageIndex,
+  state: {
+    // Broadcast means everyone who is actually here. An agent that has
+    // never connected is not a recipient: fanning out to it fills a
+    // mailbox nobody will ever drain, and the first hundred messages
+    // later come back as "grok's mailbox is full" on sends that worked
+    // perfectly — which trains the user to ignore the shed note that
+    // partial-rejection reporting depends on being read.
+    //
+    // Codex is unconditional because it has no control socket to attach
+    // with; its presence is the app-server process, not a slot.
+    //
+    // "Known", not "attached": a frontend that has attached once and is
+    // mid-reconnect must keep receiving into its mailbox, which is the
+    // entire reason the mailbox exists. `FrontendRegistry.knownAgents`
+    // seeds Claude, so a message that arrives before Claude's first
+    // connect is still retained — long-standing behaviour.
+    knownAgents: () => ["codex", ...frontends.knownAgents()],
+    senderOf: (id, replier, now) => messageIndex.resolveSender(id, replier, now),
+    activeRequesterFor: (agent) => activeRequester.get(agent) ?? null,
+  },
+  transports,
+  log,
+});
+
+let idSeq = 0;
+function nextMessageId(): string {
+  return `msg_${Date.now()}_${++idSeq}`;
+}
+
+/**
+ * Ids whose sender asked Codex for a reply.
+ *
+ * The flag has to survive the gap between acceptance and the wake-up:
+ * `bus.route` enqueues first and wakes afterwards, and the wake may be
+ * deferred by a whole turn, so it cannot be a parameter of the send.
+ */
+const requireReplyIds = new Set<string>();
+
+/** Sender-facing text produced while waking Codex, read back by the send that caused it. */
+const codexDeferralNotes = new Map<string, string>();
+
+/** Who was waiting on each reply the outbox is holding. */
+const outboxRequester = new Map<string, AgentId>();
+
+/**
+ * Codex's wake-up: inject the message as a turn.
+ *
+ * This is where `deliverToCodex` is demoted from "the delivery" to "one
+ * transport's wake-up". A refusal is a deferral, not a loss — the outbox
+ * holds the content and re-injects when the current turn ends.
+ *
+ * Note what the deferral costs: this wake returns normally, so the
+ * `registerTransport` self-ack below deletes the mailbox entry even
+ * though Codex has not seen the message. On the deferred path the
+ * **outbox**, not the mailbox, is the system of record. That is why the
+ * outbox has to report every way it can drop an entry — cap-drop on
+ * accept, expiry and undeliverable in `drainReplyOutbox`, discard in
+ * `discardOutboxForLostCodex` — each echoing the text back to the
+ * sender. Those reports are what keep a deferral from becoming a silent
+ * loss once the mailbox copy is gone.
+ */
+/**
+ * Register a transport, self-acking it when it can never ack for itself.
+ * See `registerTransport` in `src/daemon-bus.ts` for why.
+ */
+function registerTransport(agent: AgentId, transport: WakeupTransport): void {
+  registerTransportIn({ transports, mailboxFor }, agent, transport);
+}
+
+registerTransport("codex", {
+  payloadMode: "content",
+  acknowledgementMode: "none",
+  wake: (message) => {
+    const requireReply = requireReplyIds.delete(message.id);
+    const requester = isAgentId(message.from) ? message.from : null;
+
+    if (deliverToCodex(message.content, requireReply, requester, message.id)) {
+      // The sender has answered, so the attention window opened for it is over.
+      clearAttentionWindow();
+      return;
+    }
+
+    const { depth, dropped } = replyOutbox.accept({
+      id: message.id,
+      content: message.content,
+      requireReply,
+      queuedAt: Date.now(),
+    });
+    if (requester) outboxRequester.set(message.id, requester);
+    log(`Queued reply for Codex while it was busy (depth ${depth}, dropped ${dropped.length})`);
+
+    // `turnPending`, not `turnInProgress`: a turn/start already on the
+    // wire is a turn from the sender's point of view, and telling them
+    // "no thread" for it would be wrong in the one direction that
+    // matters — it reads as "gone", not as "held".
+    let note = codex.turnPending
+      ? depth > 1
+        ? `Codex is mid-turn. Held for delivery when the turn ends (${depth} replies now queued, sent in order).`
+        : "Codex is mid-turn. Held for delivery when the turn ends."
+      : "Codex has no thread to inject into right now. Held for delivery when one is available.";
+    if (dropped.length > 0) {
+      note +=
+        ` ${dropped.length} older queued repl${dropped.length > 1 ? "ies were" : "y was"}` +
+        ` dropped to stay under the ${replyOutbox.capacity}-message limit.`;
+    }
+    codexDeferralNotes.set(message.id, note);
+  },
+});
+
+/**
+ * A frontend's wake-up: push the message down its control socket.
+ *
+ * `payloadMode: "content"` describes the frame, not the outcome — a
+ * `codex_to_claude` that leaves this process may still never reach the
+ * model, which is why the mailbox keeps its copy until an ack. Throwing
+ * is how a transport reports failure: `TransportRegistry.wake` turns it
+ * into a logged `"failed"` and the message waits.
+ */
+function frontendTransport(agent: FrontendAgent): WakeupTransport {
+  return {
+    payloadMode: "content",
+    // A frontend *can* produce correlated evidence: it drains under a
+    // lease and acks by id over its control socket. Nothing deletes on
+    // its behalf, which is why the push may be lost without the message
+    // being lost.
+    acknowledgementMode: "explicit",
+    wake: (message) => {
+      const socket = frontends.occupant(agent);
+      if (socket === null || !frontends.isAttached(agent)) {
+        throw new Error(`${agent} is not attached`);
+      }
+      if (!trySendBridgeMessage(socket, message, deliveryHintFor(message, FILTER_MODE))) {
+        throw new Error(`the control socket for ${agent} refused the frame`);
+      }
+    },
+  };
+}
+
+for (const agent of FRONTEND_AGENTS) registerTransport(agent, frontendTransport(agent));
+
+/** The one call into the bus. See `routeThroughBus` in `src/daemon-bus.ts`. */
+async function routeThroughBus(envelope: BridgeMessage): Promise<RouteOutcome> {
+  return routeThroughBusIn({ bus, log }, envelope);
+}
+
+/**
+ * Fire-and-forget send for a path with no sender waiting on a result.
+ *
+ * The daemon is the sender here, so the log *is* the sender-facing
+ * surface. It still has to be told — an outcome that reaches nobody at
+ * all is the failure mode this union exists to make impossible.
+ */
+function routeOrLog(envelope: BridgeMessage): void {
+  void routeThroughBus(envelope).then((outcome) => {
+    const text = senderFacingText(outcome);
+    if (text !== null) log(`Daemon-authored ${envelope.id}: ${text}`);
+  });
+}
+
+/**
+ * Fan a daemon-authored notice out to the frontends, one envelope each.
+ *
+ * `to: null` from `system` is a broadcast to every *known* agent, and
+ * that set includes Codex — so a notice like "Codex is working on the
+ * current task" would be injected back into Codex's own turn. These
+ * notices are observations about the bridge addressed to the agents
+ * watching it, so each frontend is addressed explicitly and the routing
+ * decision stays inside `resolveRecipients`.
+ */
+function emitToFrontends(build: (to: AgentId) => BridgeMessage): void {
+  for (const agent of frontends.knownAgents()) routeOrLog(build(agent));
+}
+
+/**
+ * Fan a lifecycle notice out to the frontends *without* a mailbox.
+ *
+ * `system_*` notices are statusbar tags — "Codex is working", "turn
+ * completed", "TUI reconnected". They carry no reply semantics, nobody
+ * can act on a stale one, and each is superseded by the next within
+ * seconds. Giving them at-least-once storage was actively harmful: two
+ * per Codex turn is enough to pin a 100-slot mailbox permanently, after
+ * which every real `[REPLY]` is shed against a backlog of notices about
+ * turns that ended an hour ago.
+ *
+ * So they are wake-only: delivered if the agent is here to receive them,
+ * dropped if it is not. That is the correct semantic for a tag, and it
+ * is not silent shedding of *messages* — nothing addressed by one agent
+ * to another takes this path. Everything with content a sender could be
+ * waiting on still goes through `emitToFrontends` and the bus.
+ */
+function notifyFrontends(build: (to: AgentId) => BridgeMessage): void {
+  for (const agent of frontends.attachedAgents()) {
+    void transports.wake(agent, build(agent), log);
+  }
+}
+
+function describeError(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  try {
+    return JSON.stringify(err);
+  } catch {
+    return String(err);
+  }
+}
+
 const tuiConnectionState = new TuiConnectionState({
   disconnectGraceMs: TUI_DISCONNECT_GRACE_MS,
   log,
   onDisconnectPersisted: (connId) => {
-    emitToFrontends(
+    notifyFrontends((to) =>
       systemMessage(
         "system_tui_disconnected",
         `⚠️ Codex TUI disconnected (conn #${connId}). Codex is still running in the background — reconnect the TUI to resume.`,
+        to,
       ),
     );
   },
   onReconnectAfterNotice: (connId) => {
-    emitToFrontends(
+    notifyFrontends((to) =>
       systemMessage(
         "system_tui_reconnected",
         `✅ Codex TUI reconnected (conn #${connId}). Bridge restored, communication can continue.`,
+        to,
       ),
     );
     codex.injectMessage("✅ Claude Code is still online, bridge restored. Bidirectional communication can continue.");
@@ -196,31 +487,131 @@ const tuiConnectionState = new TuiConnectionState({
 // instead of pushing it on the MCP channel. Same reasoning as
 // untagged Codex output: routine progress should not auto-bloat
 // Claude's context. Claude can drain via get_messages if curious.
-const statusBuffer = new StatusBuffer((summary) => emitToFrontends(summary, "queue"));
+const statusBuffer = new StatusBuffer((summary) =>
+  emitToFrontends((to) => ({
+    ...summary,
+    // The summary is built by message-filter with its own id; re-id it
+    // per copy so two flushes inside the same millisecond cannot collide
+    // in the provenance index, which rejects a duplicate id.
+    id: `status_summary_${++nextSystemMessageId}`,
+    to,
+  })),
+);
 
 codex.on("turnStarted", () => {
   log("Codex turn started");
-  emitToFrontends(
+  notifyFrontends((to) =>
     systemMessage(
       "system_turn_started",
       "⏳ Codex is working on the current task. Wait for completion before sending a reply.",
+      to,
     ),
   );
 });
 
-codex.on("agentMessage", (msg: BridgeMessage) => {
-  if (msg.source !== "codex") return;
-  const result = classifyMessage(msg.content, FILTER_MODE);
+/**
+ * Notices for Codex that arrived while one of its turns was still open.
+ *
+ * `agentMessage` is emitted from `item/completed`, which fires *inside*
+ * the turn — `turnInProgress` is not cleared until `turn/completed`. So
+ * every notice produced while handling a Codex message is injected into
+ * a busy adapter and refused. Discarding the refusal would leave Codex
+ * unable to learn the one thing only the daemon knows: that the name it
+ * addressed does not resolve, or that its `[REPLY]` reached one
+ * recipient and was shed by another.
+ *
+ * These are not queued replies. The reply outbox carries a mailbox id, a
+ * `requireReply` flag and a requester, and reports its own losses to
+ * *frontends* as "a reply you sent" — a daemon notice routed through it
+ * would be echoed back to the user as their own message. So notices get
+ * their own deferral, flushed by the `turnCompleted` handler alongside
+ * the Claude-online notice that already works this way.
+ */
+const pendingCodexNotices: string[] = [];
+let droppedCodexNotices = 0;
 
-  // Track whether Codex sent a [REPLY] during a require_reply turn,
-  // so system_reply_missing fires when it didn't. Only [REPLY] counts
-  // as "actually replied" - [STATUS] / [FYI] / untagged don't
-  // satisfy a required reply. Tracking is the ONLY effect of
-  // replyRequired now; we no longer force-forward every intermediate
-  // message. Routing of each message still goes through
-  // classifyMessage below.
-  if (replyRequired && result.marker === "reply") {
-    replyReceivedDuringTurn = true;
+/** Bounds the queue in a process that runs for days. Overflow is reported, not hidden. */
+const PENDING_CODEX_NOTICE_CAP = 20;
+
+/**
+ * Tell Codex something it cannot otherwise learn, now or when it is free.
+ *
+ * Never silent: delivered immediately, or held and flushed at the end of
+ * the current turn, or — if the queue overflows — counted and reported
+ * in the flush.
+ */
+function tellCodex(text: string): void {
+  const framed = `[AgentBridge] ${text}`;
+  if (codex.injectMessage(framed)) return;
+  pendingCodexNotices.push(framed);
+  while (pendingCodexNotices.length > PENDING_CODEX_NOTICE_CAP) {
+    pendingCodexNotices.shift();
+    droppedCodexNotices++;
+  }
+  log(`Deferred an AgentBridge notice to Codex (${pendingCodexNotices.length} pending)`);
+}
+
+/**
+ * Flush every held notice as one injection.
+ *
+ * One injection, not one per notice: the first would start a turn and
+ * every later one would be refused, so they would trickle out a turn at
+ * a time. On failure nothing is consumed and the next completed turn
+ * tries again.
+ */
+function flushPendingCodexNotices(): void {
+  if (pendingCodexNotices.length === 0) return;
+  const parts = [...pendingCodexNotices];
+  if (droppedCodexNotices > 0) {
+    parts.unshift(
+      `[AgentBridge] ${droppedCodexNotices} earlier notice${droppedCodexNotices > 1 ? "s were" : " was"}` +
+        ` dropped to stay under the ${PENDING_CODEX_NOTICE_CAP}-notice limit.`,
+    );
+  }
+  if (!codex.injectMessage(parts.join("\n\n"))) {
+    log(`Could not flush ${pendingCodexNotices.length} held AgentBridge notice(s); keeping them`);
+    return;
+  }
+  log(`Flushed ${pendingCodexNotices.length} held AgentBridge notice(s) to Codex`);
+  pendingCodexNotices.length = 0;
+  droppedCodexNotices = 0;
+}
+
+// An async listener hands the emitter a promise it does not await, so a
+// throw anywhere in the handler becomes an unhandled rejection — in a
+// process designed to run for days, on the path every Codex message
+// takes. The emitter gets a sync function; the rejection is caught here.
+codex.on("agentMessage", (msg: CodexProseIngress) => {
+  void handleCodexMessage(msg).catch((err: unknown) => {
+    log(`agentMessage handler failed for ${msg.senderRef}: ${describeError(err)}`);
+  });
+});
+
+async function handleCodexMessage(msg: CodexProseIngress): Promise<void> {
+  // The adapter hands over prose, not an envelope: attribution on ingress
+  // comes from where the message arrived, and everything on this emitter
+  // arrived from Codex. `normalizeProse` writes `from` accordingly, and is
+  // the only thing that constructs a `BridgeMessage` on this path — so it
+  // runs before anything downstream (including the status buffer) sees it.
+  let result: FilterResult;
+  try {
+    result = classifyMessage(msg.content, FILTER_MODE);
+  } catch (err: unknown) {
+    // An unknown @name is a parse failure, not a broadcast. Tell Codex.
+    tellCodex(describeError(err));
+    return;
+  }
+
+  let envelope: BridgeMessage;
+  try {
+    envelope = normalizeProse(
+      msg.content,
+      { agent: "codex", protocolVersion: PROTOCOL_VERSION },
+      { id: nextMessageId(), now: Date.now(), senderRef: msg.senderRef },
+    );
+  } catch (err: unknown) {
+    tellCodex(describeError(err));
+    return;
   }
 
   // During attention window, suppress STATUS to give Claude space to respond.
@@ -229,58 +620,81 @@ codex.on("agentMessage", (msg: BridgeMessage) => {
   // a [STATUS] message would start getting buffered instead of forwarded.
   if (FILTER_MODE !== "full" && inAttentionWindow && result.marker === "status") {
     log(`Codex → Claude [${result.marker}/buffer-attention] (${msg.content.length} chars)`);
-    statusBuffer.add(msg);
+    statusBuffer.add(envelope);
     return;
   }
 
   log(`Codex → Claude [${result.marker}/${result.action}] (${msg.content.length} chars)`);
-  switch (result.action) {
-    case "forward":
-      if (result.marker === "reply" && statusBuffer.size > 0) {
-        statusBuffer.flush("reply message arrived");
-      }
-      emitToFrontends(msg);
-      // [REPLY] message — give Claude an attention window to respond
-      if (result.marker === "reply") {
-        startAttentionWindow();
-      }
-      break;
-    case "queue":
-      // Untagged Codex output: deliver to Claude's pull queue, not the
-      // MCP channel. Claude only sees it when get_messages is called.
-      emitToFrontends(msg, "queue");
-      break;
-    case "buffer":
-      statusBuffer.add(msg);
-      break;
-    case "drop":
-      break;
+
+  // [STATUS] still folds into the summary rather than entering a mailbox
+  // one message at a time; the summary itself is an ordinary send.
+  if (result.action === "buffer") {
+    statusBuffer.add(envelope);
+    return;
   }
-});
+
+  if (result.marker === "reply" && statusBuffer.size > 0) {
+    statusBuffer.flush("reply message arrived");
+  }
+
+  const outcome = await routeThroughBus(envelope);
+  // Both a refusal and a partial shed are the sender's business: Codex
+  // has no other way to learn that the name it addressed does not
+  // resolve, or that its `[REPLY]` reached Grok and not Claude. A
+  // partial shed is the dangerous one — the send "succeeded", so
+  // nothing else in the system will ever mention it again. This runs
+  // inside Codex's own turn, so the injection is always refused and the
+  // notice is always deferred; `tellCodex` is what makes it arrive.
+  const text = senderFacingText(outcome);
+  if (text !== null) tellCodex(text);
+  if (outcome.status === "failed") return;
+
+  // Only a [REPLY] satisfies a pending require-reply request — [STATUS] /
+  // [FYI] / untagged don't count as "actually replied". Correlated by
+  // `inReplyTo` when Codex named it, or by delivery to the requester
+  // otherwise (an untagged reply back to whoever opened the turn).
+  if (result.marker === "reply") {
+    pendingRequests.satisfy(envelope.inReplyTo, outcome.accepted);
+    // [REPLY] message — give the recipient an attention window to respond.
+    startAttentionWindow();
+  }
+}
+
+/**
+ * Close the turn-scoped state a Codex turn owns.
+ *
+ * Spec §6 says the requester is discarded at turn end, and a crash is a
+ * turn end. When only the clean path cleared it, an app-server that died
+ * mid-turn left `activeRequester` set forever: Codex's next spontaneous
+ * untagged output hit `routing.ts`'s requester branch and resolved to
+ * that one stale agent instead of broadcasting, so every other attached
+ * frontend received nothing and nobody was told — silent non-delivery to
+ * a live agent, which is exactly what the guarantee forbids. Every path
+ * that ends a turn calls this, not just the one that ends it well.
+ */
+function endCodexTurn(why: string): void {
+  if (!activeRequester.has("codex")) return;
+  log(`Clearing Codex's turn-scoped requester: ${why}`);
+  activeRequester.delete("codex");
+}
 
 codex.on("turnCompleted", () => {
   log("Codex turn completed");
   statusBuffer.flush("turn completed");
 
-  // Check if reply was required but Codex didn't send any agentMessage
-  if (replyRequired && !replyReceivedDuringTurn) {
-    log("⚠️ Reply was required but Codex did not send any agentMessage");
-    emitToFrontends(
-      systemMessage(
-        "system_reply_missing",
-        "⚠️ Codex completed the turn without sending a reply (require_reply was set). Codex may not have generated an agentMessage. You may want to retry or rephrase.",
-      ),
-    );
-  }
+  // Whether a required reply is missing is now decided by
+  // `checkExpiredRequests` against each request's own TTL, not by
+  // whether this turn happened to end with one still outstanding — a
+  // turn ending is not itself evidence of anything; Codex may open
+  // another turn on the same requirement moments later.
 
-  // Reset reply-required state
-  replyRequired = false;
-  replyReceivedDuringTurn = false;
+  endCodexTurn("the turn completed");
 
-  emitToFrontends(
+  notifyFrontends((to) =>
     systemMessage(
       "system_turn_completed",
       "✅ Codex finished the current turn. You can reply now if needed.",
+      to,
     ),
   );
   startAttentionWindow();
@@ -289,6 +703,13 @@ codex.on("turnCompleted", () => {
   if (claudeSocket() && shouldNotifyCodexClaudeOnline()) {
     notifyCodexClaudeOnline();
   }
+
+  // Anything the daemon owed Codex about its own last turn — a parse
+  // failure, a partial shed. Before the outbox drain because it explains
+  // a message Codex has already sent, and because whichever of the two
+  // wins the injection slot, the loser keeps its payload and retries at
+  // the next completed turn.
+  flushPendingCodexNotices();
 
   // Deliver anything Claude sent while this turn was running. Last,
   // because the online notice is the handshake that explains what
@@ -303,9 +724,7 @@ codex.on("ready", (threadId: string) => {
   log(`Codex ready — thread ${threadId}`);
   log("Bridge fully operational");
 
-  emitToFrontends(
-    systemMessage("system_ready", currentReadyMessage()),
-  );
+  notifyFrontends((to) => systemMessage("system_ready", currentReadyMessage(), to));
 
   if (claudeSocket() && shouldNotifyCodexClaudeOnline()) {
     notifyCodexClaudeOnline();
@@ -330,10 +749,58 @@ codex.on("error", (err: Error) => {
   log(`Codex error: ${err.message}`);
 });
 
+// A turn the app-server connection took down with it. No `turn/completed`
+// is ever coming for it, so `turnCompleted` never fires and only this
+// event closes the turn-scoped state.
+codex.on("turnAborted", (why: string) => {
+  endCodexTurn(why);
+});
+
+/**
+ * The app-server refused a turn the daemon already reported as sent.
+ *
+ * `injectMessage` returning true only means the frame left this process.
+ * The refusal arrives later, by which time the Codex transport's
+ * `acknowledgementMode: "none"` self-ack has deleted the mailbox entry —
+ * so without this handler the message is gone, Codex never saw it, and
+ * the only trace is a log line the sender cannot read. That is the exact
+ * shape the never-silently-lost guarantee rules out, which is why the
+ * notice echoes the text back: a sender told "this did not land" and not
+ * shown what it was cannot act on it.
+ */
+codex.on("injectionRejected", ({ correlation, error }: InjectionRejection) => {
+  log(`Codex refused the turn for ${correlation.id}: ${error}`);
+
+  // The turn never opened, so nothing about it is in scope any more.
+  endCodexTurn("Codex refused the turn");
+  // A require-reply request against a message Codex never received would
+  // otherwise expire into "no reply came" — pointing at Codex instead of
+  // at the send that failed.
+  if (pendingRequests.cancel(correlation.id)) {
+    log(`Cancelled the pending reply request for refused message ${correlation.id}`);
+  }
+  // The contract reminder rode along on the refused turn, so it was
+  // never pinned. Let the next injection carry it again.
+  lastPinnedContractThreadId = null;
+
+  const notice = (to: AgentId) =>
+    noticeMessage(
+      "turn_start_rejected",
+      `⚠️ Codex refused the turn carrying your message — it was not delivered and Codex never saw it. ` +
+        `The app-server said: ${error}\n\nUndelivered message:\n${truncateForNotice(correlation.text)}`,
+      to,
+    );
+
+  const requester = isAgentId(correlation.requester) ? correlation.requester : null;
+  if (requester) routeOrLog(notice(requester));
+  else emitToFrontends(notice);
+});
+
 codex.on("exit", (code: number | null) => {
   log(`Codex process exited (code ${code})`);
   codexBootstrapped = false;
   statusBuffer.flush("codex exited");
+  endCodexTurn("the Codex app-server exited");
   tuiConnectionState.handleCodexExit();
   clearPendingClaudeDisconnect("Codex process exited");
   claudeOnlineNoticeSent = false;
@@ -341,10 +808,11 @@ codex.on("exit", (code: number | null) => {
   // Codex thread is gone; next thread needs the contract pinned again.
   lastPinnedContractThreadId = null;
   discardOutboxForLostCodex("the Codex app-server exited");
-  emitToFrontends(
+  notifyFrontends((to) =>
     systemMessage(
       "system_codex_exit",
       `⚠️ Codex app-server exited (code ${code ?? "unknown"}). AgentBridge daemon is still running, but the Codex side needs to be restarted.`,
+      to,
     ),
   );
   broadcastStatus();
@@ -374,6 +842,7 @@ function startControlServer() {
             attached: false,
             lastPongAt: Date.now(),
             pongCount: 0,
+            protocolVersion: null,
           },
         })
       ) {
@@ -475,6 +944,9 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
           return;
         }
         ws.data.agent = agent;
+        // Absent means pre-0.8, which is tolerated rather than refused;
+        // `normalizeIngress` decides what a legacy frame may omit.
+        ws.data.protocolVersion = message.protocolVersion ?? null;
         attachFrontend(ws, agent).catch((err) => {
           log(`attachFrontend threw for #${ws.data.clientId}: ${err?.message ?? err}`);
         });
@@ -486,17 +958,52 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
     case "status":
       sendStatus(ws);
       return;
+    case "drain": {
+      // A socket that never attached holds no slot, so there is no agent
+      // whose mailbox it may empty. Answer with an empty batch rather
+      // than silence: the caller is waiting on this requestId.
+      if (!ws.data.attached) {
+        sendProtocolMessage(ws, {
+          type: "drain_result",
+          requestId: message.requestId,
+          // No lease was taken, so no ack can match: a real batch id is
+          // always `<agent>_b<n>_<now>`.
+          batchId: "",
+          messages: [],
+        });
+        return;
+      }
+      const batch = mailboxFor(ws.data.agent).drain(Date.now());
+      sendProtocolMessage(ws, {
+        type: "drain_result",
+        requestId: message.requestId,
+        batchId: batch.batchId,
+        messages: batch.messages.map((m) => forEgress(m, ws.data.protocolVersion)),
+      });
+      return;
+    }
+    case "ack": {
+      if (!ws.data.attached) return;
+      const deleted = mailboxFor(ws.data.agent).ack(message.batchId, message.ids);
+      log(`Ack from ${ws.data.agent}: ${deleted}/${message.ids.length} entries deleted`);
+      return;
+    }
     case "claude_to_codex": {
-      // The source must be the agent this socket declared itself to be.
-      // Checking against the declaration rather than the literal
-      // `"claude"` keeps the guard meaningful now that more than one
-      // agent can hold a slot: a frontend cannot send as its neighbour.
-      if (message.message.source !== ws.data.agent) {
+      // `message.message.source` is deliberately not checked: attribution
+      // now comes from the authenticated socket via `normalizeIngress`,
+      // so a frontend cannot send as its neighbour regardless of what it
+      // writes in the body.
+      //
+      // `attached` is the authorization predicate `drain` and `ack`
+      // already use. A socket that never claimed a slot has no agent
+      // identity, so `normalizeIngress` would attribute its message to
+      // whatever `DEFAULT_FRONTEND_AGENT` happens to be — Claude.
+      if (!ws.data.attached) {
         sendProtocolMessage(ws, {
           type: "claude_to_codex_result",
           requestId: message.requestId,
           success: false,
-          error: "Invalid message source",
+          error: "This socket is not attached. Send claude_connect first.",
         });
         return;
       }
@@ -511,74 +1018,99 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
         return;
       }
 
-      const requireReply = !!message.requireReply;
-      const content = message.message.content;
-
-      if (deliverToCodex(content, requireReply)) {
-        clearAttentionWindow(); // Claude successfully replied, end attention window
-        sendProtocolMessage(ws, {
-          type: "claude_to_codex_result",
-          requestId: message.requestId,
-          success: true,
-        });
-        return;
-      }
-
-      // Codex mid-turn is not a failure, it is a wait. Hold the message
-      // and deliver it when the turn completes, so Claude does not have
-      // to notice the rejection and retry by hand — the single most
-      // common way a reply used to get lost.
-      if (codex.turnInProgress) {
-        const { depth, dropped } = replyOutbox.accept({
-          id: message.message.id,
-          content,
-          requireReply,
-          queuedAt: Date.now(),
-        });
-        log(`Queued Claude → Codex reply while turn in progress (depth ${depth}, dropped ${dropped.length})`);
-        let note =
-          depth > 1
-            ? `Codex is mid-turn. Held for delivery when the turn ends (${depth} replies now queued, sent in order).`
-            : "Codex is mid-turn. Held for delivery when the turn ends.";
-        if (dropped.length > 0) {
-          note +=
-            ` ${dropped.length} older queued repl${dropped.length > 1 ? "ies were" : "y was"}` +
-            ` dropped to stay under the ${replyOutbox.capacity}-message limit.`;
-        }
-        sendProtocolMessage(ws, {
-          type: "claude_to_codex_result",
-          requestId: message.requestId,
-          success: true,
-          queued: true,
-          note,
-        });
-        return;
-      }
-
-      const reason = "Injection failed: no active thread or WebSocket not connected.";
-      log(`Injection rejected: ${reason}`);
-      sendProtocolMessage(ws, {
-        type: "claude_to_codex_result",
-        requestId: message.requestId,
-        success: false,
-        error: reason,
-      });
+      void sendFromFrontend(ws, message.requestId, message.message, !!message.requireReply);
       return;
     }
   }
 }
 
 /**
+ * A frontend's send, from wire frame to sender-visible result.
+ *
+ * Everything the sender learns about the fate of this message is decided
+ * here: a validation failure, a routing refusal, an overflow rejection,
+ * or the note the Codex transport left when it had to defer. Silence is
+ * never an acceptable outcome — every path below answers `requestId`.
+ */
+async function sendFromFrontend(
+  ws: ServerWebSocket<ControlSocketData>,
+  requestId: string,
+  frame: BridgeMessage,
+  requireReply: boolean,
+): Promise<void> {
+  let envelope: BridgeMessage;
+  try {
+    // Attribution comes from the socket, not the frame. Nothing has been
+    // enqueued at this point, so a rejection here leaves no trace.
+    envelope = normalizeIngress(
+      frame,
+      { agent: ws.data.agent, protocolVersion: ws.data.protocolVersion },
+      { id: nextMessageId(), now: Date.now() },
+    );
+  } catch (err: unknown) {
+    sendProtocolMessage(ws, {
+      type: "claude_to_codex_result",
+      requestId,
+      success: false,
+      error: describeError(err),
+    });
+    return;
+  }
+
+  // The wake-up happens inside `bus.route` and cannot take arguments, so
+  // the flag is parked under the daemon-assigned id for it to collect.
+  if (requireReply) requireReplyIds.add(envelope.id);
+
+  const outcome = await routeThroughBus(envelope);
+  requireReplyIds.delete(envelope.id);
+
+  if (outcome.status === "failed") {
+    sendProtocolMessage(ws, {
+      type: "claude_to_codex_result",
+      requestId,
+      success: false,
+      error: outcome.error,
+    });
+    return;
+  }
+
+  // A deferral is an acceptance with an explanation, not a failure — the
+  // message is in Codex's mailbox and the outbox will re-wake it. Saying
+  // `success: false` here is what used to make callers resend by hand.
+  //
+  // A partial shed rides along in the same field: both are "accepted,
+  // and here is what you need to know about it".
+  const deferral = codexDeferralNotes.get(envelope.id);
+  codexDeferralNotes.delete(envelope.id);
+  const shed = senderFacingText(outcome);
+  const note = [deferral, shed].filter((t) => t !== null && t !== undefined).join(" ");
+
+  sendProtocolMessage(ws, {
+    type: "claude_to_codex_result",
+    requestId,
+    success: true,
+    queued: deferral !== undefined ? true : undefined,
+    note: note === "" ? undefined : note,
+  });
+}
+
+/**
  * Decorate a Claude message and inject it as a Codex turn.
  *
  * Every state mutation here happens *after* `injectMessage` returns
- * true. The contract-pin bookkeeping and the require-reply flag used to
- * be set before the attempt, so a rejected injection left the thread
- * marked as already-pinned (the contract would then never be sent) and
- * armed `replyRequired` against Codex's *current* turn — producing a
- * `system_reply_missing` warning for a message Codex never received.
+ * true. The contract-pin bookkeeping and the pending-request bookkeeping
+ * used to be set before the attempt, so a rejected injection left the
+ * thread marked as already-pinned (the contract would then never be
+ * sent) and armed a pending request against Codex's *current* turn —
+ * producing a `reply_missing` warning for a message Codex never
+ * received.
  */
-function deliverToCodex(content: string, requireReply: boolean): boolean {
+function deliverToCodex(
+  content: string,
+  requireReply: boolean,
+  requester: AgentId | null,
+  messageId: string,
+): boolean {
   // Pin contract once per Codex thread. Cuts ~200 tokens per
   // Claude→Codex msg after the first. Falls back to per-msg append
   // when AGENTBRIDGE_PIN_CONTRACT=always (legacy mode for users who
@@ -593,17 +1125,28 @@ function deliverToCodex(content: string, requireReply: boolean): boolean {
   if (requireReply) contentToSend += REPLY_REQUIRED_INSTRUCTION;
 
   log(`Forwarding Claude → Codex (${content.length} chars, requireReply=${requireReply}, pinnedContract=${needsContract})`);
-  if (!codex.injectMessage(contentToSend)) return false;
+  // The correlation is what turns a later app-server refusal from a log
+  // line into something the sender hears about. `content`, not
+  // `contentToSend`: the echo should be what the sender wrote, not the
+  // contract reminder the daemon stapled to it.
+  if (!codex.injectMessage(contentToSend, { id: messageId, requester, text: content })) return false;
 
   if (needsContract && PIN_CONTRACT_MODE === "once" && activeThreadId) {
     lastPinnedContractThreadId = activeThreadId;
     log(`Pinned BRIDGE_CONTRACT_REMINDER for thread ${activeThreadId.slice(0, 8)}; subsequent msgs skip the reminder`);
   }
-  if (requireReply) {
-    replyRequired = true;
-    replyReceivedDuringTurn = false;
-    log(`Reply required flag set for this message`);
+  // Only a requester we can name is worth tracking — with nobody to
+  // notify on expiry there is nothing `checkExpiredRequests` could do
+  // for it anyway. In practice every caller has a requester; this is
+  // the same guard `activeRequester` uses below.
+  if (requireReply && requester) {
+    pendingRequests.add({ requester, messageId, at: Date.now() });
+    log(`Reply required from Codex for ${messageId} (requester: ${requester})`);
   }
+  // Codex's turn is now open on this sender's behalf. `resolveRecipients`
+  // reads this to let an untagged reply from Codex go back to whoever
+  // asked, instead of being broadcast to every agent.
+  if (requester) activeRequester.set("codex", requester);
   return true;
 }
 
@@ -621,33 +1164,44 @@ function drainReplyOutbox(): void {
   for (const stale of expired) {
     const waitedMin = Math.round((Date.now() - stale.queuedAt) / 60_000);
     log(`Dropping expired queued reply ${stale.id} (waited ~${waitedMin}m)`);
-    emitToFrontends(
+    outboxRequester.delete(stale.id);
+    emitToFrontends((to) =>
       noticeMessage(
         "reply_expired",
         `⚠️ A reply you sent while Codex was busy waited ~${waitedMin} minutes and was dropped without being delivered. ` +
           `Codex never saw it. Send it again if it still applies.\n\nDropped message:\n${truncateForNotice(stale.content)}`,
+        to,
       ),
     );
   }
 
   if (!reply) return;
 
-  if (deliverToCodex(reply.content, reply.requireReply)) {
+  // The sender is carried across the deferral so the turn this delivery
+  // opens is still attributed to whoever actually asked.
+  if (deliverToCodex(reply.content, reply.requireReply, outboxRequester.get(reply.id) ?? null, reply.id)) {
+    outboxRequester.delete(reply.id);
     // Same bookkeeping as a live reply: Claude has answered, so the
     // attention window opened moments ago by turnCompleted is over.
     clearAttentionWindow();
     log(`Delivered queued reply ${reply.id} after turn completion`);
-    emitToFrontends(
+    emitToFrontends((to) =>
       noticeMessage(
         "reply_delivered",
         "📤 The reply you sent while Codex was busy has now been delivered — Codex is starting a turn on it.",
+        to,
       ),
     );
     return;
   }
 
-  if (codex.turnInProgress) {
-    // A new turn started between the completion event and this call.
+  if (codex.turnPending) {
+    // A new turn started — or was started, by the notice flush a few
+    // lines earlier in the same tick — between the completion event and
+    // this call. `turnPending` covers the in-flight case that
+    // `turnInProgress` cannot see yet; without it a deferral here would
+    // fall through to the "thread is gone" branch below and discard the
+    // whole outbox.
     // Keep the original queuedAt so the TTL still measures Claude's wait.
     replyOutbox.requeue(reply);
     log(`Queued reply ${reply.id} still blocked by an in-progress turn; keeping it`);
@@ -655,11 +1209,13 @@ function drainReplyOutbox(): void {
   }
 
   log(`Queued reply ${reply.id} could not be injected (no active thread); dropping`);
-  emitToFrontends(
+  outboxRequester.delete(reply.id);
+  emitToFrontends((to) =>
     noticeMessage(
       "reply_undeliverable",
       "⚠️ A reply you sent while Codex was busy could not be delivered — the Codex thread is gone. " +
         `Reconnect the Codex TUI and send it again.\n\nUndelivered message:\n${truncateForNotice(reply.content)}`,
+      to,
     ),
   );
   // Anything still held is blocked on the same dead thread.
@@ -678,13 +1234,15 @@ function discardOutboxForLostCodex(why: string): void {
   const lost = replyOutbox.clear();
   if (lost.length === 0) return;
   log(`Discarding ${lost.length} queued Claude → Codex repl(ies): ${why}`);
-  emitToFrontends(
+  for (const r of lost) outboxRequester.delete(r.id);
+  emitToFrontends((to) =>
     noticeMessage(
       "reply_discarded",
       `⚠️ ${lost.length} repl${lost.length > 1 ? "ies" : "y"} you sent while Codex was busy ` +
         `${lost.length > 1 ? "were" : "was"} never delivered — ${why}. ` +
         `Resend if still relevant.\n\n` +
         lost.map((r, i) => `[${i + 1}] ${truncateForNotice(r.content)}`).join("\n\n"),
+      to,
     ),
   );
 }
@@ -773,20 +1331,28 @@ async function attachFrontend(ws: ServerWebSocket<ControlSocketData>, agent: Fro
   cancelIdleShutdown();
   log(`${label} attached (#${ws.data.clientId})`);
 
+  // First frame on an accepted attach, before anything else: its absence
+  // is how a 0.8 frontend detects a daemon too old to drain from.
+  sendProtocolMessage(ws, { type: "hello", protocolVersion: PROTOCOL_VERSION });
+
   statusBuffer.flush(`${agent} reconnected`);
   sendStatus(ws);
 
   const now = Date.now();
   const isRapidReattach = now - lastAttachStatusSentTs < ATTACH_STATUS_COOLDOWN_MS;
 
-  if (frontends.bufferedCount(agent) > 0) {
-    flushBufferedMessages(agent, ws);
-  } else if (!isRapidReattach) {
+  // Nothing is replayed here any more. Whatever arrived while this agent
+  // was away is still in its mailbox and leaves only when the frontend
+  // drains and acks it; a daemon-side replay would race that lease and
+  // deliver the same message twice.
+  if (!isRapidReattach) {
     // Only send status messages if this is not a rapid reattach (avoid flooding Claude)
+    // Wake-only, like every other `system_*` notice: this describes the
+    // state of the bridge at this instant, and the agent is right here.
     if (tuiConnectionState.canReply()) {
-      sendBridgeMessage(ws, systemMessage("system_ready", currentReadyMessage()));
+      void transports.wake(agent, systemMessage("system_ready", currentReadyMessage(), agent), log);
     } else if (codexBootstrapped) {
-      sendBridgeMessage(ws, systemMessage("system_waiting", currentWaitingMessage()));
+      void transports.wake(agent, systemMessage("system_waiting", currentWaitingMessage(), agent), log);
     }
   }
 
@@ -883,6 +1449,54 @@ function clearAttentionWindow() {
   inAttentionWindow = false;
 }
 
+/**
+ * Sweep for require-reply requests that have sat unanswered past
+ * `PENDING_REQUEST_TTL_MS` and report each one — this is the only place
+ * `PendingRequests.expire` is called, and the governing rule for the
+ * whole bus is that nothing accepted is silently lost, so an expiry
+ * that nobody hears about would just be a slower version of the bug
+ * this replaces.
+ *
+ * Runs on a timer rather than at a turn boundary: a turn ending is not
+ * evidence the requester's question went unanswered (Codex may open
+ * another turn on it moments later), and a single global flag armed
+ * against "the current turn" is exactly the coupling this task removes.
+ *
+ * Routed through the bus (`routeOrLog`), not the wake-only
+ * `notifyFrontends`, so the notice lands in the requester's mailbox and
+ * survives a reconnect the same way any other message does — a request
+ * is not answered just because the requester's socket blipped, and the
+ * notice that it wasn't must not be lost the same way.
+ *
+ * Emitted as `reply_missing`, in the `reply_*` family alongside
+ * `reply_expired` / `reply_delivered` / `reply_undeliverable` /
+ * `reply_discarded` — not `system_*`. Every `system_*` id is wake-only
+ * by convention (Task 11: a statusbar tag with no reply semantics must
+ * never occupy a mailbox slot), but this notice is routed through the
+ * bus deliberately, same as its `reply_*` siblings — a loss report, not
+ * a statusbar tag. Naming it into that family makes the exception
+ * legible instead of a `system_`-prefixed id quietly breaking the
+ * convention it appears to follow. Built with `noticeMessage`, so it
+ * reaches the sender as content (`bridge.ts`'s `isDaemonLifecycle` only
+ * intercepts `system_*` ids into the statusbar; everything else pushes
+ * to the model), exactly like the four siblings above.
+ */
+function checkExpiredRequests(): void {
+  const expired = pendingRequests.expire(Date.now(), PENDING_REQUEST_TTL_MS);
+  for (const req of expired) {
+    log(
+      `Reply required for ${req.messageId} expired after ${PENDING_REQUEST_TTL_MS}ms without a reply (requester: ${req.requester})`,
+    );
+    routeOrLog(
+      noticeMessage(
+        "reply_missing",
+        "⚠️ Codex did not send a reply before the reply-required window expired. You may want to retry or rephrase.",
+        req.requester,
+      ),
+    );
+  }
+}
+
 function scheduleIdleShutdown() {
   cancelIdleShutdown();
   if (frontends.size > 0) return; // still has a client
@@ -952,47 +1566,12 @@ function scheduleClaudeDisconnectNotification(clientId: number) {
   }, CLAUDE_DISCONNECT_GRACE_MS);
 }
 
-/**
- * Deliver a message to every frontend except the one that wrote it.
- *
- * Each agent that misses it — not attached, or a send that failed —
- * keeps its own buffer, so a Grok session that never launched cannot
- * make Claude's reconnect replay Grok's backlog, and neither one's
- * overflow discards the other's messages.
- */
-function emitToFrontends(message: BridgeMessage, deliveryHint?: "push" | "queue") {
-  const delivered = new Set<FrontendAgent>();
-  for (const { agent, socket } of frontends.recipients(message.source)) {
-    if (trySendBridgeMessage(socket, message, deliveryHint)) {
-      delivered.add(agent);
-      continue;
-    }
-    // Send failed — fall through to buffer
-    log(`Send to ${agent} failed, buffering message for retry on reconnect`);
-  }
-
-  // Buffered messages preserve their delivery hint via an attached
-  // property; flushBufferedMessages reads it back when replaying. We
-  // store the hint inline on the BridgeMessage at runtime (kept off
-  // the type definition because it is a daemon-internal artifact).
-  if (deliveryHint) {
-    (message as BridgeMessage & { __deliveryHint?: "push" | "queue" }).__deliveryHint = deliveryHint;
-  }
-
-  for (const agent of frontends.knownAgents()) {
-    if (delivered.has(agent) || agent === message.source) continue;
-    const { dropped } = frontends.buffer(agent, message);
-    if (dropped > 0) {
-      log(`Message buffer overflow for ${agent}: dropped ${dropped} oldest message(s), ${MAX_BUFFERED_MESSAGES} remaining`);
-    }
-  }
-}
-
 function trySendBridgeMessage(ws: ServerWebSocket<ControlSocketData>, message: BridgeMessage, deliveryHint?: "push" | "queue"): boolean {
   try {
+    const egressMessage = forEgress(message, ws.data.protocolVersion);
     const payload: ControlServerMessage = deliveryHint
-      ? { type: "codex_to_claude", message, deliveryHint }
-      : { type: "codex_to_claude", message };
+      ? { type: "codex_to_claude", message: egressMessage, deliveryHint }
+      : { type: "codex_to_claude", message: egressMessage };
     const result = ws.send(JSON.stringify(payload));
     if (typeof result === "number" && result <= 0) {
       log(`Bridge message send returned ${result} (0=dropped, -1=backpressure)`);
@@ -1005,33 +1584,12 @@ function trySendBridgeMessage(ws: ServerWebSocket<ControlSocketData>, message: B
   }
 }
 
-function flushBufferedMessages(agent: FrontendAgent, ws: ServerWebSocket<ControlSocketData>) {
-  const messages = frontends.takeBuffered(agent);
-  for (const message of messages) {
-    // Recover the delivery hint we stashed on the message when it
-    // was buffered, so a queued message stays queued after replay.
-    const hint = (message as BridgeMessage & { __deliveryHint?: "push" | "queue" }).__deliveryHint;
-    if (!trySendBridgeMessage(ws, message, hint)) {
-      // Re-buffer this and all remaining messages on failure
-      const failedIndex = messages.indexOf(message);
-      const remaining = messages.slice(failedIndex);
-      frontends.requeue(agent, remaining);
-      log(`Flush interrupted: re-buffered ${remaining.length} message(s) after send failure`);
-      return;
-    }
-  }
-}
-
-function sendBridgeMessage(ws: ServerWebSocket<ControlSocketData>, message: BridgeMessage) {
-  trySendBridgeMessage(ws, message);
-}
-
 function sendStatus(ws: ServerWebSocket<ControlSocketData>) {
   sendProtocolMessage(ws, { type: "status", status: currentStatus() });
 }
 
 function broadcastStatus() {
-  for (const { socket } of frontends.recipients()) {
+  for (const { socket } of frontends.writable()) {
     sendStatus(socket);
   }
 }
@@ -1050,7 +1608,10 @@ function currentStatus(): DaemonStatus {
     bridgeReady: tuiConnectionState.canReply(),
     tuiConnected: snapshot.tuiConnected,
     threadId: codex.activeThreadId,
-    queuedMessageCount: frontends.bufferedCount() + statusBuffer.size,
+    // Retention now lives in the mailboxes, so this counts what is
+    // actually still owed to someone rather than what failed to send.
+    queuedMessageCount:
+      [...mailboxes.values()].reduce((n, box) => n + box.size, 0) + statusBuffer.size,
     proxyUrl: codex.proxyUrl,
     appServerUrl: codex.appServerUrl,
     pid: process.pid,
@@ -1096,10 +1657,12 @@ function shouldNotifyCodexClaudeOnline() {
   return !claudeOnlineNoticeSent || claudeOfflineNoticeShown;
 }
 
-function systemMessage(idPrefix: string, content: string): BridgeMessage {
+function systemMessage(idPrefix: string, content: string, to: AgentId): BridgeMessage {
   return {
     id: `${idPrefix}_${++nextSystemMessageId}`,
-    source: "codex",
+    from: "system",
+    to,
+    kind: "untagged",
     content,
     timestamp: Date.now(),
   };
@@ -1116,10 +1679,12 @@ function systemMessage(idPrefix: string, content: string): BridgeMessage {
  * statusbar tag would destroy the only copy. The `notice_` prefix opts
  * out of that routing.
  */
-function noticeMessage(idPrefix: string, content: string): BridgeMessage {
+function noticeMessage(idPrefix: string, content: string, to: AgentId): BridgeMessage {
   return {
     id: `notice_${idPrefix}_${++nextSystemMessageId}`,
-    source: "codex",
+    from: "system",
+    to,
+    kind: "untagged",
     content: `[AgentBridge] ${content}`,
     timestamp: Date.now(),
   };
@@ -1157,14 +1722,15 @@ async function bootCodex() {
     codexBootstrapped = true;
     writeStatusFile();
 
-    emitToFrontends(systemMessage("system_waiting", currentWaitingMessage()));
+    notifyFrontends((to) => systemMessage("system_waiting", currentWaitingMessage(), to));
     broadcastStatus();
   } catch (err: any) {
     log(`Failed to start Codex: ${err.message}`);
-    emitToFrontends(
+    notifyFrontends((to) =>
       systemMessage(
         "system_codex_start_failed",
         `❌ AgentBridge failed to start Codex app-server: ${err.message}`,
+        to,
       ),
     );
     broadcastStatus();
@@ -1183,6 +1749,10 @@ function shutdown(reason: string) {
   daemonStatusLine.write(BRIDGE_STOPPED_TAG);
   tuiConnectionState.dispose(`daemon shutdown (${reason})`);
   clearPendingClaudeDisconnect(`daemon shutdown (${reason})`);
+  if (pendingRequestsTimer) {
+    clearInterval(pendingRequestsTimer);
+    pendingRequestsTimer = null;
+  }
   controlServer?.stop();
   controlServer = null;
   codex.stop();
@@ -1251,5 +1821,6 @@ try {
   removePidFile();
   process.exit(1);
 }
+pendingRequestsTimer = setInterval(checkExpiredRequests, PENDING_REQUEST_CHECK_INTERVAL_MS);
 startupComplete = true;
 void bootCodex();

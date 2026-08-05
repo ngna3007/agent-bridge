@@ -177,11 +177,16 @@ describe("abg status - live daemon view", () => {
     expect(output()).toContain("no action needed");
   });
 
-  test("reports queued Codex messages", async () => {
+  test("reports messages held in mailboxes, in either direction", async () => {
+    // The count is no longer Codex→Claude only: every agent owns a
+    // mailbox now, so it includes Claude→Codex and anything held for a
+    // frontend that is not currently attached. Naming Codex here would
+    // point the user at the wrong side when the backlog is Claude's.
     serveStatus({ queuedMessageCount: 3 });
     await runStatus();
 
-    expect(output()).toContain("queued      3 Codex message(s)");
+    expect(output()).toContain("queued      3 message(s) held in agent mailboxes");
+    expect(output()).not.toContain("Codex message(s)");
   });
 
   test("falls back to the file view when the daemon does not answer", async () => {
