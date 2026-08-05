@@ -136,7 +136,7 @@ describe("DaemonClient", () => {
     expect(disconnectEmitted).toBe(false);
   });
 
-  test("emits rejected (not disconnect) when server closes with code 4003 (probe in progress)", async () => {
+  test("emits rejected (not disconnect) when server closes with code 4004 (probe in progress)", async () => {
     await client.connect();
 
     let disconnectEmitted = false;
@@ -147,11 +147,11 @@ describe("DaemonClient", () => {
     });
 
     for (const ws of serverSockets) {
-      ws.close(4003, "liveness probe in progress, retry shortly");
+      ws.close(4004, "liveness probe in progress, retry shortly");
     }
 
     const code = await rejected;
-    expect(code).toBe(4003);
+    expect(code).toBe(4004);
     await new Promise((r) => setTimeout(r, 50));
     // Critical: must NOT trigger the disconnect path, which would cause the
     // contestant to reconnect-loop during the probe window.
@@ -185,7 +185,7 @@ describe("DaemonClient", () => {
     onServerMessage = (ws, raw) => {
       const message = JSON.parse(raw.toString());
       if (message.type === "claude_connect") {
-        ws.close(4003, "liveness probe in progress, retry shortly");
+        ws.close(4004, "liveness probe in progress, retry shortly");
       }
     };
 

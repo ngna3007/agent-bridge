@@ -1508,6 +1508,8 @@ var LIFECYCLE_TAGS = {
   system_bridge_evicted: wrap(C_RED, "[REPLACED BY NEWER SESSION]"),
   system_bridge_probe_in_progress: wrap(C_YELLOW, "[RECONNECTING]"),
   system_bridge_replaced: wrap(C_RED, "[ANOTHER SESSION ACTIVE]"),
+  system_bridge_project_mismatch: wrap(C_RED, "[PORT COLLISION]"),
+  system_bridge_unknown_agent: wrap(C_RED, "[UNKNOWN AGENT]"),
   system_bridge_disabled: BRIDGE_STOPPED_TAG,
   system_bridge_auto_recovery_gave_up: wrap(C_RED, "[RECONNECT FAILED]"),
   system_bridge_recovered: wrap(C_GREEN, "[CODEX READY]"),
@@ -2233,7 +2235,8 @@ class ConfigService {
 var CLOSE_CODE_REPLACED = 4001;
 var CLOSE_CODE_EVICTED_STALE = 4002;
 var CLOSE_CODE_PROJECT_MISMATCH = 4003;
-var CLOSE_CODE_PROBE_IN_PROGRESS = 4003;
+var CLOSE_CODE_PROBE_IN_PROGRESS = 4004;
+var CLOSE_CODE_UNKNOWN_AGENT = 4005;
 
 // src/env-utils.ts
 function parsePositiveIntEnv(name, fallback, log = () => {}) {
@@ -3363,7 +3366,7 @@ function handleControlMessage(ws, raw) {
         if (agent === null) {
           log(`Refusing claude_connect from #${ws.data.clientId} \u2014 unknown agent ${JSON.stringify(message.agent)}`);
           ws.data.rejected = true;
-          ws.close(CLOSE_CODE_PROJECT_MISMATCH, `Unknown frontend agent ${JSON.stringify(message.agent)} \u2014 this daemon serves ${FRONTEND_AGENT_LIST}.`);
+          ws.close(CLOSE_CODE_UNKNOWN_AGENT, `Unknown frontend agent ${JSON.stringify(message.agent)} \u2014 this daemon serves ${FRONTEND_AGENT_LIST}.`);
           return;
         }
         ws.data.agent = agent;

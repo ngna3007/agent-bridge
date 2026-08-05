@@ -39,6 +39,8 @@ import { disabledReplyError, type BridgeDisabledReason } from "./bridge-disabled
 import {
   CLOSE_CODE_EVICTED_STALE,
   CLOSE_CODE_PROBE_IN_PROGRESS,
+  CLOSE_CODE_PROJECT_MISMATCH,
+  CLOSE_CODE_UNKNOWN_AGENT,
 } from "./control-protocol";
 import type { BridgeMessage } from "./types";
 
@@ -169,6 +171,14 @@ daemonClient.on("rejected", async (code: number) => {
       reason = "probe_in_progress";
       notificationId = "system_bridge_probe_in_progress";
       break;
+    case CLOSE_CODE_PROJECT_MISMATCH:
+      reason = "project_mismatch";
+      notificationId = "system_bridge_project_mismatch";
+      break;
+    case CLOSE_CODE_UNKNOWN_AGENT:
+      reason = "unknown_agent";
+      notificationId = "system_bridge_unknown_agent";
+      break;
     default:
       reason = "rejected";
       notificationId = "system_bridge_replaced";
@@ -176,8 +186,11 @@ daemonClient.on("rejected", async (code: number) => {
   }
   log(`Daemon rejected this session (close code ${code}, reason=${reason})`);
 
-  // Eviction and replacement are terminal until the user intervenes: the
-  // legitimate new session must not be kicked out by an auto-reconnect. But
+  // Every rejection except probe_in_progress is terminal until the user
+  // intervenes. For eviction and replacement, the legitimate new session must
+  // not be kicked out by an auto-reconnect; for project_mismatch and
+  // unknown_agent, reconnecting cannot succeed at all until the user changes
+  // something, so retrying would just be a silent hot loop. But
   // probe_in_progress is transient by definition (the probe resolves within
   // LIVENESS_PROBE_TIMEOUT_MS, default 3s), so we start the recovery poller
   // and let it auto-reconnect once the slot becomes available.
@@ -404,6 +417,8 @@ async function pollDisabledRecovery() {
       }
       case "evicted":
       case "rejected":
+      case "project_mismatch":
+      case "unknown_agent":
       case "auto_recovery_exhausted":
       case null:
         log(

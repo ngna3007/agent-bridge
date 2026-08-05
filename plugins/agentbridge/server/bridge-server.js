@@ -14220,7 +14220,9 @@ var PROTOCOL_VERSION = 1;
 // src/control-protocol.ts
 var CLOSE_CODE_REPLACED = 4001;
 var CLOSE_CODE_EVICTED_STALE = 4002;
-var CLOSE_CODE_PROBE_IN_PROGRESS = 4003;
+var CLOSE_CODE_PROJECT_MISMATCH = 4003;
+var CLOSE_CODE_PROBE_IN_PROGRESS = 4004;
+var CLOSE_CODE_UNKNOWN_AGENT = 4005;
 
 // src/daemon-client.ts
 var DRAIN_TIMEOUT_MS = 5000;
@@ -14456,7 +14458,7 @@ class DaemonClient extends EventEmitter2 {
         this.ws = null;
         this.rejectPendingReplies("AgentBridge daemon disconnected.");
         this.resolvePendingDrainsOnClose();
-        if (event.code === CLOSE_CODE_REPLACED || event.code === CLOSE_CODE_EVICTED_STALE || event.code === CLOSE_CODE_PROBE_IN_PROGRESS) {
+        if (event.code === CLOSE_CODE_REPLACED || event.code === CLOSE_CODE_EVICTED_STALE || event.code === CLOSE_CODE_PROBE_IN_PROGRESS || event.code === CLOSE_CODE_PROJECT_MISMATCH || event.code === CLOSE_CODE_UNKNOWN_AGENT) {
           this.emit("rejected", event.code);
         } else {
           this.emit("disconnect");
@@ -14987,6 +14989,10 @@ function disabledReplyError(reason) {
       return "AgentBridge evicted this session because it stopped responding to liveness probes \u2014 a newer Claude Code session has taken over. Close this session and start a new one with `agentbridge claude`.";
     case "probe_in_progress":
       return "AgentBridge rejected this session \u2014 a liveness probe is currently checking the incumbent Claude session. Retry in a few seconds with `agentbridge claude`.";
+    case "project_mismatch":
+      return "AgentBridge refused this session \u2014 the daemon on this control port belongs to a different project. Two projects have derived the same port slot. Run `agentbridge doctor` to see the collision, and `agentbridge doctor --fix` to move this project onto a free slot.";
+    case "unknown_agent":
+      return "AgentBridge refused this session \u2014 the daemon does not recognise the agent identity this frontend declared (`AGENTBRIDGE_AGENT`). The daemon is likely older than this frontend; restart it with `agentbridge kill` followed by `agentbridge claude`.";
     case "auto_recovery_exhausted":
       return "AgentBridge auto-recovery gave up after exhausting its retry budget for the in-flight liveness probe contention. Retry manually with `agentbridge claude`.";
     case "killed":
@@ -15011,6 +15017,8 @@ var LIFECYCLE_TAGS = {
   system_bridge_evicted: wrap(C_RED, "[REPLACED BY NEWER SESSION]"),
   system_bridge_probe_in_progress: wrap(C_YELLOW, "[RECONNECTING]"),
   system_bridge_replaced: wrap(C_RED, "[ANOTHER SESSION ACTIVE]"),
+  system_bridge_project_mismatch: wrap(C_RED, "[PORT COLLISION]"),
+  system_bridge_unknown_agent: wrap(C_RED, "[UNKNOWN AGENT]"),
   system_bridge_disabled: BRIDGE_STOPPED_TAG,
   system_bridge_auto_recovery_gave_up: wrap(C_RED, "[RECONNECT FAILED]"),
   system_bridge_recovered: wrap(C_GREEN, "[CODEX READY]"),
@@ -15147,6 +15155,14 @@ daemonClient.on("rejected", async (code) => {
     case CLOSE_CODE_PROBE_IN_PROGRESS:
       reason = "probe_in_progress";
       notificationId = "system_bridge_probe_in_progress";
+      break;
+    case CLOSE_CODE_PROJECT_MISMATCH:
+      reason = "project_mismatch";
+      notificationId = "system_bridge_project_mismatch";
+      break;
+    case CLOSE_CODE_UNKNOWN_AGENT:
+      reason = "unknown_agent";
+      notificationId = "system_bridge_unknown_agent";
       break;
     default:
       reason = "rejected";
@@ -15335,6 +15351,8 @@ async function pollDisabledRecovery() {
       }
       case "evicted":
       case "rejected":
+      case "project_mismatch":
+      case "unknown_agent":
       case "auto_recovery_exhausted":
       case null:
         log(`Disabled-state recovery poller encountered terminal/unexpected reason ${recoveredFrom ?? "null"} \u2014 stopping`);

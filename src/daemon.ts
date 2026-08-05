@@ -23,6 +23,7 @@ import {
   CLOSE_CODE_EVICTED_STALE,
   CLOSE_CODE_PROBE_IN_PROGRESS,
   CLOSE_CODE_PROJECT_MISMATCH,
+  CLOSE_CODE_UNKNOWN_AGENT,
 } from "./control-protocol";
 import { probeControlPort, describeControlPortConflict } from "./port-preflight";
 import { parsePositiveIntEnv } from "./env-utils";
@@ -938,7 +939,7 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
           log(`Refusing claude_connect from #${ws.data.clientId} — unknown agent ${JSON.stringify(message.agent)}`);
           ws.data.rejected = true;
           ws.close(
-            CLOSE_CODE_PROJECT_MISMATCH,
+            CLOSE_CODE_UNKNOWN_AGENT,
             `Unknown frontend agent ${JSON.stringify(message.agent)} — this daemon serves ${FRONTEND_AGENT_LIST}.`,
           );
           return;
