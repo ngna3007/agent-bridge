@@ -15,6 +15,19 @@ if (process.env.AGENTBRIDGE_ACTIVE !== "1") {
   process.exit(0);
 }
 
+// The CLI guard does not cover this entry point. Claude Code loads
+// bridge-server itself, so a native-Windows session that inherited
+// AGENTBRIDGE_ACTIVE=1 — from a shell profile, or from a `.mcp.json`
+// written by hand — reaches here without `abg` ever running. Same
+// policy function as the CLI, so the two cannot drift.
+//
+// ESM imports hoist, so this does not run before the modules below are
+// evaluated — it runs before the first top-level *statement*, which is
+// what matters: `stateDir.ensure()` creates directories, and nothing
+// above it does anything but define classes.
+import { assertSupportedPlatform } from "./windows-guard";
+assertSupportedPlatform();
+
 import { ClaudeAdapter } from "./claude-adapter";
 import { DaemonClient } from "./daemon-client";
 import { DaemonLifecycle } from "./daemon-lifecycle";

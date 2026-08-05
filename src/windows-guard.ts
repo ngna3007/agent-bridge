@@ -55,12 +55,33 @@ Keep the project on the Linux filesystem (~/code/...) rather than under
 /mnt/c if you can — cross-filesystem file watching is slow enough to be
 noticeable.
 
-Details: docs/windows.md`;
+Details: https://github.com/ngna3007/agent-bridge/blob/master/docs/windows.md`;
 
 const OVERRIDE_WARNING = `[abg] ${ALLOW_NATIVE_WINDOWS_ENV}=1 — running on native Windows anyway.
 [abg] Unsupported. Daemon identity checks and graceful shutdown do not
 [abg] work here; expect refused kills, orphaned processes, and a 30s
 [abg] readiness timeout on launch. See docs/windows.md.`;
+
+/**
+ * Commands that must not run on an unsupported platform.
+ *
+ * Help and version are the exception, and deliberately so: someone on
+ * Windows finding out AgentBridge will not run here is exactly the
+ * person who needs `--help` to work, and package managers probe
+ * `--version` on an installed binary regardless of whether it can do
+ * anything useful. Both answer from static strings and touch no
+ * daemon, no ports, and no state directory.
+ *
+ * Every other command either spawns a process, talks to the daemon, or
+ * writes state — the three things that break here.
+ */
+const PLATFORM_EXEMPT_COMMANDS = new Set(["--help", "-h", "--version", "-v"]);
+
+export function commandNeedsSupportedPlatform(command: string | undefined): boolean {
+  // A bare `abg` prints help.
+  if (command === undefined) return false;
+  return !PLATFORM_EXEMPT_COMMANDS.has(command);
+}
 
 /**
  * Decide what to do on this platform. Pure, so the decision is
@@ -79,12 +100,20 @@ export function checkPlatformSupport(
 }
 
 /**
- * Exit before any command runs when the platform cannot support one.
+ * Refuse to go further when the platform cannot support what follows.
  *
- * Deliberately the first thing `main()` does: every later step —
- * resolving the project namespace, offering first-run setup, spawning
- * a daemon — either fails or half-succeeds on native Windows, and a
- * half-succeeded setup is harder to explain than a refusal.
+ * Called from both process entry points — the CLI (`cli.ts`, gated on
+ * `commandNeedsSupportedPlatform`) and the plugin-spawned MCP server
+ * (`bridge.ts`, unconditionally, since it has no command to classify
+ * and does nothing but attach to a daemon). Two enforcement points,
+ * one policy: `checkPlatformSupport` above is the only place that
+ * decides, so the two can never drift into disagreeing about what
+ * "supported" means.
+ *
+ * In the CLI it runs before every other step, because resolving the
+ * project namespace, offering first-run setup, and spawning a daemon
+ * each either fail or half-succeed here — and a half-finished setup is
+ * harder to explain than a refusal.
  */
 export function assertSupportedPlatform(
   write: (s: string) => void = (s) => process.stderr.write(s),
