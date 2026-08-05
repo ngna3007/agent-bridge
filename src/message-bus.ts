@@ -34,9 +34,42 @@ export interface BusDeps {
 export class MessageBus {
   constructor(private readonly deps: BusDeps) {}
 
-  async route(envelope: BridgeMessage, now: number): Promise<RouteResult> {
+  async route(
+    envelope: BridgeMessage,
+    now: number,
+    opts: { requireReply?: boolean } = {},
+  ): Promise<RouteResult> {
     // 1. the only routing decision in the system
     const recipients = resolveRecipients(envelope, this.deps.state, now);
+
+    // The whole `require_reply` contract, in the one place that can see
+    // both halves of it. The recipient count is a routing fact — `to:
+    // "*"`, an omitted `to`, and a turn-scoped requester all fan out, and
+    // only `resolveRecipients` knows which — so no caller can check it
+    // for itself. The kind rule could be checked at ingress, and was;
+    // splitting one invariant across two files meant a second bus caller
+    // could route a `status` with `requireReply` and meet only half of
+    // it. Ingress may still refuse earlier for a better message, but the
+    // rule lives here.
+    //
+    // Exactly one recipient, because the obligation names one agent to
+    // wait on: a sender who asked three and got one obligation has been
+    // told something untrue about two of them. And `reply` only, because
+    // `reply` is the one kind a full mailbox refuses — every other kind
+    // sheds under pressure and still reports `accepted`, which would
+    // record a reply owed for a message that no longer exists.
+    if (opts.requireReply) {
+      if (envelope.kind !== "reply") {
+        throw new SendRejected(
+          `require_reply is only available on reply-kind messages; ${envelope.id} is ${envelope.kind}. A ${envelope.kind} may be shed when a mailbox fills, which would leave the reply owed by nobody.`,
+        );
+      }
+      if (recipients.length !== 1) {
+        throw new SendRejected(
+          `require_reply needs exactly one recipient; ${envelope.id} resolved to ${recipients.length} (${recipients.join(", ") || "none"}). Address one agent directly.`,
+        );
+      }
+    }
 
     // 2. per-recipient acceptance. a full mailbox for A must not block B.
     const accepted: AgentId[] = [];

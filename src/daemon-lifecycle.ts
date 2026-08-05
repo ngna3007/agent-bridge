@@ -89,10 +89,27 @@ export class DaemonLifecycle {
     return `ws://127.0.0.1:${this.controlPort}/ws`;
   }
 
-  /** Ensure daemon is running: check health, check pid, start if needed. */
-  async ensureRunning(): Promise<void> {
+  /**
+   * Ensure daemon is running: check health, check pid, start if needed.
+   *
+   * `readiness` says what "running enough" means for the caller.
+   * `"codex"` — the default and what `/readyz` reports — additionally
+   * waits for the Codex app-server to bootstrap. That is the right gate
+   * for `abg claude` and `abg codex`, and the wrong one for every other
+   * agent: `abg grok` needs the daemon and its own proxy socket, and a
+   * machine with no working Codex install would otherwise never get a
+   * Grok session at all. `"health"` waits only for this project's daemon
+   * to answer.
+   */
+  async ensureRunning(opts: { readiness?: "codex" | "health" } = {}): Promise<void> {
+    const readiness = opts.readiness ?? "codex";
+    const waitFor = (maxRetries?: number, delayMs?: number) =>
+      readiness === "health"
+        ? this.waitForHealthy(maxRetries, delayMs)
+        : this.waitForReady(maxRetries, delayMs);
+
     if (await this.isHealthy()) {
-      await this.waitForReady();
+      await waitFor();
       return;
     }
 
@@ -102,7 +119,7 @@ export class DaemonLifecycle {
         // Verify the live process is actually our daemon, not an OS-reused PID
         if (this.isDaemonProcess(existingPid)) {
           try {
-            await this.waitForReady(12, 250);
+            await waitFor(12, 250);
             return;
           } catch {
             throw new Error(
@@ -121,7 +138,7 @@ export class DaemonLifecycle {
     if (!lockAcquired) {
       // Another process is launching the daemon — wait for it
       this.log("Another process is starting the daemon, waiting for readiness...");
-      await this.waitForReady();
+      await waitFor();
       return;
     }
 
@@ -135,7 +152,7 @@ export class DaemonLifecycle {
         throw new Error(describeControlPortConflict(this.controlPort, this.projectId, holder));
       }
       this.launch();
-      await this.waitForReady();
+      await waitFor();
     } finally {
       this.releaseLock();
     }
@@ -225,6 +242,36 @@ export class DaemonLifecycle {
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
     throw new Error(`Timed out waiting for AgentBridge daemon health on ${this.healthUrl}`);
+  }
+
+  /**
+   * Whether this project's daemon is listening on the Grok proxy socket.
+   *
+   * Asked over `/healthz` rather than by connecting to the socket. The
+   * adapter gives its one TUI slot to whoever connects first, so a
+   * connect-probe claims that slot, opens an upstream leader connection,
+   * and announces a TUI that does not exist — then hangs up, leaving the
+   * real TUI to race the teardown for the slot it was just refused.
+   * A probe must not be indistinguishable from the thing it probes for.
+   */
+  async isGrokProxyReady(): Promise<boolean> {
+    const probe = await this.probe(this.healthUrl);
+    if (probe === null || !probe.ok || !this.acceptsDaemon(probe.body)) return false;
+    const body = probe.body;
+    return (
+      typeof body === "object" &&
+      body !== null &&
+      (body as { grokProxyReady?: unknown }).grokProxyReady === true
+    );
+  }
+
+  /** Poll until the Grok proxy socket is bound. False once the retries are spent. */
+  async waitForGrokProxy(maxRetries = 20, delayMs = 250): Promise<boolean> {
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      if (await this.isGrokProxyReady()) return true;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+    return false;
   }
 
   /** Check if daemon is ready to accept Codex TUI connections. */

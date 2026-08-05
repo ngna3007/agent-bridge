@@ -147,6 +147,29 @@ export class Mailbox {
     }
   }
 
+  /**
+   * Hand entries back unleased, so the next drain sees them again.
+   *
+   * The counterpart to `ack` for a delivery that provably did not
+   * happen. Without it a failed hand-off costs a full `leaseTimeoutMs`
+   * of invisibility: the entry is neither delivered nor drainable, and a
+   * retry triggered the moment the obstacle clears — the recipient
+   * signalling it can take work again — finds nothing to retry. Stale
+   * batch ids are ignored on the same grounds as in `ack`.
+   */
+  nack(batchId: string, ids: string[]): number {
+    const named = new Set(ids);
+    let released = 0;
+    for (const entry of this.entries) {
+      if (entry.leasedBy !== batchId) continue;
+      if (!named.has(entry.message.id)) continue;
+      entry.leasedBy = null;
+      entry.leaseExpiresAt = 0;
+      released++;
+    }
+    return released;
+  }
+
   remove(ids: string[]): void {
     const doomed = new Set(ids);
     for (let i = this.entries.length - 1; i >= 0; i--) {

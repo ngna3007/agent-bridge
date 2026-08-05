@@ -67,6 +67,36 @@ describe("MessageBus.route", () => {
     expect(order).toEqual(["wake:1"]);
   });
 
+  test("require_reply is refused when the message fans out", async () => {
+    // `require_reply` names one agent to wait on. A broadcast that
+    // reached three and recorded one obligation would tell the sender
+    // something untrue about two of them, and only the first transport
+    // to run would carry the instruction.
+    const h = harness();
+    await expect(h.bus.route(env({ to: "*" }), 0, { requireReply: true })).rejects.toThrow(
+      SendRejected,
+    );
+    // Refused before enqueue: nothing was half-sent.
+    expect(h.mailboxFor("claude").size).toBe(0);
+    expect(h.mailboxFor("grok").size).toBe(0);
+  });
+
+  test("require_reply passes when exactly one recipient resolves", async () => {
+    const h = harness();
+    const result = await h.bus.route(env({ to: "claude" }), 0, { requireReply: true });
+    expect(result.accepted).toEqual(["claude"]);
+  });
+
+  test("an implicit fan-out is refused the same way an explicit one is", async () => {
+    // No `to`, no `inReplyTo`, no active requester — this resolves to
+    // everyone else just as `to: "*"` does. The check lives here, after
+    // resolution, precisely because the frontend cannot tell them apart.
+    const h = harness();
+    await expect(h.bus.route(env({ to: null }), 0, { requireReply: true })).rejects.toThrow(
+      /exactly one recipient/,
+    );
+  });
+
   test("a wake-up that throws still leaves the message drainable", async () => {
     const h = harness();
     h.transports.register("claude", {

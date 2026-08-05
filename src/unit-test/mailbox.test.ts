@@ -139,6 +139,35 @@ describe("leased drain and explicit ack", () => {
     expect(m.size).toBe(1);
   });
 
+  test("a nack makes a refused hand-off drainable at once", () => {
+    // The lease is what makes a delivered-but-unacked entry invisible, and
+    // that is right until the hand-off provably failed. Without the nack a
+    // retry fires the moment the recipient signals it can take work again
+    // and finds nothing — the entry is still leased for the rest of the
+    // timeout.
+    const m = box(5);
+    const a = msg("reply", "a");
+    const b = msg("reply", "b");
+    m.enqueue(a);
+    m.enqueue(b);
+    const batch = m.drain(1_000);
+    expect(m.nack(batch.batchId, [b.id])).toBe(1);
+    expect(m.drain(1_100).messages.map((x) => x.id)).toEqual([b.id]);
+    // The one still leased stays put — a nack releases only what it names.
+    expect(m.size).toBe(2);
+  });
+
+  test("a nack naming a stale batch releases nothing", () => {
+    const m = box(5);
+    const a = msg("reply", "a");
+    m.enqueue(a);
+    const batch = m.drain(1_000);
+    m.drain(1_000 + 30_001); // lease expires, entry is re-leased
+    expect(m.nack(batch.batchId, [a.id])).toBe(0);
+    // Releasing here would hand a live second delivery's entry back.
+    expect(m.drain(1_000 + 30_002).messages).toHaveLength(0);
+  });
+
   test("a drain with nothing to serve still reports a pending gap", () => {
     const m = box(1);
     m.enqueue(msg("untagged", "old"));

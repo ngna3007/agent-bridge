@@ -13,8 +13,18 @@ interface FakeSocket {
 
 const socket = (id: string, state: FakeSocket["state"] = "open"): FakeSocket => ({ id, state });
 
+/**
+ * The registry's rules are about *N* agent slots, and the product
+ * currently ships one (`FrontendAgent` is `"claude"` alone, now that
+ * Grok is proxied rather than attached). Testing it against the live
+ * union would only prove a one-element map works — so these tests bind
+ * the class's agent parameter to a two-agent type. The second name is
+ * "grok" because that is the collision this module was written for.
+ */
+type TestAgent = "claude" | "grok";
+
 function registry() {
-  return new FrontendRegistry<FakeSocket>({
+  return new FrontendRegistry<FakeSocket, TestAgent>({
     isOpen: (s) => s.state === "open",
     isClosed: (s) => s.state === "closed",
   });
@@ -29,7 +39,6 @@ describe("parseFrontendAgent", () => {
 
   test("known agents pass through", () => {
     expect(parseFrontendAgent("claude")).toBe("claude");
-    expect(parseFrontendAgent("grok")).toBe("grok");
   });
 
   test("anything else is rejected rather than coerced", () => {
@@ -37,6 +46,9 @@ describe("parseFrontendAgent", () => {
     // Claude's slot, which is the failure this whole module exists
     // to stop.
     expect(parseFrontendAgent("codex")).toBeNull();
+    // Grok used to be a frontend. It is proxied now, so a socket
+    // claiming to be Grok is either stale or lying.
+    expect(parseFrontendAgent("grok")).toBeNull();
     expect(parseFrontendAgent("Claude")).toBeNull();
     expect(parseFrontendAgent(7)).toBeNull();
     expect(parseFrontendAgent({})).toBeNull();

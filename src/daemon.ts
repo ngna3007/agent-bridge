@@ -3,6 +3,13 @@
 import type { ServerWebSocket } from "bun";
 import { CodexAdapter } from "./codex-adapter";
 import type { CodexProseIngress, InjectionRejection } from "./codex-adapter";
+import { GrokAdapter } from "./grok-adapter";
+import type {
+  GrokInjectionCorrelation,
+  GrokInjectionDelivery,
+  GrokInjectionRejection,
+  GrokProseIngress,
+} from "./grok-adapter";
 import { getRotatingLogger } from "./log-rotator";
 import { StatusLineWriter } from "./status-line-writer";
 import { BRIDGE_STOPPED_TAG } from "./lifecycle-tags";
@@ -43,11 +50,13 @@ import {
   parseFrontendAgent,
 } from "./frontend-registry";
 import type { FrontendAgent } from "./frontend-registry";
-import { isAgentId } from "./agent-id";
+import { agentLabel, isAgentId } from "./agent-id";
 import { Mailbox } from "./mailbox";
 import { MessageIndex } from "./message-index";
 import { MessageBus } from "./message-bus";
 import { PendingRequests } from "./pending-requests";
+import { ReplyObligations } from "./reply-obligations";
+import { grokWakeTransport } from "./grok-wake";
 import { TransportRegistry, type WakeupTransport } from "./wakeup-transport";
 import {
   deliveryHintFor,
@@ -126,6 +135,30 @@ const daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_POR
 
 const codex = new CodexAdapter(CODEX_APP_PORT, CODEX_PROXY_PORT, stateDir.logFile);
 const attachCmd = `codex --enable tui_app_server --remote ${codex.proxyUrl}`;
+
+/**
+ * Grok's proxy, in the same role the Codex proxy plays.
+ *
+ * Constructed unconditionally and cheaply: `start` only opens a unix
+ * socket, and the socket has to exist before `abg grok` has anything to
+ * point a TUI at. No Grok installed and no TUI launched costs one idle
+ * listener.
+ */
+const grok = new GrokAdapter({
+  socketPath: stateDir.grokLeaderSocket,
+  logFile: stateDir.logFile,
+});
+
+/**
+ * Whether a Grok TUI has ever been through this proxy.
+ *
+ * Gates Grok's membership in `knownAgents` the way attaching gates a
+ * frontend's: broadcasting to a Grok that has never connected fills a
+ * mailbox nobody will drain. "Ever", not "now", for the same reason the
+ * frontend registry keeps known separate from attached — a TUI being
+ * restarted must keep receiving into its mailbox.
+ */
+let grokEverAttached = false;
 
 let controlServer: ReturnType<typeof Bun.serve> | null = null;
 
@@ -271,7 +304,8 @@ const bus = new MessageBus({
     // entire reason the mailbox exists. `FrontendRegistry.knownAgents`
     // seeds Claude, so a message that arrives before Claude's first
     // connect is still retained — long-standing behaviour.
-    knownAgents: () => ["codex", ...frontends.knownAgents()],
+    knownAgents: () =>
+      ["codex", ...(grokEverAttached ? (["grok"] as const) : []), ...frontends.knownAgents()],
     senderOf: (id, replier, now) => messageIndex.resolveSender(id, replier, now),
     activeRequesterFor: (agent) => activeRequester.get(agent) ?? null,
   },
@@ -285,13 +319,10 @@ function nextMessageId(): string {
 }
 
 /**
- * Ids whose sender asked Codex for a reply.
- *
- * The flag has to survive the gap between acceptance and the wake-up:
- * `bus.route` enqueues first and wakes afterwards, and the wake may be
- * deferred by a whole turn, so it cannot be a parameter of the send.
+ * Who is still owed a reply. See `src/reply-obligations.ts` for why this
+ * is one object and not a flag each path clears for itself.
  */
-const requireReplyIds = new Set<string>();
+const obligations = new ReplyObligations();
 
 /** Sender-facing text produced while waking Codex, read back by the send that caused it. */
 const codexDeferralNotes = new Map<string, string>();
@@ -328,7 +359,7 @@ registerTransport("codex", {
   payloadMode: "content",
   acknowledgementMode: "none",
   wake: (message) => {
-    const requireReply = requireReplyIds.delete(message.id);
+    const requireReply = obligations.discharge(message.id);
     const requester = isAgentId(message.from) ? message.from : null;
 
     if (deliverToCodex(message.content, requireReply, requester, message.id)) {
@@ -364,6 +395,71 @@ registerTransport("codex", {
   },
 });
 
+registerTransport(
+  "grok",
+  grokWakeTransport({
+    obligations,
+    inject: (content, correlation) => grok.injectMessage(content, correlation),
+    expectReply: (requester, messageId) =>
+      pendingRequests.add({ requester, responder: "grok", messageId, at: Date.now() }),
+    log,
+  }),
+);
+
+/**
+ * Deliver what piled up while no Grok TUI was connected.
+ *
+ * Grok has no `get_messages`: it cannot pull its own mailbox the way a
+ * frontend does, so nothing would ever drain this on its own. Messages
+ * addressed to a Grok that was not running are held rather than shed —
+ * the mailbox is the whole point — and this is the only thing that
+ * hands them over.
+ */
+let grokDrainRunning = false;
+let grokDrainAgain = false;
+
+async function drainGrokBacklog(why: string): Promise<void> {
+  // Coalesced, never concurrent. `injectionCapacity` fires synchronously
+  // from inside the adapter, which can happen while this function is
+  // between its `wake` and its `nack` — a second drain there would lease
+  // nothing (the entry is still held by this batch), see an empty
+  // mailbox, and return, and the nack that follows would arrive with no
+  // signal left to act on it. The rerun flag is what makes that
+  // impossible: a request that lands mid-drain is served after the
+  // current batch has been fully accounted for.
+  if (grokDrainRunning) {
+    grokDrainAgain = true;
+    return;
+  }
+  grokDrainRunning = true;
+  try {
+    do {
+      grokDrainAgain = false;
+      await drainGrokBatch(why);
+    } while (grokDrainAgain);
+  } finally {
+    grokDrainRunning = false;
+  }
+}
+
+async function drainGrokBatch(why: string): Promise<void> {
+  const box = mailboxFor("grok");
+  const batch = box.drain(Date.now());
+  if (batch.messages.length === 0) return;
+  log(`Delivering ${batch.messages.length} held message(s) to Grok (${why})`);
+  // Grok takes one injected turn at a time, so a batch of held messages
+  // is mostly refusals: the first goes out, the rest throw. A refused
+  // entry has to be handed straight back — the drain leased it, and a
+  // lease outlives the refusal by `LEASE_TIMEOUT_MS`, so the retry this
+  // function exists to be would find nothing to retry. `injectionCapacity`
+  // calls it again the moment the slot frees.
+  const refused: string[] = [];
+  for (const message of batch.messages) {
+    if ((await transports.wake("grok", message, log)) === "failed") refused.push(message.id);
+  }
+  if (refused.length > 0) box.nack(batch.batchId, refused);
+}
+
 /**
  * A frontend's wake-up: push the message down its control socket.
  *
@@ -396,8 +492,11 @@ function frontendTransport(agent: FrontendAgent): WakeupTransport {
 for (const agent of FRONTEND_AGENTS) registerTransport(agent, frontendTransport(agent));
 
 /** The one call into the bus. See `routeThroughBus` in `src/daemon-bus.ts`. */
-async function routeThroughBus(envelope: BridgeMessage): Promise<RouteOutcome> {
-  return routeThroughBusIn({ bus, log }, envelope);
+async function routeThroughBus(
+  envelope: BridgeMessage,
+  opts: { requireReply?: boolean } = {},
+): Promise<RouteOutcome> {
+  return routeThroughBusIn({ bus, log }, envelope, opts);
 }
 
 /**
@@ -578,28 +677,59 @@ function flushPendingCodexNotices(): void {
   droppedCodexNotices = 0;
 }
 
-// An async listener hands the emitter a promise it does not await, so a
-// throw anywhere in the handler becomes an unhandled rejection — in a
-// process designed to run for days, on the path every Codex message
-// takes. The emitter gets a sync function; the rejection is caught here.
-codex.on("agentMessage", (msg: CodexProseIngress) => {
-  void handleCodexMessage(msg).catch((err: unknown) => {
-    log(`agentMessage handler failed for ${msg.senderRef}: ${describeError(err)}`);
-  });
-});
+/**
+ * One proxied agent's prose, on its way to the bus.
+ *
+ * Codex and Grok reach the daemon by different roads and arrive in the
+ * same place. `respondingTo` is the only asymmetry, and it is an
+ * asymmetry of evidence rather than of policy: Grok's adapter can say
+ * which injected prompt a turn answers, Codex's cannot.
+ */
+interface ProxiedIngress {
+  agent: Extract<AgentId, "codex" | "grok">;
+  senderRef: string;
+  content: string;
+  /** The injected prompt this turn answers, when the adapter knows. */
+  respondingTo: GrokInjectionCorrelation | null;
+  /** How the daemon speaks back to this agent, as the bridge. */
+  tell: (text: string) => void;
+}
 
-async function handleCodexMessage(msg: CodexProseIngress): Promise<void> {
+/**
+ * The ingress path every proxied agent takes: classify, normalise, route.
+ *
+ * Deliberately one function rather than one per agent. What happens to a
+ * message between "the adapter saw prose" and "the bus has it" is
+ * production-defining — which marker buffers, when the status buffer
+ * flushes, what closes a `require_reply`, when the attention window
+ * opens — and two copies of it drift. They already had: the attention
+ * window suppressed Codex's `[STATUS]` and not Grok's, for no reason
+ * anyone chose.
+ */
+async function handleProxiedMessage(msg: ProxiedIngress): Promise<void> {
+  const { agent, tell } = msg;
+  const label = agentLabel(agent);
+
+  // Turn ownership arrives with the turn, not with the injection that
+  // asked for it — see the `registerTransport("grok")` wake for why. It
+  // has to be set before `routeThroughBus`, which reads it synchronously
+  // in `resolveRecipients` to send an untagged reply back to whoever
+  // asked instead of broadcasting it.
+  if (msg.respondingTo && isAgentId(msg.respondingTo.requester)) {
+    activeRequester.set(agent, msg.respondingTo.requester);
+  }
+
   // The adapter hands over prose, not an envelope: attribution on ingress
-  // comes from where the message arrived, and everything on this emitter
-  // arrived from Codex. `normalizeProse` writes `from` accordingly, and is
-  // the only thing that constructs a `BridgeMessage` on this path — so it
-  // runs before anything downstream (including the status buffer) sees it.
+  // comes from where the message arrived. `normalizeProse` writes `from`
+  // accordingly, and is the only thing that constructs a `BridgeMessage`
+  // on this path — so it runs before anything downstream (including the
+  // status buffer) sees it.
   let result: FilterResult;
   try {
     result = classifyMessage(msg.content, FILTER_MODE);
   } catch (err: unknown) {
-    // An unknown @name is a parse failure, not a broadcast. Tell Codex.
-    tellCodex(describeError(err));
+    // An unknown @name is a parse failure, not a broadcast. Tell the sender.
+    tell(describeError(err));
     return;
   }
 
@@ -607,25 +737,26 @@ async function handleCodexMessage(msg: CodexProseIngress): Promise<void> {
   try {
     envelope = normalizeProse(
       msg.content,
-      { agent: "codex", protocolVersion: PROTOCOL_VERSION },
+      { agent, protocolVersion: PROTOCOL_VERSION },
       { id: nextMessageId(), now: Date.now(), senderRef: msg.senderRef },
     );
   } catch (err: unknown) {
-    tellCodex(describeError(err));
+    tell(describeError(err));
     return;
   }
 
-  // During attention window, suppress STATUS to give Claude space to respond.
-  // Skipped in full mode: full mode's contract is "forward everything", and
-  // classifyMessage now reports the real marker there, so without this guard
-  // a [STATUS] message would start getting buffered instead of forwarded.
+  // During attention window, suppress STATUS to give the recipient space
+  // to respond. Skipped in full mode: full mode's contract is "forward
+  // everything", and classifyMessage now reports the real marker there,
+  // so without this guard a [STATUS] message would start getting
+  // buffered instead of forwarded.
   if (FILTER_MODE !== "full" && inAttentionWindow && result.marker === "status") {
-    log(`Codex → Claude [${result.marker}/buffer-attention] (${msg.content.length} chars)`);
+    log(`${label} → bus [${result.marker}/buffer-attention] (${msg.content.length} chars)`);
     statusBuffer.add(envelope);
     return;
   }
 
-  log(`Codex → Claude [${result.marker}/${result.action}] (${msg.content.length} chars)`);
+  log(`${label} → bus [${result.marker}/${result.action}] (${msg.content.length} chars)`);
 
   // [STATUS] still folds into the summary rather than entering a mailbox
   // one message at a time; the summary itself is an ordinary send.
@@ -639,44 +770,75 @@ async function handleCodexMessage(msg: CodexProseIngress): Promise<void> {
   }
 
   const outcome = await routeThroughBus(envelope);
-  // Both a refusal and a partial shed are the sender's business: Codex
-  // has no other way to learn that the name it addressed does not
-  // resolve, or that its `[REPLY]` reached Grok and not Claude. A
-  // partial shed is the dangerous one — the send "succeeded", so
-  // nothing else in the system will ever mention it again. This runs
-  // inside Codex's own turn, so the injection is always refused and the
-  // notice is always deferred; `tellCodex` is what makes it arrive.
+  // Both a refusal and a partial shed are the sender's business: a
+  // proxied agent has no other way to learn that the name it addressed
+  // does not resolve, or that its `[REPLY]` reached one peer and not
+  // another. A partial shed is the dangerous one — the send
+  // "succeeded", so nothing else in the system will ever mention it
+  // again. This runs inside the sender's own turn, so the injection is
+  // deferred; `tell` is what makes it arrive.
   const text = senderFacingText(outcome);
-  if (text !== null) tellCodex(text);
+  if (text !== null) tell(text);
   if (outcome.status === "failed") return;
 
   // Only a [REPLY] satisfies a pending require-reply request — [STATUS] /
   // [FYI] / untagged don't count as "actually replied". Correlated by
-  // `inReplyTo` when Codex named it, or by delivery to the requester
-  // otherwise (an untagged reply back to whoever opened the turn).
+  // `inReplyTo` when the agent named it, then by the injection that
+  // opened this turn, then by delivery to the requester (an untagged
+  // reply back to whoever opened the turn).
   if (result.marker === "reply") {
-    pendingRequests.satisfy(envelope.inReplyTo, outcome.accepted);
+    pendingRequests.satisfy(
+      envelope.inReplyTo ?? msg.respondingTo?.messageId,
+      outcome.accepted,
+      agent,
+    );
     // [REPLY] message — give the recipient an attention window to respond.
     startAttentionWindow();
   }
 }
 
 /**
- * Close the turn-scoped state a Codex turn owns.
+ * Hand prose to the ingress path without letting a throw escape.
+ *
+ * An async listener hands the emitter a promise it does not await, so a
+ * throw anywhere in the handler becomes an unhandled rejection — in a
+ * process designed to run for days, on the path every proxied message
+ * takes. The emitter gets a sync function; the rejection is caught here.
+ */
+function receiveProxiedMessage(msg: ProxiedIngress): void {
+  void handleProxiedMessage(msg).catch((err: unknown) => {
+    log(`${msg.agent} agentMessage handler failed for ${msg.senderRef}: ${describeError(err)}`);
+  });
+}
+
+codex.on("agentMessage", (msg: CodexProseIngress) => {
+  receiveProxiedMessage({
+    agent: "codex",
+    senderRef: msg.senderRef,
+    content: msg.content,
+    // The app-server gives no per-turn correlation to read one from.
+    respondingTo: null,
+    tell: tellCodex,
+  });
+});
+
+/**
+ * Close the turn-scoped state a proxied agent's turn owns.
  *
  * Spec §6 says the requester is discarded at turn end, and a crash is a
  * turn end. When only the clean path cleared it, an app-server that died
- * mid-turn left `activeRequester` set forever: Codex's next spontaneous
- * untagged output hit `routing.ts`'s requester branch and resolved to
- * that one stale agent instead of broadcasting, so every other attached
- * frontend received nothing and nobody was told — silent non-delivery to
- * a live agent, which is exactly what the guarantee forbids. Every path
- * that ends a turn calls this, not just the one that ends it well.
+ * mid-turn left `activeRequester` set forever: the agent's next
+ * spontaneous untagged output hit `routing.ts`'s requester branch and
+ * resolved to that one stale agent instead of broadcasting, so every
+ * other attached frontend received nothing and nobody was told — silent
+ * non-delivery to a live agent, which is exactly what the guarantee
+ * forbids. Every path that ends a turn calls this, not just the one that
+ * ends it well.
  */
-function endCodexTurn(why: string): void {
-  if (!activeRequester.has("codex")) return;
-  log(`Clearing Codex's turn-scoped requester: ${why}`);
-  activeRequester.delete("codex");
+function endAgentTurn(agent: Extract<AgentId, "codex" | "grok">, why: string): void {
+  if (!activeRequester.has(agent)) return;
+  log(`Clearing ${agentLabel(agent)}'s turn-scoped requester: ${why}`);
+  activeRequester.delete(agent);
 }
 
 codex.on("turnCompleted", () => {
@@ -689,7 +851,7 @@ codex.on("turnCompleted", () => {
   // turn ending is not itself evidence of anything; Codex may open
   // another turn on the same requirement moments later.
 
-  endCodexTurn("the turn completed");
+  endAgentTurn("codex", "the turn completed");
 
   notifyFrontends((to) =>
     systemMessage(
@@ -754,54 +916,129 @@ codex.on("error", (err: Error) => {
 // is ever coming for it, so `turnCompleted` never fires and only this
 // event closes the turn-scoped state.
 codex.on("turnAborted", (why: string) => {
-  endCodexTurn(why);
+  endAgentTurn("codex", why);
 });
 
+/** One proxied agent's backend failing an injection the daemon already reported as sent. */
+interface FailedInjection {
+  agent: Extract<AgentId, "codex" | "grok">;
+  /** The notice kind, which each agent's clients already know by name. */
+  kind: string;
+  /** What the backend refused: Codex takes a turn, Grok takes a prompt. */
+  unit: string;
+  /** What refused it, as the notice names it to a human. */
+  backend: string;
+  /**
+   * Whether the backend said no, or the connection simply died with the
+   * request already written. These are different facts about the world
+   * and the sender has to be able to act on the difference — see
+   * `reportFailedInjection`.
+   */
+  delivery: GrokInjectionDelivery;
+  messageId: string;
+  /**
+   * Whoever sent the message, as an untrusted string off the wire —
+   * `null` when the injection carried no sender at all.
+   */
+  requester: string | null;
+  /** The message that did not land, echoed back so the sender can act. */
+  text: string;
+  reason: string;
+}
+
 /**
- * The app-server refused a turn the daemon already reported as sent.
+ * Report an injection that failed after the daemon had acked it.
  *
  * `injectMessage` returning true only means the frame left this process.
- * The refusal arrives later, by which time the Codex transport's
+ * The failure arrives later, by which time the transport's
  * `acknowledgementMode: "none"` self-ack has deleted the mailbox entry —
- * so without this handler the message is gone, Codex never saw it, and
- * the only trace is a log line the sender cannot read. That is the exact
+ * so without this the message is gone, the agent never saw it, and the
+ * only trace is a log line the sender cannot read. That is the exact
  * shape the never-silently-lost guarantee rules out, which is why the
  * notice echoes the text back: a sender told "this did not land" and not
  * shown what it was cannot act on it.
+ *
+ * Two outcomes, kept apart on purpose. A backend that answers with an
+ * error refused the work: nothing ran, and a resend is the right move. A
+ * connection that dies with the request already written proves nothing —
+ * the turn may have run in full, and telling the sender "it never saw
+ * it" invites a resend that runs the same turn's file writes and tool
+ * calls a second time. So `unknown` says it is unknown, and the pending
+ * reply request stays open: if the turn did run, its reply satisfies it;
+ * if it did not, the expiry notice reports that, which is exactly as
+ * much as this side knows.
+ *
+ * Shared rather than written once per agent because every clause here is
+ * part of that guarantee, and a guarantee kept in two places is kept in
+ * neither.
  */
-codex.on("injectionRejected", ({ correlation, error }: InjectionRejection) => {
-  log(`Codex refused the turn for ${correlation.id}: ${error}`);
+function reportFailedInjection(failure: FailedInjection): void {
+  const { agent, messageId, unit, reason, delivery } = failure;
+  const label = agentLabel(agent);
+  const verb = delivery === "rejected" ? "refused" : "may not have received";
+  log(`${label} ${verb} the ${unit} for ${messageId}: ${reason}`);
 
-  // The turn never opened, so nothing about it is in scope any more.
-  endCodexTurn("Codex refused the turn");
-  // A require-reply request against a message Codex never received would
-  // otherwise expire into "no reply came" — pointing at Codex instead of
-  // at the send that failed.
-  if (pendingRequests.cancel(correlation.id)) {
-    log(`Cancelled the pending reply request for refused message ${correlation.id}`);
+  // Whatever this turn owned is out of scope: it either never opened, or
+  // it is beyond this side's reach.
+  endAgentTurn(agent, `${label} ${verb} the ${unit}`);
+
+  const body =
+    delivery === "rejected"
+      ? `⚠️ ${label} refused the ${unit} carrying your message — it was not delivered and ${label} never saw it. ` +
+        `The ${failure.backend} said: ${reason}`
+      : `⚠️ The bridge lost its connection to the ${failure.backend} with your message already sent, so whether ${label} ` +
+        `received it is unknown. Do not assume either way: ${label} may answer, or may never have seen it. ` +
+        `Resending can make ${label} run the same request twice. The reason given was: ${reason}`;
+
+  if (delivery === "rejected") {
+    // A require-reply request against a message the agent never received
+    // would otherwise expire into "no reply came" — pointing at the
+    // agent instead of at the send that failed. Deliberately not done
+    // for `unknown`: there the request is still live, because a reply
+    // may still be coming.
+    if (pendingRequests.cancel(messageId)) {
+      log(`Cancelled the pending reply request for refused message ${messageId}`);
+    }
   }
+
+  const echoHeading = delivery === "rejected" ? "Undelivered message" : "The message in question";
+  const notice = (to: AgentId) =>
+    noticeMessage(
+      failure.kind,
+      `${body}\n\n${echoHeading}:\n${truncateForNotice(failure.text)}`,
+      to,
+    );
+
+  const sender = isAgentId(failure.requester) ? failure.requester : null;
+  if (sender) routeOrLog(notice(sender));
+  else emitToFrontends(notice);
+}
+
+codex.on("injectionRejected", ({ correlation, error }: InjectionRejection) => {
   // The contract reminder rode along on the refused turn, so it was
   // never pinned. Let the next injection carry it again.
   lastPinnedContractThreadId = null;
 
-  const notice = (to: AgentId) =>
-    noticeMessage(
-      "turn_start_rejected",
-      `⚠️ Codex refused the turn carrying your message — it was not delivered and Codex never saw it. ` +
-        `The app-server said: ${error}\n\nUndelivered message:\n${truncateForNotice(correlation.text)}`,
-      to,
-    );
-
-  const requester = isAgentId(correlation.requester) ? correlation.requester : null;
-  if (requester) routeOrLog(notice(requester));
-  else emitToFrontends(notice);
+  reportFailedInjection({
+    agent: "codex",
+    // A `turn/start` error is the app-server declining the work: it
+    // answered, so nothing ran.
+    delivery: "rejected",
+    kind: "turn_start_rejected",
+    unit: "turn",
+    backend: "app-server",
+    messageId: correlation.id,
+    requester: correlation.requester,
+    text: correlation.text,
+    reason: error,
+  });
 });
 
 codex.on("exit", (code: number | null) => {
   log(`Codex process exited (code ${code})`);
   codexBootstrapped = false;
   statusBuffer.flush("codex exited");
-  endCodexTurn("the Codex app-server exited");
+  endAgentTurn("codex", "the Codex app-server exited");
   tuiConnectionState.handleCodexExit();
   clearPendingClaudeDisconnect("Codex process exited");
   claudeOnlineNoticeSent = false;
@@ -817,6 +1054,75 @@ codex.on("exit", (code: number | null) => {
     ),
   );
   broadcastStatus();
+});
+
+// ── Grok ────────────────────────────────────────────────────────────
+
+/** Say something to Grok as the bridge. Grok's equivalent of `tellCodex`. */
+function tellGrok(text: string): void {
+  if (!grok.injectMessage(`[AgentBridge] ${text}`)) {
+    log(`Could not tell Grok: ${text}`);
+  }
+}
+
+grok.on("agentMessage", (msg: GrokProseIngress) => {
+  receiveProxiedMessage({
+    agent: "grok",
+    senderRef: msg.senderRef,
+    content: msg.content,
+    respondingTo: msg.respondingTo,
+    tell: tellGrok,
+  });
+});
+
+grok.on("sessionAttached", (sessionId: string) => {
+  log(`Grok session attached: ${sessionId}`);
+  grokEverAttached = true;
+  void drainGrokBacklog("a Grok session became available");
+  broadcastStatus();
+});
+
+// The adapter refuses an injection while one is outstanding, so the
+// message stays in the mailbox. This is the signal that it can go now —
+// without it the retry waits on a lease expiry, and a connected Grok can
+// leave a message held indefinitely.
+grok.on("injectionCapacity", () => {
+  void drainGrokBacklog("Grok can take another injected turn");
+});
+
+grok.on("turnCompleted", () => {
+  log("Grok turn completed");
+  endAgentTurn("grok", "the turn completed");
+});
+
+// A Grok TUI counts as a client, so its arrival and departure move the
+// idle-shutdown clock the same way a frontend's does — otherwise a
+// daemon whose only user is Grok shuts itself down mid-session.
+grok.on("tuiConnected", () => {
+  log("Grok TUI connected through the proxy");
+  cancelIdleShutdown();
+  broadcastStatus();
+});
+
+grok.on("tuiDisconnected", () => {
+  log("Grok TUI disconnected");
+  endAgentTurn("grok", "the Grok TUI disconnected");
+  scheduleIdleShutdown();
+  broadcastStatus();
+});
+
+grok.on("injectionRejected", (failure: GrokInjectionRejection) => {
+  reportFailedInjection({
+    agent: "grok",
+    kind: "grok_prompt_rejected",
+    unit: "prompt",
+    backend: "leader",
+    delivery: failure.delivery,
+    messageId: failure.messageId,
+    requester: failure.requester,
+    text: failure.text,
+    reason: failure.reason,
+  });
 });
 
 function startControlServer() {
@@ -1009,16 +1315,15 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
         return;
       }
 
-      if (!tuiConnectionState.canReply()) {
-        sendProtocolMessage(ws, {
-          type: "claude_to_codex_result",
-          requestId: message.requestId,
-          success: false,
-          error: "Codex is not ready. Wait for TUI to connect and create a thread.",
-        });
-        return;
-      }
-
+      // Deliberately no Codex-readiness gate here. This frame is the
+      // only way *any* agent sends anything, and the destination is not
+      // known until `resolveRecipients` runs inside the bus — so a gate
+      // at this point refused a Claude→Grok message because Codex's TUI
+      // had not connected, in a bridge whose claim is that its agents
+      // are independent. Codex's readiness is Codex's transport's
+      // business: `deliverToCodex` returns false when there is no thread
+      // and the outbox holds the message until there is, which is a
+      // better answer than a refusal anyway.
       void sendFromFrontend(ws, message.requestId, message.message, !!message.requireReply);
       return;
     }
@@ -1059,13 +1364,21 @@ async function sendFromFrontend(
   }
 
   // The wake-up happens inside `bus.route` and cannot take arguments, so
-  // the flag is parked under the daemon-assigned id for it to collect.
-  if (requireReply) requireReplyIds.add(envelope.id);
+  // the obligation is parked under the daemon-assigned id for whichever
+  // transport ends up handing the message over to collect.
+  if (requireReply) obligations.require(envelope.id, Date.now());
 
-  const outcome = await routeThroughBus(envelope);
-  requireReplyIds.delete(envelope.id);
+  const outcome = await routeThroughBus(envelope, { requireReply });
 
   if (outcome.status === "failed") {
+    // Nothing was enqueued, so no transport will ever discharge this.
+    // Note what is deliberately *not* here: a discharge on the success
+    // path. A wake-up is best-effort — it can fail while the message
+    // stays in the mailbox for a later retry — so "the route returned"
+    // is not "an agent was handed the message", and clearing here left
+    // that retry with no reply instruction and nothing awaiting an
+    // answer.
+    obligations.release(envelope.id);
     sendProtocolMessage(ws, {
       type: "claude_to_codex_result",
       requestId,
@@ -1141,7 +1454,7 @@ function deliverToCodex(
   // for it anyway. In practice every caller has a requester; this is
   // the same guard `activeRequester` uses below.
   if (requireReply && requester) {
-    pendingRequests.add({ requester, messageId, at: Date.now() });
+    pendingRequests.add({ requester, responder: "codex", messageId, at: Date.now() });
     log(`Reply required from Codex for ${messageId} (requester: ${requester})`);
   }
   // Codex's turn is now open on this sender's behalf. `resolveRecipients`
@@ -1491,24 +1804,35 @@ function checkExpiredRequests(): void {
     routeOrLog(
       noticeMessage(
         "reply_missing",
-        "⚠️ Codex did not send a reply before the reply-required window expired. You may want to retry or rephrase.",
+        `⚠️ ${agentLabel(req.responder)} did not send a reply before the reply-required window expired. You may want to retry or rephrase.`,
         req.requester,
       ),
     );
   }
 }
 
+/**
+ * Is anyone still using this daemon?
+ *
+ * A Grok TUI is a client in every sense that matters here: it is
+ * connected through the daemon's own proxy socket, and killing the
+ * daemon takes its session's leader connection down with it. It counts
+ * for the same reason the Codex TUI does — and it has to be counted in
+ * both the initial check and the re-check, or the grace period becomes a
+ * window in which attaching Grok does not save the daemon.
+ */
+function hasLiveClients(): boolean {
+  return frontends.size > 0 || tuiConnectionState.snapshot().tuiConnected || grok.tuiConnected;
+}
+
 function scheduleIdleShutdown() {
   cancelIdleShutdown();
-  if (frontends.size > 0) return; // still has a client
-
-  const snapshot = tuiConnectionState.snapshot();
-  if (snapshot.tuiConnected) return; // TUI still connected
+  if (hasLiveClients()) return;
 
   log(`No clients connected. Daemon will shut down in ${IDLE_SHUTDOWN_MS}ms if no one reconnects.`);
   idleShutdownTimer = setTimeout(() => {
     // Re-check before shutting down
-    if (frontends.size > 0 || tuiConnectionState.snapshot().tuiConnected) {
+    if (hasLiveClients()) {
       log("Idle shutdown cancelled: client reconnected during grace period");
       return;
     }
@@ -1619,6 +1943,7 @@ function currentStatus(): DaemonStatus {
     claudeAttached: frontends.isAttached(DEFAULT_FRONTEND_AGENT),
     attachedAgents: frontends.attachedAgents(),
     pendingReplyCount: replyOutbox.size,
+    grokProxyReady: grok.proxyListening,
     projectId: DAEMON_PROJECT_ID,
   };
 }
@@ -1757,6 +2082,7 @@ function shutdown(reason: string) {
   controlServer?.stop();
   controlServer = null;
   codex.stop();
+  grok.stop();
   removePidFile();
   removeStatusFile();
   process.exit(0);
@@ -1824,4 +2150,12 @@ try {
 }
 pendingRequestsTimer = setInterval(checkExpiredRequests, PENDING_REQUEST_CHECK_INTERVAL_MS);
 startupComplete = true;
+// Independent of Codex on purpose: the Grok socket only has to exist
+// before `abg grok` points a TUI at it, and a Codex app-server that
+// fails to start is no reason for the Grok side to be unreachable.
+try {
+  grok.start();
+} catch (err: unknown) {
+  log(`Failed to open the Grok proxy socket: ${describeError(err)}`);
+}
 void bootCodex();

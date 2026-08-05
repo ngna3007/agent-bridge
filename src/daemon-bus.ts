@@ -82,7 +82,11 @@ export function senderFacingText(outcome: RouteOutcome): string | null {
 
 /** The slice of `MessageBus` the routing wrapper actually uses. */
 export interface RoutableBus {
-  route(envelope: BridgeMessage, now: number): Promise<RouteResult>;
+  route(
+    envelope: BridgeMessage,
+    now: number,
+    opts?: { requireReply?: boolean },
+  ): Promise<RouteResult>;
 }
 
 export interface RouteDeps {
@@ -104,10 +108,11 @@ export interface RouteDeps {
 export async function routeThroughBus(
   deps: RouteDeps,
   envelope: BridgeMessage,
+  opts: { requireReply?: boolean } = {},
 ): Promise<RouteOutcome> {
   const { bus, log } = deps;
   try {
-    const outcome = await bus.route(envelope, (deps.now ?? Date.now)());
+    const outcome = await bus.route(envelope, (deps.now ?? Date.now)(), opts);
     if (outcome.rejected.length === 0) return { status: "delivered", accepted: outcome.accepted };
     log(
       `Message ${envelope.id} rejected by ${outcome.rejected.map((r) => r.agent).join(", ")}`,

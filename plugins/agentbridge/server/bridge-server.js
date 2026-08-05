@@ -13757,6 +13757,9 @@ class StateDirResolver {
   get codexWrapperLogFile() {
     return join(this.stateDir, "codex-wrapper.log");
   }
+  get grokLeaderSocket() {
+    return join(this.stateDir, "grok.sock");
+  }
   get killedFile() {
     return join(this.stateDir, "killed");
   }
@@ -14137,7 +14140,7 @@ class ClaudeAdapter extends EventEmitter {
 import { EventEmitter as EventEmitter2 } from "events";
 
 // src/frontend-registry.ts
-var FRONTEND_AGENTS = ["claude", "grok"];
+var FRONTEND_AGENTS = ["claude"];
 var DEFAULT_FRONTEND_AGENT = "claude";
 function parseFrontendAgent(raw) {
   if (raw === undefined || raw === null)
@@ -14590,9 +14593,11 @@ class DaemonLifecycle {
   get controlWsUrl() {
     return `ws://127.0.0.1:${this.controlPort}/ws`;
   }
-  async ensureRunning() {
+  async ensureRunning(opts = {}) {
+    const readiness = opts.readiness ?? "codex";
+    const waitFor = (maxRetries, delayMs) => readiness === "health" ? this.waitForHealthy(maxRetries, delayMs) : this.waitForReady(maxRetries, delayMs);
     if (await this.isHealthy()) {
-      await this.waitForReady();
+      await waitFor();
       return;
     }
     const existingPid = this.readPid();
@@ -14600,7 +14605,7 @@ class DaemonLifecycle {
       if (isProcessAlive(existingPid)) {
         if (this.isDaemonProcess(existingPid)) {
           try {
-            await this.waitForReady(12, 250);
+            await waitFor(12, 250);
             return;
           } catch {
             throw new Error(`Found existing daemon process ${existingPid}, but control port ${this.controlPort} never became ready.`);
@@ -14613,7 +14618,7 @@ class DaemonLifecycle {
     const lockAcquired = this.acquireLock();
     if (!lockAcquired) {
       this.log("Another process is starting the daemon, waiting for readiness...");
-      await this.waitForReady();
+      await waitFor();
       return;
     }
     try {
@@ -14622,7 +14627,7 @@ class DaemonLifecycle {
         throw new Error(describeControlPortConflict(this.controlPort, this.projectId, holder));
       }
       this.launch();
-      await this.waitForReady();
+      await waitFor();
     } finally {
       this.releaseLock();
     }
@@ -14667,6 +14672,21 @@ class DaemonLifecycle {
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
     throw new Error(`Timed out waiting for AgentBridge daemon health on ${this.healthUrl}`);
+  }
+  async isGrokProxyReady() {
+    const probe = await this.probe(this.healthUrl);
+    if (probe === null || !probe.ok || !this.acceptsDaemon(probe.body))
+      return false;
+    const body = probe.body;
+    return typeof body === "object" && body !== null && body.grokProxyReady === true;
+  }
+  async waitForGrokProxy(maxRetries = 20, delayMs = 250) {
+    for (let attempt = 0;attempt < maxRetries; attempt++) {
+      if (await this.isGrokProxyReady())
+        return true;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+    return false;
   }
   async isReady() {
     const probe = await this.probe(this.readyUrl);

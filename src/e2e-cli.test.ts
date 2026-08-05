@@ -178,7 +178,10 @@ class CliE2EHarness {
     extraEnv: NodeJS.ProcessEnv,
     timeoutMs = 20000,
   ): Promise<RunResult> {
-    if (args[0] === "codex") {
+    // `codex` and `grok` both start the daemon before launching their
+    // TUI, and the daemon cannot bind a port this harness is still
+    // holding open to reserve it.
+    if (args[0] === "codex" || args[0] === "grok") {
       await this.releaseDaemonPortReservations();
     }
 
@@ -193,7 +196,10 @@ class CliE2EHarness {
   }
 
   async spawnCli(args: string[], extraEnv: NodeJS.ProcessEnv = {}): Promise<TrackedProcess> {
-    if (args[0] === "codex") {
+    // `codex` and `grok` both start the daemon before launching their
+    // TUI, and the daemon cannot bind a port this harness is still
+    // holding open to reserve it.
+    if (args[0] === "codex" || args[0] === "grok") {
       await this.releaseDaemonPortReservations();
     }
 
@@ -423,24 +429,76 @@ describe("E2E: CLI surface", () => {
     });
   });
 
-  test("agentbridge grok hands Grok its own identity", async () => {
-    // Grok loads our MCP server through Claude Code's plugin registry
-    // without any help from us, so the launcher's entire contribution is
-    // these two variables and the arguments passing through untouched.
-    // AGENTBRIDGE_AGENT is what keeps Grok out of Claude's slot; without
-    // it the two evict each other, since Claude is what every frontend
-    // was before 0.8.
+  test("agentbridge grok points the TUI at the daemon's leader socket", async () => {
+    // Grok is proxied now, not an MCP frontend: the launcher's whole
+    // contribution is `--leader-socket`, which is what puts the daemon
+    // between the TUI and the machine-wide leader. The bus variables it
+    // used to set are deliberately gone — a Grok that claims a frontend
+    // slot is the bug this replaced.
     await withHarness(async (harness) => {
       const result = await harness.runCli(["grok", "--model", "grok-code"]);
-
-      expect(result.code).toBe(0);
+            expect(result.code).toBe(0);
 
       const invocations = harness.readShimCalls("grok");
       expect(invocations.length).toBe(1);
-      expect(invocations[0]?.args).toEqual(["--model", "grok-code"]);
-      expect(invocations[0]?.env).toEqual({ active: "1", agent: "grok" });
+      expect(invocations[0]?.args).toEqual([
+        "--leader-socket",
+        join(harness.stateDir, "grok.sock"),
+        "--model",
+        "grok-code",
+      ]);
+      expect(invocations[0]?.env).toEqual({ active: null, agent: null });
     });
   });
+
+  test("agentbridge grok refuses a caller-chosen leader socket", async () => {
+    // Honouring it would produce a Grok with no bridge behind it, and the
+    // failure would be silent — no turn boundaries, no messages, no
+    // injection, and nothing on screen to say so. Overriding it would
+    // make the flag a lie. Neither: refuse, and launch nothing.
+    await withHarness(async (harness) => {
+      const result = await harness.runCli(["grok", "--leader-socket", "/tmp/mine.sock"]);
+
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("--leader-socket is owned by AgentBridge");
+      expect(harness.readShimCalls("grok")).toEqual([]);
+    });
+  });
+
+  test("agentbridge grok refuses to launch when the daemon owns no proxy socket", async () => {
+    // A daemon that predates the proxy — or whose `listen` failed — is
+    // healthy and answers `/readyz`, so `ensureRunning` is satisfied while
+    // nothing is bound. Launching Grok at that path hangs it on connect
+    // with no explanation, so the launcher checks and says what to do.
+    await withHarness(async (harness) => {
+      await harness.startManagedFakeDaemon();
+      rmSync(join(harness.stateDir, "grok.sock"), { force: true });
+
+      const result = await harness.runCli(["grok"]);
+
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("the bridge is not listening on");
+      expect(harness.readShimCalls("grok")).toEqual([]);
+    });
+    // The launcher waits out its full socket grace period before giving up.
+  }, 20_000);
+
+  test("agentbridge grok launches while the Codex app-server is not ready", async () => {
+    // `/readyz` reports the Codex app-server's bootstrap, which has
+    // nothing to do with whether Grok can work: Grok's leader is its own
+    // backend and the proxy socket is bound the moment the daemon is up.
+    // Gating the launcher on it would mean a machine with a broken or
+    // absent Codex install can never start Grok — in a bridge whose whole
+    // claim is that its agents are independent. So: health, not readiness.
+    await withHarness(async (harness) => {
+      const result = await harness.runCliWithEnv(["grok"], {
+        AGENTBRIDGE_FAKE_DAEMON_NEVER_READY: "1",
+      });
+
+      expect(result.code).toBe(0);
+      expect(harness.readShimCalls("grok")).not.toEqual([]);
+    });
+  }, 30_000);
 
   test("agentbridge grok clears the killed sentinel before launching", async () => {
     await withHarness(async (harness) => {
@@ -904,6 +962,10 @@ const appPort = Number.parseInt(process.env.CODEX_WS_PORT ?? "4500", 10);
 const proxyPort = Number.parseInt(process.env.CODEX_PROXY_PORT ?? "4501", 10);
 const launchLog = process.env.AGENTBRIDGE_FAKE_DAEMON_LAUNCH_LOG;
 const delayMs = Number.parseInt(process.env.AGENTBRIDGE_FAKE_DAEMON_DELAY_MS ?? "0", 10);
+// Stands in for a daemon whose Codex app-server never bootstrapped: the
+// process is up and healthy, \`/readyz\` says 503 forever. Everything that
+// does not depend on Codex has to keep working.
+const neverReady = process.env.AGENTBRIDGE_FAKE_DAEMON_NEVER_READY === "1";
 
 if (!stateDir || !launchLog) {
   console.error("Fake daemon requires AGENTBRIDGE_STATE_DIR and AGENTBRIDGE_FAKE_DAEMON_LAUNCH_LOG");
@@ -913,6 +975,11 @@ if (!stateDir || !launchLog) {
 const pidFile = join(stateDir, "daemon.pid");
 const statusFile = join(stateDir, "status.json");
 const killedFile = join(stateDir, "killed");
+// The real daemon owns the Grok proxy socket, and \`abg grok\` refuses to
+// launch until it exists — a daemon predating the proxy is healthy
+// without one, and pointing Grok at a socket nobody is listening on just
+// hangs. The stand-in has to honour the same contract.
+const grokSocket = join(stateDir, "grok.sock");
 const proxyUrl = \`ws://127.0.0.1:\${proxyPort}\`;
 const appServerUrl = \`ws://127.0.0.1:\${appPort}\`;
 
@@ -929,8 +996,19 @@ if (delayMs > 0) {
 
 writeFileSync(pidFile, \`\${process.pid}\\n\`, "utf-8");
 
+try { unlinkSync(grokSocket); } catch {}
+const grokProxy = Bun.listen({
+  unix: grokSocket,
+  socket: { data() {}, open() {}, close() {} },
+});
+
 function currentStatus() {
   return {
+    // The launcher asks the daemon whether the proxy socket is bound
+    // rather than connecting to find out — a connect-probe would claim
+    // the one TUI slot. The stand-in binds it above; the file check is
+    // how a test takes it away again.
+    grokProxyReady: existsSync(grokSocket),
     bridgeReady: false,
     tuiConnected: false,
     threadId: null,
@@ -956,6 +1034,8 @@ function cleanupFiles() {
   cleanedUp = true;
   try { unlinkSync(pidFile); } catch {}
   try { unlinkSync(statusFile); } catch {}
+  try { grokProxy.stop(true); } catch {}
+  try { unlinkSync(grokSocket); } catch {}
 }
 
 const server = Bun.serve({
@@ -963,7 +1043,11 @@ const server = Bun.serve({
   hostname: "127.0.0.1",
   fetch(req, serverInstance) {
     const url = new URL(req.url);
-    if (url.pathname === "/healthz" || url.pathname === "/readyz") {
+    if (url.pathname === "/readyz") {
+      return Response.json(currentStatus(), { status: neverReady ? 503 : 200 });
+    }
+
+    if (url.pathname === "/healthz") {
       return Response.json(currentStatus());
     }
 

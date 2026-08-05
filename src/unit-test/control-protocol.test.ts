@@ -6,7 +6,7 @@ describe("control protocol shape", () => {
   test("claude_connect carries a protocol version", () => {
     const msg: ControlClientMessage = {
       type: "claude_connect",
-      agent: "grok",
+      agent: "claude",
       protocolVersion: PROTOCOL_VERSION,
     };
     expect(msg.protocolVersion).toBe(1);

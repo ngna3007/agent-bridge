@@ -116,7 +116,7 @@ describe("E2E: daemon lifecycle + reconnect", () => {
     await client.disconnect();
   }, 10000);
 
-  test("sendReply fails gracefully when Codex TUI is not connected", async () => {
+  test("sendReply holds the message when the Codex TUI is not connected", async () => {
     const client = new DaemonClient(WS_URL);
     await client.connect();
     client.attachClaude();
@@ -131,9 +131,37 @@ describe("E2E: daemon lifecycle + reconnect", () => {
       timestamp: Date.now(),
     });
 
-    // Should fail because no Codex TUI is connected
+    // Held, not refused. The daemon used to reject the send outright
+    // when Codex had no thread — a readiness rule sitting in front of
+    // routing, where it also refused messages addressed to agents that
+    // have nothing to do with Codex. Codex's own transport already
+    // knows how to hold one: the outbox keeps it and re-injects at the
+    // next thread, and the sender is told so.
+    expect(result.success).toBe(true);
+    expect(result.note ?? "").toContain("Held for delivery");
+
+    await client.disconnect();
+  }, 10000);
+
+  test("require_reply is refused on a kind a mailbox may shed", async () => {
+    // Only `reply` refuses a full mailbox; every other kind sheds under
+    // pressure and still reports `accepted`. Accepting `require_reply` on
+    // one of those would record an obligation against a message that can
+    // stop existing, owed by nobody.
+    const client = new DaemonClient(WS_URL);
+    await client.connect();
+    client.attachClaude();
+    await new Promise((r) => setTimeout(r, 200));
+
+    const result = await client.sendReply({
+      id: "test_require_status",
+      from: "claude", to: "codex", kind: "status",
+      content: "working on it",
+      timestamp: Date.now(),
+    }, true);
+
     expect(result.success).toBe(false);
-    expect(result.error).toBeTruthy();
+    expect(result.error ?? "").toContain("require_reply is only available on reply-kind");
 
     await client.disconnect();
   }, 10000);

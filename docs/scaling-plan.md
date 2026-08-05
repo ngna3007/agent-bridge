@@ -519,6 +519,10 @@ interactive TUI only joins a leader when told to.
 
 ### 4.1a Grok leader experiment (2026-07-30, grok 0.2.114, WSL2)
 
+> **Superseded as a design, kept as evidence — see §4.1c.** What shipped is a
+> man-in-the-middle proxy, not the side-car client this section proposes. The
+> measurements below still hold; the design conclusions drawn from them do not.
+
 Run because the paragraph above gated the whole Grok target on an untested
 claim. Two experiments; scripts in the session scratchpad, worth promoting to
 `src/live-test/` before any Grok code lands.
@@ -694,6 +698,42 @@ outbound half is nearly free.
 protocol. Amp data is mirror-sourced (ampcode.com unreachable). The official MCP
 client-capability matrix page was deleted 2026-05-27, so third-party
 sampling/elicitation claims may have drifted. Grok pricing tiers unconfirmed.
+
+---
+
+### 4.1c Grok ships as a proxy, not a side-car (2026-08-05, grok 0.2.118)
+
+§4.1a and §4.1b together described a side-car: a second ACP client on the
+leader for inbound, and Grok's inherited MCP tools for outbound. That is not
+what shipped. Two things changed the call.
+
+**Measurement.** `use_leader` is gone — leader mode is the default in 0.2.118,
+and a leader was running on this machine with no config entry at all, so the
+"needs `[cli] use_leader = true`" precondition repeated throughout Part 4 is
+dead. The leader socket is also not newline-delimited JSON-RPC: frames are
+`[u32 big-endian length][JSON]`, and ACP travels inside them as
+`{"type":"acp","payload":"<ACP JSON-RPC, JSON-encoded as a string>"}` — two
+parses to read one message. See `src/grok-leader-protocol.ts`.
+
+**Design.** `grok --leader-socket <path>` is honored by real clients, which
+makes a man-in-the-middle possible: the daemon owns a socket, `abg grok`
+launches the TUI against it, and every frame is forwarded to the real
+`~/.grok/leader.sock` untouched. That is the same topology the Codex side
+already has, and it is what buys the same behavior — the daemon sees the
+human's `session/prompt` *and* the response that closes it, so a turn boundary
+is observed rather than inferred from an idle timer, and there is no cwd
+matching or `session/list` discovery to get wrong.
+
+The MITM leg only observes. Injection goes out over a second, dedicated leader
+connection, which avoids rewriting JSON-RPC ids on a stream carrying a live
+human session. The injector ignores `session/update`, or every update the
+leader fans to both legs would be counted twice.
+
+**Consequence for §4.1b:** Grok no longer attaches as an MCP frontend at all.
+`FrontendAgent` is `"claude"` alone again, `abg grok` sets no
+`AGENTBRIDGE_ACTIVE` / `AGENTBRIDGE_AGENT`, and it clears any it inherited —
+a Grok launched from a terminal under `abg claude` would otherwise have its
+MCP child evict the real Claude from its slot.
 
 ---
 

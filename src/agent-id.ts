@@ -24,3 +24,8 @@ export function isAgentId(v: unknown): v is AgentId {
 export function parseAgentId(v: string): AgentId | null {
   return isAgentId(v) ? v : null;
 }
+
+/** How an agent is named in text an agent or a human reads. */
+export function agentLabel(agent: AgentId): string {
+  return { claude: "Claude", grok: "Grok", codex: "Codex" }[agent];
+}

@@ -2,6 +2,16 @@ import type { AgentId } from "./agent-id";
 
 export interface PendingRequest {
   requester: AgentId;
+  /**
+   * Who owes the answer.
+   *
+   * Not decorative: with more than one proxied agent, a `[REPLY]` from
+   * Grok routed to Claude would otherwise satisfy — and silence the
+   * expiry notice for — a request Claude was still waiting on *Codex*
+   * to answer. It is also the only thing that lets the expiry notice
+   * name the agent that went quiet instead of guessing "Codex".
+   */
+  responder: AgentId;
   /** The canonical id of the message that asked for a reply. */
   messageId: string;
   at: number;
@@ -26,13 +36,36 @@ export class PendingRequests {
     this.requests.push(req);
   }
 
-  satisfy(inReplyTo: string | undefined, recipients: AgentId[]): PendingRequest[] {
+  /**
+   * Clear the requests `responder` just answered.
+   *
+   * `responder` scopes the whole search, including the `inReplyTo` match:
+   * an id names a request, but only the agent that was asked can answer
+   * it.
+   *
+   * A correlation, when there is one, is the *only* thing that matches.
+   * The delivery fallback below is broad by design — any reply reaching
+   * the requester closes everything that requester is owed — and running
+   * both rules together made the precise case behave like the imprecise
+   * one: two questions outstanding to the same agent, an answer naming
+   * the first, and the second silently marked answered too. Its expiry
+   * notice, the only report that it went unanswered, never fired. So:
+   * correlation when the agent gave one, delivery only when it did not.
+   */
+  satisfy(
+    inReplyTo: string | undefined,
+    recipients: AgentId[],
+    responder: AgentId,
+  ): PendingRequest[] {
     const satisfied: PendingRequest[] = [];
     for (let i = this.requests.length - 1; i >= 0; i--) {
       const req = this.requests[i];
-      const named = inReplyTo !== undefined && inReplyTo === req.messageId;
-      const routed = recipients.includes(req.requester);
-      if (!named && !routed) continue;
+      if (req.responder !== responder) continue;
+      const matched =
+        inReplyTo !== undefined
+          ? inReplyTo === req.messageId
+          : recipients.includes(req.requester);
+      if (!matched) continue;
       this.requests.splice(i, 1);
       satisfied.push(req);
     }
