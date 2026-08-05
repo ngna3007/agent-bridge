@@ -14593,9 +14593,11 @@ class DaemonLifecycle {
   get controlWsUrl() {
     return `ws://127.0.0.1:${this.controlPort}/ws`;
   }
-  async ensureRunning() {
+  async ensureRunning(opts = {}) {
+    const readiness = opts.readiness ?? "codex";
+    const waitFor = (maxRetries, delayMs) => readiness === "health" ? this.waitForHealthy(maxRetries, delayMs) : this.waitForReady(maxRetries, delayMs);
     if (await this.isHealthy()) {
-      await this.waitForReady();
+      await waitFor();
       return;
     }
     const existingPid = this.readPid();
@@ -14603,7 +14605,7 @@ class DaemonLifecycle {
       if (isProcessAlive(existingPid)) {
         if (this.isDaemonProcess(existingPid)) {
           try {
-            await this.waitForReady(12, 250);
+            await waitFor(12, 250);
             return;
           } catch {
             throw new Error(`Found existing daemon process ${existingPid}, but control port ${this.controlPort} never became ready.`);
@@ -14616,7 +14618,7 @@ class DaemonLifecycle {
     const lockAcquired = this.acquireLock();
     if (!lockAcquired) {
       this.log("Another process is starting the daemon, waiting for readiness...");
-      await this.waitForReady();
+      await waitFor();
       return;
     }
     try {
@@ -14625,7 +14627,7 @@ class DaemonLifecycle {
         throw new Error(describeControlPortConflict(this.controlPort, this.projectId, holder));
       }
       this.launch();
-      await this.waitForReady();
+      await waitFor();
     } finally {
       this.releaseLock();
     }

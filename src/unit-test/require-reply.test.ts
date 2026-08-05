@@ -43,6 +43,30 @@ describe("requireReply correlation", () => {
     expect(p.satisfy(undefined, ["claude"], "codex")).toHaveLength(1);
   });
 
+  test("a named reply satisfies only the request it names", () => {
+    // Two questions outstanding to the same agent, an answer naming the
+    // first. Running the delivery fallback alongside the correlation
+    // closed the second one too — and its expiry notice, the only report
+    // that it went unanswered, never fired.
+    const p = new PendingRequests();
+    p.add({ requester: "claude", responder: "grok", messageId: "q1", at: 0 });
+    p.add({ requester: "claude", responder: "grok", messageId: "q2", at: 0 });
+
+    expect(p.satisfy("q1", ["claude"], "grok").map((r) => r.messageId)).toEqual(["q1"]);
+    expect(p.size).toBe(1);
+    expect(p.satisfy("q2", ["claude"], "grok").map((r) => r.messageId)).toEqual(["q2"]);
+  });
+
+  test("a reply naming an unknown id satisfies nothing", () => {
+    // The agent said what it was answering and it was not this. Falling
+    // back to "delivered to the requester, close everything" would
+    // discard a request on the strength of a correlation that missed.
+    const p = new PendingRequests();
+    p.add({ requester: "claude", responder: "grok", messageId: "q1", at: 0 });
+    expect(p.satisfy("nope", ["claude"], "grok")).toHaveLength(0);
+    expect(p.size).toBe(1);
+  });
+
   test("an expired request is reported, not silently forgotten", () => {
     const p = new PendingRequests();
     p.add({ requester: "claude", responder: "codex", messageId: "q1", at: 0 });

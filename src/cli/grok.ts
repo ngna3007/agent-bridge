@@ -1,13 +1,34 @@
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { connect } from "node:net";
 import { DaemonLifecycle } from "../daemon-lifecycle";
 import { StateDirResolver } from "../state-dir";
 
-/** Poll for the daemon's proxy socket. Returns false once `timeoutMs` is up. */
+/**
+ * Whether something is listening on `path` right now.
+ *
+ * Deliberately a connect and not an `existsSync`. A unix socket file
+ * outlives the process that bound it — a daemon killed with SIGKILL
+ * leaves one behind — and the stale file is exactly the case this check
+ * exists to catch: the TUI would launch, connect to nothing, and hang
+ * with no explanation. Only a completed connection proves an owner.
+ */
+function socketAccepts(path: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const probe = connect(path);
+    const settle = (answer: boolean) => {
+      probe.destroy();
+      resolve(answer);
+    };
+    probe.once("connect", () => settle(true));
+    probe.once("error", () => settle(false));
+  });
+}
+
+/** Poll until the daemon's proxy socket accepts. False once `timeoutMs` is up. */
 async function waitForSocket(path: string, timeoutMs: number): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    if (existsSync(path)) return true;
+    if (await socketAccepts(path)) return true;
     if (Date.now() >= deadline) return false;
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
@@ -54,13 +75,19 @@ export async function runGrok(args: string[]) {
   lifecycle.clearKilled();
   // The daemon owns the socket we are about to hand Grok, so it has to
   // be up *before* the TUI tries to connect — not merely eventually.
-  await lifecycle.ensureRunning();
+  //
+  // `readiness: "health"` because `/readyz` reports the Codex
+  // app-server's bootstrap, which has nothing to do with whether Grok can
+  // work. Gating here on it would mean a machine with a broken or absent
+  // Codex install can never start Grok, in a bridge whose whole claim is
+  // that its agents are independent.
+  await lifecycle.ensureRunning({ readiness: "health" });
 
-  // `ensureRunning` is satisfied by a *healthy* daemon, and a daemon
-  // started before this feature existed — or one whose `listen` failed —
-  // is healthy without owning this socket. Grok would then connect to
-  // nothing and hang. Wait for the socket to appear, and if it does not,
-  // say what to do rather than handing the failure to the TUI.
+  // A healthy daemon is not the same as a daemon owning this socket: one
+  // started before this feature existed, or one whose `listen` failed,
+  // is healthy without it. Grok would then connect to nothing and hang.
+  // Wait for a listener, and if none appears, say what to do rather than
+  // handing the failure to the TUI.
   if (!(await waitForSocket(stateDir.grokLeaderSocket, 5_000))) {
     console.error(`Error: the bridge is not listening on ${stateDir.grokLeaderSocket}.`);
     console.error("Run `abg kill` to restart the daemon, then try again.");

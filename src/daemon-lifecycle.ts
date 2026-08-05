@@ -89,10 +89,27 @@ export class DaemonLifecycle {
     return `ws://127.0.0.1:${this.controlPort}/ws`;
   }
 
-  /** Ensure daemon is running: check health, check pid, start if needed. */
-  async ensureRunning(): Promise<void> {
+  /**
+   * Ensure daemon is running: check health, check pid, start if needed.
+   *
+   * `readiness` says what "running enough" means for the caller.
+   * `"codex"` — the default and what `/readyz` reports — additionally
+   * waits for the Codex app-server to bootstrap. That is the right gate
+   * for `abg claude` and `abg codex`, and the wrong one for every other
+   * agent: `abg grok` needs the daemon and its own proxy socket, and a
+   * machine with no working Codex install would otherwise never get a
+   * Grok session at all. `"health"` waits only for this project's daemon
+   * to answer.
+   */
+  async ensureRunning(opts: { readiness?: "codex" | "health" } = {}): Promise<void> {
+    const readiness = opts.readiness ?? "codex";
+    const waitFor = (maxRetries?: number, delayMs?: number) =>
+      readiness === "health"
+        ? this.waitForHealthy(maxRetries, delayMs)
+        : this.waitForReady(maxRetries, delayMs);
+
     if (await this.isHealthy()) {
-      await this.waitForReady();
+      await waitFor();
       return;
     }
 
@@ -102,7 +119,7 @@ export class DaemonLifecycle {
         // Verify the live process is actually our daemon, not an OS-reused PID
         if (this.isDaemonProcess(existingPid)) {
           try {
-            await this.waitForReady(12, 250);
+            await waitFor(12, 250);
             return;
           } catch {
             throw new Error(
@@ -121,7 +138,7 @@ export class DaemonLifecycle {
     if (!lockAcquired) {
       // Another process is launching the daemon — wait for it
       this.log("Another process is starting the daemon, waiting for readiness...");
-      await this.waitForReady();
+      await waitFor();
       return;
     }
 
@@ -135,7 +152,7 @@ export class DaemonLifecycle {
         throw new Error(describeControlPortConflict(this.controlPort, this.projectId, holder));
       }
       this.launch();
-      await this.waitForReady();
+      await waitFor();
     } finally {
       this.releaseLock();
     }

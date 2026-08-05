@@ -15,6 +15,10 @@ import {
 } from "../grok-leader-protocol";
 import { isJsonRpcNotification, isJsonRpcRequest, isJsonRpcResponse, updateText } from "../grok-acp";
 
+/** The adapter's settle window under test, and long enough to wait it out. */
+const SETTLE_MS = 20;
+const settle = () => new Promise((resolve) => setTimeout(resolve, SETTLE_MS * 4));
+
 const SID = "019fd240-4ae5-7440-a8ee-ae7cb8e75638";
 const OTHER_SID = "019fd241-29aa-76b0-9b92-da4516da1985";
 
@@ -91,6 +95,11 @@ function harness() {
   const upstreams: FakeConnection[] = [];
   const adapter = new GrokAdapter({
     socketPath: "/tmp/does-not-exist.sock",
+    // An injected turn ends after the proxy leg goes quiet, so the tests
+    // that drive one have to outlast that window. Short, not zero: zero
+    // would make the settle fire between two synchronous deliveries and
+    // hide the very race it exists to close.
+    injectedTurnSettleMs: SETTLE_MS,
     createServer: () => server,
     createUpstream: () => {
       const conn = new FakeConnection();
@@ -420,6 +429,9 @@ describe("GrokAdapter injection", () => {
     expect(rejections).toHaveLength(1);
     expect(rejections[0].messageId).toBe("m1");
     expect(rejections[0].reason).toContain("balance exhausted");
+    // The leader answered, so nothing ran. That is a fact, and the
+    // sender is allowed to act on it by resending.
+    expect(rejections[0].delivery).toBe("rejected");
   });
 
   test("a successful prompt raises no rejection", () => {
@@ -436,7 +448,7 @@ describe("GrokAdapter injection", () => {
     expect(rejections).toHaveLength(0);
   });
 
-  test("an injected turn's answer is flushed when the leader answers our prompt", () => {
+  test("an injected turn's answer is flushed when the leader answers our prompt", async () => {
     // Nothing on the proxy leg can end this turn: the prompt came from
     // here, so the TUI has no `session/prompt` of its own outstanding.
     // Without this boundary the answer sits buffered until the human
@@ -455,12 +467,68 @@ describe("GrokAdapter injection", () => {
     expect(seen).toHaveLength(0);
 
     injector.deliverAcp({ jsonrpc: "2.0", id: promptId, result: { stopReason: "end_turn" } });
+    await settle();
 
     expect(seen).toHaveLength(1);
     expect(seen[0]?.content).toBe("four");
     // And it says whose turn it was, so the daemon can route the answer
     // back to the requester instead of broadcasting it.
     expect(seen[0]?.respondingTo).toEqual({ messageId: "m1", requester: "claude", text: "q" });
+  });
+
+  test("an answer that beats its own prose across the sockets is not lost", async () => {
+    // The two facts about one injected turn arrive on two sockets with
+    // no ordering between them: the prose fans out on the proxy leg, the
+    // "turn over" response comes back on the injector leg. When the
+    // response won, the turn used to end against an empty buffer — the
+    // correlation was discarded, and the prose that landed a moment
+    // later sat there with no boundary and no `respondingTo`, so the
+    // `require_reply` it answered could never be satisfied.
+    const { adapter, tui, upstreams, leader } = harness();
+    tuiPrompts(tui, 1);
+    leader.deliverAcp({ jsonrpc: "2.0", id: 1, result: {} });
+
+    const seen: GrokProseIngress[] = [];
+    adapter.on("agentMessage", (m: GrokProseIngress) => seen.push(m));
+    adapter.injectMessage("what is 2+2", { messageId: "m1", requester: "claude", text: "q" });
+
+    const injector = upstreams[1]!;
+    const promptId = injector.acpSent().find((m) => m.method === "session/prompt").id;
+    // Response first, prose second — the ordering that used to lose it.
+    injector.deliverAcp({ jsonrpc: "2.0", id: promptId, result: { stopReason: "end_turn" } });
+    chunk(leader, "four");
+    expect(seen).toHaveLength(0);
+
+    await settle();
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.content).toBe("four");
+    expect(seen[0]?.respondingTo).toEqual({ messageId: "m1", requester: "claude", text: "q" });
+  });
+
+  test("prose still streaming holds the injected turn open", async () => {
+    const { adapter, tui, upstreams, leader } = harness();
+    tuiPrompts(tui, 1);
+    leader.deliverAcp({ jsonrpc: "2.0", id: 1, result: {} });
+
+    const seen: GrokProseIngress[] = [];
+    adapter.on("agentMessage", (m: GrokProseIngress) => seen.push(m));
+    adapter.injectMessage("count", { messageId: "m1", requester: "claude", text: "q" });
+
+    const injector = upstreams[1]!;
+    const promptId = injector.acpSent().find((m) => m.method === "session/prompt").id;
+    injector.deliverAcp({ jsonrpc: "2.0", id: promptId, result: { stopReason: "end_turn" } });
+
+    // Each chunk restarts the settle window, so a slow stream cannot be
+    // cut in half by a boundary that already arrived.
+    for (const part of ["one ", "two ", "three"]) {
+      await new Promise((resolve) => setTimeout(resolve, SETTLE_MS / 2));
+      chunk(leader, part);
+    }
+    expect(seen).toHaveLength(0);
+
+    await settle();
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.content).toBe("one two three");
   });
 
   test("a turn the human started is not attributed to anyone", () => {
@@ -475,10 +543,14 @@ describe("GrokAdapter injection", () => {
     expect(seen[0]?.respondingTo).toBeNull();
   });
 
-  test("a lost injection connection fails its in-flight prompts", () => {
+  test("a lost injection connection reports its in-flight prompts as unknown", () => {
     // The transport self-acks, so the mailbox copy is already gone by the
     // time the prompt is on the wire. A connection that dies mid-flight
     // would otherwise be indistinguishable from a delivery that worked.
+    //
+    // Reported as `unknown`, not rejected: the bytes were written, and
+    // the leader may well have run the turn. Calling this a refusal
+    // would license a resend that runs the same turn twice.
     const { adapter, tui, upstreams } = harness();
     tuiPrompts(tui, 1);
     const rejections: any[] = [];
@@ -490,6 +562,7 @@ describe("GrokAdapter injection", () => {
     expect(rejections).toHaveLength(1);
     expect(rejections[0].messageId).toBe("m1");
     expect(rejections[0].reason).toContain("closed before the prompt was answered");
+    expect(rejections[0].delivery).toBe("unknown");
   });
 
   test("a close after the answer arrived fails nothing", () => {

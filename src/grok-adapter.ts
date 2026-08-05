@@ -40,12 +40,33 @@ export interface GrokProseIngress {
   respondingTo: GrokInjectionCorrelation | null;
 }
 
-/** Why an injected turn did not run. */
+/**
+ * How long the proxy leg must be quiet before an injected turn is over.
+ *
+ * Covers the skew between two sockets carrying one turn — see
+ * `armInjectedCompletion`. Long enough that ordinary scheduling jitter
+ * cannot beat it, short enough to be invisible next to a model turn.
+ */
+const INJECTED_TURN_SETTLE_MS = 250;
+
+/**
+ * What became of an injected prompt that did not visibly run.
+ *
+ * - `rejected` — the leader answered with a JSON-RPC error. The prompt
+ *   did not run and Grok never saw it. Safe to say so, safe to resend.
+ * - `unknown` — the connection died with the prompt in flight. The bytes
+ *   were written; whether the leader read and ran them is not knowable
+ *   from here. A resend may duplicate whatever the turn already did.
+ */
+export type GrokInjectionDelivery = "rejected" | "unknown";
+
+/** Why an injected turn did not visibly run. */
 export interface GrokInjectionRejection {
   messageId: string;
   requester: string;
   text: string;
   reason: string;
+  delivery: GrokInjectionDelivery;
 }
 
 export interface GrokInjectionCorrelation {
@@ -77,6 +98,11 @@ export interface GrokAdapterOptions {
   /** The real leader this proxy forwards to. Defaults to `~/.grok/leader.sock`. */
   upstreamPath?: string;
   logFile?: string;
+  /**
+   * How long to wait for the proxy leg to go quiet before closing an
+   * injected turn. See `armInjectedCompletion`. Injected by tests.
+   */
+  injectedTurnSettleMs?: number;
   /** Injected by tests. */
   createServer?: () => ProxyServer;
   /** Injected by tests. Called once per TUI connection, plus once for injection. */
@@ -124,10 +150,21 @@ export class GrokAdapter extends EventEmitter {
   /** Ids of our own in-flight prompts, so their responses are recognised. */
   private readonly ourPrompts = new Set<number>();
 
+  /**
+   * An injected turn whose leader response has arrived, waiting for the
+   * proxy leg to finish streaming it. See `armInjectedCompletion`.
+   */
+  private injectedCompletion: {
+    correlation: GrokInjectionCorrelation | null;
+    reason: string;
+    timer: ReturnType<typeof setTimeout>;
+  } | null = null;
+
   private stopped = false;
 
   private readonly socketPath: string;
   private readonly upstreamPath: string;
+  private readonly settleMs: number;
   private readonly logFile: string | null;
   private readonly makeServer: () => ProxyServer;
   private readonly makeUpstream: () => LeaderConnection;
@@ -136,6 +173,7 @@ export class GrokAdapter extends EventEmitter {
     super();
     this.socketPath = options.socketPath;
     this.upstreamPath = options.upstreamPath ?? defaultLeaderSocket();
+    this.settleMs = options.injectedTurnSettleMs ?? INJECTED_TURN_SETTLE_MS;
     this.logFile = options.logFile ?? null;
     this.makeServer =
       options.createServer ??
@@ -180,6 +218,7 @@ export class GrokAdapter extends EventEmitter {
 
   stop(): void {
     this.stopped = true;
+    this.takeInjectedCompletion();
     this.tui?.close();
     this.injector?.close();
     this.server?.close();
@@ -388,6 +427,9 @@ export class GrokAdapter extends EventEmitter {
     if (text === null) return;
     this.beginTurn();
     this.chunks.push(text);
+    // The leader may already have told us this turn is over on the other
+    // socket. More of it just arrived, so it is not.
+    this.rearmInjectedCompletion();
   }
 
   // ── The injection leg ──────────────────────────────────────
@@ -453,25 +495,93 @@ export class GrokAdapter extends EventEmitter {
     const correlation = this.injectionCorrelations.get(acp.id) ?? null;
     this.injectionCorrelations.delete(acp.id);
     if (!acp.error) {
-      this.flush("the leader answered our injected prompt", correlation);
+      this.armInjectedCompletion("the leader answered our injected prompt", correlation);
       return;
     }
     const reason = acp.error.message || "Grok refused the prompt";
     this.log(`Injection rejected: ${reason}`);
     if (correlation) {
-      this.emit("injectionRejected", { ...correlation, reason } satisfies GrokInjectionRejection);
+      this.emit("injectionRejected", {
+        ...correlation,
+        reason,
+        delivery: "rejected",
+      } satisfies GrokInjectionRejection);
     }
   }
 
   /**
-   * Fail every prompt still in flight when the injection connection dies.
+   * Close an injected turn once the prose for it has stopped arriving.
+   *
+   * The two facts about one turn reach the bridge on two different
+   * sockets: the prose streams down the proxy leg as `session/update`
+   * fan-out, and the "this turn is over" response comes back on the
+   * injector leg. Nothing orders one socket against the other. Flushing
+   * the moment the response landed therefore raced the stream it was
+   * describing — the response could win, `flush` would find an empty
+   * buffer, and the prose that arrived a moment later sat in `chunks`
+   * with its correlation already discarded: no turn boundary, no
+   * `respondingTo`, and a `require_reply` that could never be satisfied.
+   *
+   * So the response arms a settle window instead of ending the turn, and
+   * every chunk that arrives re-arms it. The turn ends when the leader's
+   * verdict has landed *and* the proxy leg has been quiet for
+   * `settleMs`. The cost is that an injected turn's answer reaches the
+   * bus `settleMs` late; the alternative is losing it.
+   */
+  private armInjectedCompletion(reason: string, correlation: GrokInjectionCorrelation | null): void {
+    // A second completion while one is pending means two injected turns
+    // ran back to back. The older one's prose is already complete —
+    // whatever is in the buffer belongs to it — so close it now rather
+    // than letting the new turn's settle window claim it.
+    if (this.injectedCompletion) this.settleInjectedCompletion();
+    this.injectedCompletion = {
+      correlation,
+      reason,
+      timer: setTimeout(() => this.settleInjectedCompletion(), this.settleMs),
+    };
+    this.injectedCompletion.timer.unref?.();
+  }
+
+  /** Restart the settle window because more of the turn just arrived. */
+  private rearmInjectedCompletion(): void {
+    const pending = this.injectedCompletion;
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    pending.timer = setTimeout(() => this.settleInjectedCompletion(), this.settleMs);
+    pending.timer.unref?.();
+  }
+
+  /** End the injected turn the settle window was holding open. */
+  private settleInjectedCompletion(): void {
+    const pending = this.takeInjectedCompletion();
+    if (!pending) return;
+    this.flush(pending.reason, pending.correlation);
+  }
+
+  /** Disarm the settle window and hand back what it was holding. */
+  private takeInjectedCompletion() {
+    const pending = this.injectedCompletion;
+    if (!pending) return null;
+    clearTimeout(pending.timer);
+    this.injectedCompletion = null;
+    return pending;
+  }
+
+  /**
+   * Report every prompt still in flight when the injection connection dies.
    *
    * The transport self-acks (`acknowledgementMode: "none"`), so by the
    * time a prompt is on this connection the mailbox copy is gone. A
    * connection that closes mid-flight is therefore indistinguishable, to
    * everything downstream, from a delivery that worked — the message is
-   * simply never mentioned again. Reporting each one as a rejection is
-   * what keeps that from being a silent loss.
+   * simply never mentioned again. Reporting each one is what keeps that
+   * from being a silent loss.
+   *
+   * Reported as `unknown`, never as rejected. The bytes were written
+   * before the socket died and the leader may well have run the prompt;
+   * saying "Grok never saw it" would be a claim this side cannot make,
+   * and acting on it — a resend — can run the same turn twice, with
+   * whatever file writes and tool calls that turn made.
    */
   private failInflightInjections(reason: string): void {
     if (this.ourPrompts.size === 0) return;
@@ -482,7 +592,11 @@ export class GrokAdapter extends EventEmitter {
       const correlation = this.injectionCorrelations.get(id);
       this.injectionCorrelations.delete(id);
       if (correlation) {
-        this.emit("injectionRejected", { ...correlation, reason } satisfies GrokInjectionRejection);
+        this.emit("injectionRejected", {
+          ...correlation,
+          reason,
+          delivery: "unknown",
+        } satisfies GrokInjectionRejection);
       }
     }
   }
@@ -504,6 +618,12 @@ export class GrokAdapter extends EventEmitter {
   }
 
   private flush(reason: string, respondingTo: GrokInjectionCorrelation | null = null): void {
+    // Whatever ends the turn takes ownership of a settle window still
+    // open on it — a TUI disconnect, or the next turn starting. Leaving
+    // the window armed would fire it against the *following* turn's
+    // buffer and attribute that turn to this injection.
+    const held = this.takeInjectedCompletion();
+    respondingTo ??= held?.correlation ?? null;
     if (!this.turnActive && this.chunks.length === 0) return;
     const content = this.chunks.join("");
     const senderRef = `${this.sessionIdValue ?? "grok"}#${this.turnSeq}`;

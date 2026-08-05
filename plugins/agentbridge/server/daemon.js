@@ -1560,6 +1560,8 @@ class LeaderFramer {
 }
 
 // src/grok-adapter.ts
+var INJECTED_TURN_SETTLE_MS = 250;
+
 class GrokAdapter extends EventEmitter2 {
   server = null;
   tui = null;
@@ -1572,9 +1574,11 @@ class GrokAdapter extends EventEmitter2 {
   nextRequestId = 1;
   injectionCorrelations = new Map;
   ourPrompts = new Set;
+  injectedCompletion = null;
   stopped = false;
   socketPath;
   upstreamPath;
+  settleMs;
   logFile;
   makeServer;
   makeUpstream;
@@ -1582,6 +1586,7 @@ class GrokAdapter extends EventEmitter2 {
     super();
     this.socketPath = options.socketPath;
     this.upstreamPath = options.upstreamPath ?? defaultLeaderSocket();
+    this.settleMs = options.injectedTurnSettleMs ?? INJECTED_TURN_SETTLE_MS;
     this.logFile = options.logFile ?? null;
     this.makeServer = options.createServer ?? (() => listenUnix(this.socketPath, (err) => this.log(`Cannot listen on ${this.socketPath}: ${describe(err)}`)));
     this.makeUpstream = options.createUpstream ?? (() => connectUnix(this.upstreamPath));
@@ -1606,6 +1611,7 @@ class GrokAdapter extends EventEmitter2 {
   }
   stop() {
     this.stopped = true;
+    this.takeInjectedCompletion();
     this.tui?.close();
     this.injector?.close();
     this.server?.close();
@@ -1750,6 +1756,7 @@ class GrokAdapter extends EventEmitter2 {
       return;
     this.beginTurn();
     this.chunks.push(text);
+    this.rearmInjectedCompletion();
   }
   ensureInjector() {
     if (this.injector !== null)
@@ -1797,14 +1804,50 @@ class GrokAdapter extends EventEmitter2 {
     const correlation = this.injectionCorrelations.get(acp.id) ?? null;
     this.injectionCorrelations.delete(acp.id);
     if (!acp.error) {
-      this.flush("the leader answered our injected prompt", correlation);
+      this.armInjectedCompletion("the leader answered our injected prompt", correlation);
       return;
     }
     const reason = acp.error.message || "Grok refused the prompt";
     this.log(`Injection rejected: ${reason}`);
     if (correlation) {
-      this.emit("injectionRejected", { ...correlation, reason });
+      this.emit("injectionRejected", {
+        ...correlation,
+        reason,
+        delivery: "rejected"
+      });
     }
+  }
+  armInjectedCompletion(reason, correlation) {
+    if (this.injectedCompletion)
+      this.settleInjectedCompletion();
+    this.injectedCompletion = {
+      correlation,
+      reason,
+      timer: setTimeout(() => this.settleInjectedCompletion(), this.settleMs)
+    };
+    this.injectedCompletion.timer.unref?.();
+  }
+  rearmInjectedCompletion() {
+    const pending = this.injectedCompletion;
+    if (!pending)
+      return;
+    clearTimeout(pending.timer);
+    pending.timer = setTimeout(() => this.settleInjectedCompletion(), this.settleMs);
+    pending.timer.unref?.();
+  }
+  settleInjectedCompletion() {
+    const pending = this.takeInjectedCompletion();
+    if (!pending)
+      return;
+    this.flush(pending.reason, pending.correlation);
+  }
+  takeInjectedCompletion() {
+    const pending = this.injectedCompletion;
+    if (!pending)
+      return null;
+    clearTimeout(pending.timer);
+    this.injectedCompletion = null;
+    return pending;
   }
   failInflightInjections(reason) {
     if (this.ourPrompts.size === 0)
@@ -1816,7 +1859,11 @@ class GrokAdapter extends EventEmitter2 {
       const correlation = this.injectionCorrelations.get(id);
       this.injectionCorrelations.delete(id);
       if (correlation) {
-        this.emit("injectionRejected", { ...correlation, reason });
+        this.emit("injectionRejected", {
+          ...correlation,
+          reason,
+          delivery: "unknown"
+        });
       }
     }
   }
@@ -1835,6 +1882,8 @@ class GrokAdapter extends EventEmitter2 {
     this.emit("turnStarted");
   }
   flush(reason, respondingTo = null) {
+    const held = this.takeInjectedCompletion();
+    respondingTo ??= held?.correlation ?? null;
     if (!this.turnActive && this.chunks.length === 0)
       return;
     const content = this.chunks.join("");
@@ -2331,9 +2380,11 @@ class DaemonLifecycle {
   get controlWsUrl() {
     return `ws://127.0.0.1:${this.controlPort}/ws`;
   }
-  async ensureRunning() {
+  async ensureRunning(opts = {}) {
+    const readiness = opts.readiness ?? "codex";
+    const waitFor = (maxRetries, delayMs) => readiness === "health" ? this.waitForHealthy(maxRetries, delayMs) : this.waitForReady(maxRetries, delayMs);
     if (await this.isHealthy()) {
-      await this.waitForReady();
+      await waitFor();
       return;
     }
     const existingPid = this.readPid();
@@ -2341,7 +2392,7 @@ class DaemonLifecycle {
       if (isProcessAlive(existingPid)) {
         if (this.isDaemonProcess(existingPid)) {
           try {
-            await this.waitForReady(12, 250);
+            await waitFor(12, 250);
             return;
           } catch {
             throw new Error(`Found existing daemon process ${existingPid}, but control port ${this.controlPort} never became ready.`);
@@ -2354,7 +2405,7 @@ class DaemonLifecycle {
     const lockAcquired = this.acquireLock();
     if (!lockAcquired) {
       this.log("Another process is starting the daemon, waiting for readiness...");
-      await this.waitForReady();
+      await waitFor();
       return;
     }
     try {
@@ -2363,7 +2414,7 @@ class DaemonLifecycle {
         throw new Error(describeControlPortConflict(this.controlPort, this.projectId, holder));
       }
       this.launch();
-      await this.waitForReady();
+      await waitFor();
     } finally {
       this.releaseLock();
     }
@@ -3174,9 +3225,8 @@ class PendingRequests {
       const req = this.requests[i];
       if (req.responder !== responder)
         continue;
-      const named = inReplyTo !== undefined && inReplyTo === req.messageId;
-      const routed = recipients.includes(req.requester);
-      if (!named && !routed)
+      const matched = inReplyTo !== undefined ? inReplyTo === req.messageId : recipients.includes(req.requester);
+      if (!matched)
         continue;
       this.requests.splice(i, 1);
       satisfied.push(req);
@@ -3535,7 +3585,7 @@ registerTransport2("grok", {
   payloadMode: "content",
   acknowledgementMode: "none",
   wake: (message) => {
-    const requireReply = requireReplyIds.delete(message.id);
+    const requireReply = requireReplyIds.has(message.id);
     const requester = isAgentId(message.from) ? message.from : "system";
     const content = requireReply ? message.content + REPLY_REQUIRED_INSTRUCTION : message.content;
     const accepted = grok.injectMessage(content, {
@@ -3545,6 +3595,7 @@ registerTransport2("grok", {
     });
     if (!accepted)
       throw new Error("Grok has no live session to inject into");
+    requireReplyIds.delete(message.id);
     if (requireReply && isAgentId(message.from)) {
       pendingRequests.add({
         requester: message.from,
@@ -3764,19 +3815,24 @@ codex.on("error", (err) => {
 codex.on("turnAborted", (why) => {
   endAgentTurn("codex", why);
 });
-function reportInjectionRejected(rejection) {
-  const { agent, messageId, unit, reason } = rejection;
+function reportFailedInjection(failure) {
+  const { agent, messageId, unit, reason, delivery } = failure;
   const label = agentLabel(agent);
-  log(`${label} refused the ${unit} for ${messageId}: ${reason}`);
-  endAgentTurn(agent, `${label} refused the ${unit}`);
-  if (pendingRequests.cancel(messageId)) {
-    log(`Cancelled the pending reply request for refused message ${messageId}`);
+  const verb = delivery === "rejected" ? "refused" : "may not have received";
+  log(`${label} ${verb} the ${unit} for ${messageId}: ${reason}`);
+  endAgentTurn(agent, `${label} ${verb} the ${unit}`);
+  const body = delivery === "rejected" ? `\u26A0\uFE0F ${label} refused the ${unit} carrying your message \u2014 it was not delivered and ${label} never saw it. ` + `The ${failure.backend} said: ${reason}` : `\u26A0\uFE0F The bridge lost its connection to the ${failure.backend} with your message already sent, so whether ${label} ` + `received it is unknown. Do not assume either way: ${label} may answer, or may never have seen it. ` + `Resending can make ${label} run the same request twice. The reason given was: ${reason}`;
+  if (delivery === "rejected") {
+    if (pendingRequests.cancel(messageId)) {
+      log(`Cancelled the pending reply request for refused message ${messageId}`);
+    }
   }
-  const notice = (to) => noticeMessage(rejection.kind, `\u26A0\uFE0F ${label} refused the ${unit} carrying your message \u2014 it was not delivered and ${label} never saw it. ` + `The ${rejection.backend} said: ${reason}
+  const echoHeading = delivery === "rejected" ? "Undelivered message" : "The message in question";
+  const notice = (to) => noticeMessage(failure.kind, `${body}
 
-Undelivered message:
-${truncateForNotice(rejection.text)}`, to);
-  const sender = isAgentId(rejection.requester) ? rejection.requester : null;
+${echoHeading}:
+${truncateForNotice(failure.text)}`, to);
+  const sender = isAgentId(failure.requester) ? failure.requester : null;
   if (sender)
     routeOrLog(notice(sender));
   else
@@ -3784,8 +3840,9 @@ ${truncateForNotice(rejection.text)}`, to);
 }
 codex.on("injectionRejected", ({ correlation, error }) => {
   lastPinnedContractThreadId = null;
-  reportInjectionRejected({
+  reportFailedInjection({
     agent: "codex",
+    delivery: "rejected",
     kind: "turn_start_rejected",
     unit: "turn",
     backend: "app-server",
@@ -3844,16 +3901,17 @@ grok.on("tuiDisconnected", () => {
   scheduleIdleShutdown();
   broadcastStatus();
 });
-grok.on("injectionRejected", ({ messageId, requester, text, reason }) => {
-  reportInjectionRejected({
+grok.on("injectionRejected", (failure) => {
+  reportFailedInjection({
     agent: "grok",
     kind: "grok_prompt_rejected",
     unit: "prompt",
     backend: "leader",
-    messageId,
-    requester,
-    text,
-    reason
+    delivery: failure.delivery,
+    messageId: failure.messageId,
+    requester: failure.requester,
+    text: failure.text,
+    reason: failure.reason
   });
 });
 function startControlServer() {

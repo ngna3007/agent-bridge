@@ -483,6 +483,23 @@ describe("E2E: CLI surface", () => {
     // The launcher waits out its full socket grace period before giving up.
   }, 20_000);
 
+  test("agentbridge grok launches while the Codex app-server is not ready", async () => {
+    // `/readyz` reports the Codex app-server's bootstrap, which has
+    // nothing to do with whether Grok can work: Grok's leader is its own
+    // backend and the proxy socket is bound the moment the daemon is up.
+    // Gating the launcher on it would mean a machine with a broken or
+    // absent Codex install can never start Grok — in a bridge whose whole
+    // claim is that its agents are independent. So: health, not readiness.
+    await withHarness(async (harness) => {
+      const result = await harness.runCliWithEnv(["grok"], {
+        AGENTBRIDGE_FAKE_DAEMON_NEVER_READY: "1",
+      });
+
+      expect(result.code).toBe(0);
+      expect(harness.readShimCalls("grok")).not.toEqual([]);
+    });
+  }, 30_000);
+
   test("agentbridge grok clears the killed sentinel before launching", async () => {
     await withHarness(async (harness) => {
       writeFileSync(join(harness.stateDir, "killed"), `${Date.now()}\n`, "utf-8");
@@ -945,6 +962,10 @@ const appPort = Number.parseInt(process.env.CODEX_WS_PORT ?? "4500", 10);
 const proxyPort = Number.parseInt(process.env.CODEX_PROXY_PORT ?? "4501", 10);
 const launchLog = process.env.AGENTBRIDGE_FAKE_DAEMON_LAUNCH_LOG;
 const delayMs = Number.parseInt(process.env.AGENTBRIDGE_FAKE_DAEMON_DELAY_MS ?? "0", 10);
+// Stands in for a daemon whose Codex app-server never bootstrapped: the
+// process is up and healthy, \`/readyz\` says 503 forever. Everything that
+// does not depend on Codex has to keep working.
+const neverReady = process.env.AGENTBRIDGE_FAKE_DAEMON_NEVER_READY === "1";
 
 if (!stateDir || !launchLog) {
   console.error("Fake daemon requires AGENTBRIDGE_STATE_DIR and AGENTBRIDGE_FAKE_DAEMON_LAUNCH_LOG");
@@ -1017,7 +1038,11 @@ const server = Bun.serve({
   hostname: "127.0.0.1",
   fetch(req, serverInstance) {
     const url = new URL(req.url);
-    if (url.pathname === "/healthz" || url.pathname === "/readyz") {
+    if (url.pathname === "/readyz") {
+      return Response.json(currentStatus(), { status: neverReady ? 503 : 200 });
+    }
+
+    if (url.pathname === "/healthz") {
       return Response.json(currentStatus());
     }
 

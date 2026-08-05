@@ -42,6 +42,15 @@ export class PendingRequests {
    * `responder` scopes the whole search, including the `inReplyTo` match:
    * an id names a request, but only the agent that was asked can answer
    * it.
+   *
+   * A correlation, when there is one, is the *only* thing that matches.
+   * The delivery fallback below is broad by design — any reply reaching
+   * the requester closes everything that requester is owed — and running
+   * both rules together made the precise case behave like the imprecise
+   * one: two questions outstanding to the same agent, an answer naming
+   * the first, and the second silently marked answered too. Its expiry
+   * notice, the only report that it went unanswered, never fired. So:
+   * correlation when the agent gave one, delivery only when it did not.
    */
   satisfy(
     inReplyTo: string | undefined,
@@ -52,9 +61,11 @@ export class PendingRequests {
     for (let i = this.requests.length - 1; i >= 0; i--) {
       const req = this.requests[i];
       if (req.responder !== responder) continue;
-      const named = inReplyTo !== undefined && inReplyTo === req.messageId;
-      const routed = recipients.includes(req.requester);
-      if (!named && !routed) continue;
+      const matched =
+        inReplyTo !== undefined
+          ? inReplyTo === req.messageId
+          : recipients.includes(req.requester);
+      if (!matched) continue;
       this.requests.splice(i, 1);
       satisfied.push(req);
     }

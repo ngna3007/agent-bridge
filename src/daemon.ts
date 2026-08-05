@@ -6,6 +6,7 @@ import type { CodexProseIngress, InjectionRejection } from "./codex-adapter";
 import { GrokAdapter } from "./grok-adapter";
 import type {
   GrokInjectionCorrelation,
+  GrokInjectionDelivery,
   GrokInjectionRejection,
   GrokProseIngress,
 } from "./grok-adapter";
@@ -421,7 +422,15 @@ registerTransport("grok", {
   payloadMode: "content",
   acknowledgementMode: "none",
   wake: (message) => {
-    const requireReply = requireReplyIds.delete(message.id);
+    // Read, don't consume. This wake is the one that can fail *and* keep
+    // the message: no session means a throw, and the mailbox holds the
+    // entry for `drainGrokBacklog` to retry. A `delete` here would have
+    // that retry deliver the message with no reply instruction and no
+    // pending request — the sender told a reply was required, and
+    // nothing in the system would be waiting for one. The Codex
+    // transport can consume because its deferral hands the obligation to
+    // the outbox entry; this one has nowhere to hand it but here.
+    const requireReply = requireReplyIds.has(message.id);
     const requester = isAgentId(message.from) ? message.from : "system";
     const content = requireReply ? message.content + REPLY_REQUIRED_INSTRUCTION : message.content;
     // The correlation carries `message.content`, not `content`: the echo
@@ -433,6 +442,8 @@ registerTransport("grok", {
       text: message.content,
     });
     if (!accepted) throw new Error("Grok has no live session to inject into");
+    // Consumed only now that the prompt is on the wire.
+    requireReplyIds.delete(message.id);
 
     // Deliberately no `activeRequester.set` here. Grok's leader queues an
     // injected prompt and runs it at the *next* turn boundary, so the
@@ -917,8 +928,8 @@ codex.on("turnAborted", (why: string) => {
   endAgentTurn("codex", why);
 });
 
-/** One proxied agent's backend refusing an injection the daemon already reported as sent. */
-interface RejectedInjection {
+/** One proxied agent's backend failing an injection the daemon already reported as sent. */
+interface FailedInjection {
   agent: Extract<AgentId, "codex" | "grok">;
   /** The notice kind, which each agent's clients already know by name. */
   kind: string;
@@ -926,6 +937,13 @@ interface RejectedInjection {
   unit: string;
   /** What refused it, as the notice names it to a human. */
   backend: string;
+  /**
+   * Whether the backend said no, or the connection simply died with the
+   * request already written. These are different facts about the world
+   * and the sender has to be able to act on the difference — see
+   * `reportFailedInjection`.
+   */
+  delivery: GrokInjectionDelivery;
   messageId: string;
   /**
    * Whoever sent the message, as an untrusted string off the wire —
@@ -938,10 +956,10 @@ interface RejectedInjection {
 }
 
 /**
- * Report an injection the backend refused after the daemon acked it.
+ * Report an injection that failed after the daemon had acked it.
  *
  * `injectMessage` returning true only means the frame left this process.
- * The refusal arrives later, by which time the transport's
+ * The failure arrives later, by which time the transport's
  * `acknowledgementMode: "none"` self-ack has deleted the mailbox entry —
  * so without this the message is gone, the agent never saw it, and the
  * only trace is a log line the sender cannot read. That is the exact
@@ -949,33 +967,58 @@ interface RejectedInjection {
  * notice echoes the text back: a sender told "this did not land" and not
  * shown what it was cannot act on it.
  *
+ * Two outcomes, kept apart on purpose. A backend that answers with an
+ * error refused the work: nothing ran, and a resend is the right move. A
+ * connection that dies with the request already written proves nothing —
+ * the turn may have run in full, and telling the sender "it never saw
+ * it" invites a resend that runs the same turn's file writes and tool
+ * calls a second time. So `unknown` says it is unknown, and the pending
+ * reply request stays open: if the turn did run, its reply satisfies it;
+ * if it did not, the expiry notice reports that, which is exactly as
+ * much as this side knows.
+ *
  * Shared rather than written once per agent because every clause here is
  * part of that guarantee, and a guarantee kept in two places is kept in
  * neither.
  */
-function reportInjectionRejected(rejection: RejectedInjection): void {
-  const { agent, messageId, unit, reason } = rejection;
+function reportFailedInjection(failure: FailedInjection): void {
+  const { agent, messageId, unit, reason, delivery } = failure;
   const label = agentLabel(agent);
-  log(`${label} refused the ${unit} for ${messageId}: ${reason}`);
+  const verb = delivery === "rejected" ? "refused" : "may not have received";
+  log(`${label} ${verb} the ${unit} for ${messageId}: ${reason}`);
 
-  // The turn never opened, so nothing about it is in scope any more.
-  endAgentTurn(agent, `${label} refused the ${unit}`);
-  // A require-reply request against a message the agent never received
-  // would otherwise expire into "no reply came" — pointing at the agent
-  // instead of at the send that failed.
-  if (pendingRequests.cancel(messageId)) {
-    log(`Cancelled the pending reply request for refused message ${messageId}`);
+  // Whatever this turn owned is out of scope: it either never opened, or
+  // it is beyond this side's reach.
+  endAgentTurn(agent, `${label} ${verb} the ${unit}`);
+
+  const body =
+    delivery === "rejected"
+      ? `⚠️ ${label} refused the ${unit} carrying your message — it was not delivered and ${label} never saw it. ` +
+        `The ${failure.backend} said: ${reason}`
+      : `⚠️ The bridge lost its connection to the ${failure.backend} with your message already sent, so whether ${label} ` +
+        `received it is unknown. Do not assume either way: ${label} may answer, or may never have seen it. ` +
+        `Resending can make ${label} run the same request twice. The reason given was: ${reason}`;
+
+  if (delivery === "rejected") {
+    // A require-reply request against a message the agent never received
+    // would otherwise expire into "no reply came" — pointing at the
+    // agent instead of at the send that failed. Deliberately not done
+    // for `unknown`: there the request is still live, because a reply
+    // may still be coming.
+    if (pendingRequests.cancel(messageId)) {
+      log(`Cancelled the pending reply request for refused message ${messageId}`);
+    }
   }
 
+  const echoHeading = delivery === "rejected" ? "Undelivered message" : "The message in question";
   const notice = (to: AgentId) =>
     noticeMessage(
-      rejection.kind,
-      `⚠️ ${label} refused the ${unit} carrying your message — it was not delivered and ${label} never saw it. ` +
-        `The ${rejection.backend} said: ${reason}\n\nUndelivered message:\n${truncateForNotice(rejection.text)}`,
+      failure.kind,
+      `${body}\n\n${echoHeading}:\n${truncateForNotice(failure.text)}`,
       to,
     );
 
-  const sender = isAgentId(rejection.requester) ? rejection.requester : null;
+  const sender = isAgentId(failure.requester) ? failure.requester : null;
   if (sender) routeOrLog(notice(sender));
   else emitToFrontends(notice);
 }
@@ -985,8 +1028,11 @@ codex.on("injectionRejected", ({ correlation, error }: InjectionRejection) => {
   // never pinned. Let the next injection carry it again.
   lastPinnedContractThreadId = null;
 
-  reportInjectionRejected({
+  reportFailedInjection({
     agent: "codex",
+    // A `turn/start` error is the app-server declining the work: it
+    // answered, so nothing ran.
+    delivery: "rejected",
     kind: "turn_start_rejected",
     unit: "turn",
     backend: "app-server",
@@ -1066,16 +1112,17 @@ grok.on("tuiDisconnected", () => {
   broadcastStatus();
 });
 
-grok.on("injectionRejected", ({ messageId, requester, text, reason }: GrokInjectionRejection) => {
-  reportInjectionRejected({
+grok.on("injectionRejected", (failure: GrokInjectionRejection) => {
+  reportFailedInjection({
     agent: "grok",
     kind: "grok_prompt_rejected",
     unit: "prompt",
     backend: "leader",
-    messageId,
-    requester,
-    text,
-    reason,
+    delivery: failure.delivery,
+    messageId: failure.messageId,
+    requester: failure.requester,
+    text: failure.text,
+    reason: failure.reason,
   });
 });
 
