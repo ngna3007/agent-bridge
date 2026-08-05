@@ -13,13 +13,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.8.0]
 
-Grok becomes a full participant on the bus, and message delivery stops
-being a per-transport improvisation.
+Grok gains a proxy transport of the same shape as Codex's, and message
+delivery stops being a per-transport improvisation.
+
+> Grok's proxy is verified against unit and Tier-2 harnesses only. The
+> end-to-end path through a real Grok leader is not yet verified — the
+> account's API balance is exhausted (HTTP 402) — so marker survival on
+> the real leader remains an open item rather than a shipped guarantee.
 
 ### Added
 
 - **Grok is a proxied agent, not a half-agent.** It could already send —
-  its MCP tools come free from the plugin registry — but nothing could
+  its MCP tools come free from the plugin registry (PR #10) — but nothing could
   wake it, and it occupied a frontend slot to do so. The daemon now
   listens on `<stateDir>/grok.sock`, `abg grok` launches the TUI with
   `--leader-socket` pointed at it, and every frame is forwarded to the
@@ -31,12 +36,14 @@ being a per-transport improvisation.
   `grok-leader-protocol.ts` (the leader's `[u32][JSON]` envelope layer),
   `grok-acp.ts` (ACP itself, with no knowledge of leaders), and
   `grok-adapter.ts`. (PRs #12, #18)
-- **An injected turn knows which answer is its own.** The leader queues
-  an injected prompt behind whatever the human is already doing, and its
-  verdict arrives on a different socket from its prose. Each injection
-  now carries an invisible per-injection marker, recognised in the echo
-  the leader sends back, so a human turn running in between cannot walk
-  off with the correlation. A prompt that cannot be accounted for is
+- **An injected turn is correlated by marker, not by arrival order.** The
+  leader queues an injected prompt behind whatever the human is already
+  doing, and its verdict arrives on a different socket from its prose.
+  The adapter appends an invisible per-injection marker to the prompt and
+  claims the turn only once it observes that marker echoed back, so a
+  human turn running in between cannot walk off with the correlation.
+  Whether the marker survives a real Grok leader is untested — see the
+  note above. A prompt that cannot be accounted for is
   reported to its sender as `unknown` rather than being silently
   forgotten, and one injected turn is outstanding at a time. (PR #18)
 - **Daemon-owned mailboxes and causal routing.** Delivery was a property
