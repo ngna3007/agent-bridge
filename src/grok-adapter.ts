@@ -221,7 +221,7 @@ export class GrokAdapter extends EventEmitter {
    * Owning it is not the same as being allowed to spend it. Grok's
    * leader queues an injected prompt behind whatever the human is
    * already doing, so between the write and the turn there can be one or
-   * more turns that are none of our business. `started` is how the turn
+   * more turns that are none of our business. `ownsTurn` is how the turn
    * recognises itself: the leader echoes an injected prompt back down
    * the proxy leg as a user message before answering it, and that echo
    * carries this injection's marker.
@@ -246,8 +246,14 @@ export class GrokAdapter extends EventEmitter {
      * "is there prose buffered". Prose alone was what let the human's
      * turn — the one the leader was already running when we wrote —
      * settle against our correlation.
+     *
+     * Scoped to the turn, not to the injection: it goes back to false at
+     * the next user message that is not our echo. "The marker matched at
+     * some point" is not "the prose sitting in the buffer right now is
+     * ours" — an injection abandoned after its echo kept the flag, and
+     * the human's next turn was flushed mid-stream against it.
      */
-    started: boolean;
+    ownsTurn: boolean;
     /** Recent echo text, scanned for the marker across chunk splits. */
     echoSeen: string;
     /**
@@ -413,7 +419,7 @@ export class GrokAdapter extends EventEmitter {
       reason: "",
       proseEmitted: false,
       marker,
-      started: false,
+      ownsTurn: false,
       echoSeen: "",
       abandoned: false,
       deadline: Date.now() + this.deadlineMs,
@@ -476,15 +482,15 @@ export class GrokAdapter extends EventEmitter {
   /**
    * Whether buffered prose is this injection's answer, finished.
    *
-   * All three have to hold. `started` says the prose belongs to us
+   * All three have to hold. `ownsTurn` says the prose belongs to us
    * rather than to the turn the leader was already running; `verdictSeen`
    * says the leader considers it finished; the buffer says there is
-   * something to end. Dropping `started` from this is what let the
+   * something to end. Dropping `ownsTurn` from this is what let the
    * human's turn settle against our correlation when a verdict beat the
    * echo across the sockets.
    */
   private canSettle(injection: NonNullable<GrokAdapter["activeInjection"]>): boolean {
-    return injection.started && injection.verdictSeen && (this.turnActive || this.chunks.length > 0);
+    return injection.ownsTurn && injection.verdictSeen && (this.turnActive || this.chunks.length > 0);
   }
 
   /** The outstanding injected turn either settled or ran out of time. */
@@ -503,7 +509,7 @@ export class GrokAdapter extends EventEmitter {
         // leader was already running, and flushing it would cut a human
         // turn in half on the way to releasing a slot that has nothing
         // to do with it.
-        if (injection.started) {
+        if (injection.ownsTurn) {
           this.flush("the abandoned injected turn's answer arrived late");
         }
         this.endInjection();
@@ -866,11 +872,21 @@ export class GrokAdapter extends EventEmitter {
    */
   private matchInjectionEcho(text: string | null): void {
     const injection = this.activeInjection;
-    if (!injection || injection.started || text === null) return;
+    if (!injection) return;
+    // A user message opens a turn, and every turn decides its own
+    // ownership from its own echo. Carrying the last decision forward is
+    // what let an injection that had been abandoned after its echo still
+    // claim the human's next turn: the marker had matched once, so the
+    // release flushed prose that was never ours.
+    injection.ownsTurn = false;
+    if (text === null) return;
     const seen = (injection.echoSeen + text).slice(-ECHO_SCAN_WINDOW);
     injection.echoSeen = seen;
     if (!seen.includes(injection.marker)) return;
-    injection.started = true;
+    injection.ownsTurn = true;
+    // The window is closed on a match so the marker cannot be found a
+    // second time in the human's next prompt, which would hand them the
+    // turn this flag exists to withhold.
     injection.echoSeen = "";
     this.log("Our injected prompt came back on the proxy leg; its turn has started");
   }
@@ -975,11 +991,12 @@ export class GrokAdapter extends EventEmitter {
     // Claimed once: a second turn's prose is not this injection's answer.
     const injection = this.activeInjection;
     let respondingTo: GrokInjectionCorrelation | null = null;
-    // `started` is the whole gate: our prompt has come back, so what is
-    // buffered is the answer to it and not a human turn the leader ran
-    // first. An abandoned injection is excluded because its correlation
-    // has already been reported `unknown` to the sender.
-    if (injection && injection.started && !injection.abandoned && !injection.proseEmitted) {
+    // `ownsTurn` is the whole gate: our prompt came back to open the
+    // turn being flushed, so what is buffered is the answer to it and
+    // not a human turn the leader ran first. An abandoned injection is
+    // excluded because its correlation has already been reported
+    // `unknown` to the sender.
+    if (injection && injection.ownsTurn && !injection.abandoned && !injection.proseEmitted) {
       injection.proseEmitted = true;
       respondingTo = injection.correlation;
     }

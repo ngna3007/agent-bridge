@@ -593,6 +593,48 @@ describe("GrokAdapter injection", () => {
     ).toBe(true);
   });
 
+  test("an abandoned turn that did start does not claim the human's next one", async () => {
+    // The marker matched, so this injection owned *its* turn — and then
+    // its deadline passed with no answer. Ownership was a fact about
+    // that turn, not about the injection: when the human prompts next,
+    // the prose that follows is theirs, and a late verdict arriving
+    // mid-stream must not flush half of it to release a slot.
+    const { adapter, tui, upstreams, leader } = harness({ injectedTurnDeadlineMs: SETTLE_MS * 2 });
+    tuiPrompts(tui, 1);
+    leader.deliverAcp({ jsonrpc: "2.0", id: 1, result: {} });
+
+    const seen: GrokProseIngress[] = [];
+    const capacity: number[] = [];
+    adapter.on("agentMessage", (m: GrokProseIngress) => seen.push(m));
+    adapter.on("injectionCapacity", () => capacity.push(1));
+    adapter.injectMessage("what is 2+2", { messageId: "m1", requester: "claude", text: "q" });
+
+    const injector = upstreams[1]!;
+    echoInjected(leader, injector);
+    // The turn started and then produced nothing before the deadline.
+    await settle();
+    expect(capacity).toEqual([]);
+
+    // The human takes the session back. Their prose buffers up.
+    userChunk(leader, "never mind, what is 3+3");
+    chunk(leader, "human ");
+    chunk(leader, "answer");
+
+    // Our verdict finally lands, mid-human-turn.
+    const promptId = injector.acpSent().find((m: any) => m.method === "session/prompt").id;
+    injector.deliverAcp({ jsonrpc: "2.0", id: promptId, result: { stopReason: "end_turn" } });
+    await settle();
+
+    // Slot released, human turn untouched.
+    expect(capacity).toHaveLength(1);
+    expect(seen).toEqual([]);
+
+    userChunk(leader, "next question");
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.content).toBe("human answer");
+    expect(seen[0]?.respondingTo).toBeNull();
+  });
+
   test("an abandoned turn that never started leaves the human's turn whole", async () => {
     // Prose is buffered, but the marker never matched, so it belongs to
     // the turn the leader was already running. Ending the injection must

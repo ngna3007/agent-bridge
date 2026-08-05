@@ -1664,7 +1664,7 @@ class GrokAdapter extends EventEmitter2 {
       reason: "",
       proseEmitted: false,
       marker,
-      started: false,
+      ownsTurn: false,
       echoSeen: "",
       abandoned: false,
       deadline: Date.now() + this.deadlineMs,
@@ -1705,7 +1705,7 @@ class GrokAdapter extends EventEmitter2 {
     injection.timer.unref?.();
   }
   canSettle(injection) {
-    return injection.started && injection.verdictSeen && (this.turnActive || this.chunks.length > 0);
+    return injection.ownsTurn && injection.verdictSeen && (this.turnActive || this.chunks.length > 0);
   }
   onInjectionTimer() {
     const injection = this.activeInjection;
@@ -1713,7 +1713,7 @@ class GrokAdapter extends EventEmitter2 {
       return;
     if (injection.abandoned) {
       if (injection.verdictSeen) {
-        if (injection.started) {
+        if (injection.ownsTurn) {
           this.flush("the abandoned injected turn's answer arrived late");
         }
         this.endInjection();
@@ -1930,13 +1930,16 @@ class GrokAdapter extends EventEmitter2 {
   }
   matchInjectionEcho(text) {
     const injection = this.activeInjection;
-    if (!injection || injection.started || text === null)
+    if (!injection)
+      return;
+    injection.ownsTurn = false;
+    if (text === null)
       return;
     const seen = (injection.echoSeen + text).slice(-ECHO_SCAN_WINDOW);
     injection.echoSeen = seen;
     if (!seen.includes(injection.marker))
       return;
-    injection.started = true;
+    injection.ownsTurn = true;
     injection.echoSeen = "";
     this.log("Our injected prompt came back on the proxy leg; its turn has started");
   }
@@ -1985,7 +1988,7 @@ class GrokAdapter extends EventEmitter2 {
       return;
     const injection = this.activeInjection;
     let respondingTo = null;
-    if (injection && injection.started && !injection.abandoned && !injection.proseEmitted) {
+    if (injection && injection.ownsTurn && !injection.abandoned && !injection.proseEmitted) {
       injection.proseEmitted = true;
       respondingTo = injection.correlation;
     }
