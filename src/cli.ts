@@ -15,6 +15,7 @@
  */
 
 import { resolveRuntimeNamespace } from "./runtime-namespace";
+import { assertSupportedPlatform } from "./windows-guard";
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -72,6 +73,12 @@ function maybeApplyProjectNamespace(cmd: string | undefined, justCreatedProject 
 }
 
 async function main() {
+  // Before anything else. Every step below this line — the setup
+  // offer, the namespace, spawning a daemon — either fails or
+  // half-succeeds on native Windows, and a half-finished setup is
+  // harder to explain than a refusal.
+  assertSupportedPlatform();
+
   // First-run setup offer, before the namespace is resolved. A project
   // created here must be visible to maybeApplyProjectNamespace below,
   // otherwise the user answers "yes" and still gets fallback ports for
