@@ -13853,6 +13853,11 @@ function getRotatingLogger(path, opts) {
   return inst;
 }
 
+// src/sender-label.ts
+function withSenderLabel(message) {
+  return `[${message.from}] ${message.content}`;
+}
+
 // src/claude-adapter.ts
 var CLAUDE_INSTRUCTIONS = [
   "Codex is an AI coding agent (OpenAI) running in a separate session on the same machine. You and Codex are remote teammates working on the same project, not a request-response pair.",
@@ -14036,7 +14041,7 @@ class ClaudeAdapter extends EventEmitter {
       return "No new messages.";
     this.mailbox.ack(batchId, messages.map((m) => m.id));
     this.log(`get_messages returning ${messages.length} message(s) (instance=${this.instanceId})`);
-    return messages.map((m) => `[${m.from}] ${m.content}`).join(`
+    return messages.map(withSenderLabel).join(`
 
 `);
   }

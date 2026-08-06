@@ -3461,6 +3461,11 @@ class ReplyObligations {
   }
 }
 
+// src/sender-label.ts
+function withSenderLabel(message) {
+  return `[${message.from}] ${message.content}`;
+}
+
 // src/grok-wake.ts
 function grokWakeTransport(deps) {
   return {
@@ -3469,7 +3474,8 @@ function grokWakeTransport(deps) {
     wake: (message) => {
       const requireReply = deps.obligations.has(message.id);
       const requester = isAgentId(message.from) ? message.from : "system";
-      const content = requireReply ? message.content + REPLY_REQUIRED_INSTRUCTION : message.content;
+      const labelled = withSenderLabel(message);
+      const content = requireReply ? labelled + REPLY_REQUIRED_INSTRUCTION : labelled;
       const accepted = deps.inject(content, {
         messageId: message.id,
         requester,
@@ -3797,13 +3803,14 @@ registerTransport2("codex", {
   wake: (message) => {
     const requireReply = obligations.discharge(message.id);
     const requester = isAgentId(message.from) ? message.from : null;
-    if (deliverToCodex(message.content, requireReply, requester, message.id)) {
+    const content = withSenderLabel(message);
+    if (deliverToCodex(content, requireReply, requester, message.id)) {
       clearAttentionWindow();
       return;
     }
     const { depth, dropped } = replyOutbox.accept({
       id: message.id,
-      content: message.content,
+      content,
       requireReply,
       queuedAt: Date.now()
     });
