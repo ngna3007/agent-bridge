@@ -65,6 +65,7 @@ import {
   senderFacingText,
   type RouteOutcome,
 } from "./daemon-bus";
+import { withSenderLabel } from "./sender-label";
 import { PROTOCOL_VERSION, normalizeIngress, normalizeProse } from "./normalize-ingress";
 import {
   INDEX_CAPACITY,
@@ -361,8 +362,11 @@ registerTransport("codex", {
   wake: (message) => {
     const requireReply = obligations.discharge(message.id);
     const requester = isAgentId(message.from) ? message.from : null;
+    // Labelled once, here, so the copy that goes out now and the copy the
+    // outbox re-injects after the turn are the same text.
+    const content = withSenderLabel(message);
 
-    if (deliverToCodex(message.content, requireReply, requester, message.id)) {
+    if (deliverToCodex(content, requireReply, requester, message.id)) {
       // The sender has answered, so the attention window opened for it is over.
       clearAttentionWindow();
       return;
@@ -370,7 +374,7 @@ registerTransport("codex", {
 
     const { depth, dropped } = replyOutbox.accept({
       id: message.id,
-      content: message.content,
+      content,
       requireReply,
       queuedAt: Date.now(),
     });

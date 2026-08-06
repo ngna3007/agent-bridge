@@ -22,6 +22,7 @@ import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
 import { StateDirResolver } from "./state-dir";
 import { getRotatingLogger } from "./log-rotator";
+import { withSenderLabel } from "./sender-label";
 import type { BridgeMessage } from "./types";
 import type { ReplyOutcome } from "./control-protocol";
 
@@ -275,7 +276,7 @@ export class ClaudeAdapter extends EventEmitter {
     if (messages.length === 0) return "No new messages.";
     this.mailbox.ack(batchId, messages.map((m) => m.id));
     this.log(`get_messages returning ${messages.length} message(s) (instance=${this.instanceId})`);
-    return messages.map((m) => `[${m.from}] ${m.content}`).join("\n\n");
+    return messages.map(withSenderLabel).join("\n\n");
   }
 
   // ── MCP Tool Handlers ─────────────────────────────────────

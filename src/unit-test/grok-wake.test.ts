@@ -59,7 +59,7 @@ describe("grokWakeTransport", () => {
     transport.wake(message());
 
     expect(injected).toHaveLength(1);
-    expect(injected[0]?.content).toBe("what is 2+2" + REPLY_REQUIRED_INSTRUCTION);
+    expect(injected[0]?.content).toBe("[claude] what is 2+2" + REPLY_REQUIRED_INSTRUCTION);
     expect(expected).toEqual([{ requester: "claude", messageId: "m1" }]);
     expect(obligations.has("m1")).toBe(false);
   });
@@ -80,7 +80,8 @@ describe("grokWakeTransport", () => {
     const { transport, injected, expected } = deps(() => true);
     transport.wake(message());
 
-    expect(injected[0]?.content).toBe("what is 2+2");
+    // Grok is told who is asking, same as every other recipient.
+    expect(injected[0]?.content).toBe("[claude] what is 2+2");
     expect(expected).toEqual([]);
   });
 

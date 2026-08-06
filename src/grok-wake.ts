@@ -1,4 +1,5 @@
 import { isAgentId } from "./agent-id";
+import { withSenderLabel } from "./sender-label";
 import { REPLY_REQUIRED_INSTRUCTION } from "./message-filter";
 import type { ReplyObligations } from "./reply-obligations";
 import type { GrokInjectionCorrelation } from "./grok-adapter";
@@ -51,9 +52,8 @@ export function grokWakeTransport(deps: GrokWakeDeps): WakeupTransport {
       // nowhere to hand it but here.
       const requireReply = deps.obligations.has(message.id);
       const requester = isAgentId(message.from) ? message.from : "system";
-      const content = requireReply
-        ? message.content + REPLY_REQUIRED_INSTRUCTION
-        : message.content;
+      const labelled = withSenderLabel(message);
+      const content = requireReply ? labelled + REPLY_REQUIRED_INSTRUCTION : labelled;
       // The correlation carries `message.content`, not `content`: the
       // echo a rejection notice shows the sender should be what they
       // wrote, not the instruction the daemon stapled to it.
