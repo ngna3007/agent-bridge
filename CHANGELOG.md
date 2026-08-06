@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.8.0]
+## [0.7.1]
 
 Grok gains a proxy transport of the same shape as Codex's, and message
 delivery stops being a per-transport improvisation.
